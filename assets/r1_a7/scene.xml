@@ -1,0 +1,26 @@
+<mujoco model="r1_a7_scene">
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+  
+  <custom>
+    <numeric name="table_top" data="0.65"/>
+    <numeric name="table_center" data="0.33 0.0"/>
+    <numeric name="near_object_x" data="0.25"/>
+    <numeric name="object_y" data="0.125"/>
+    <numeric name="object_lift" data="0.0"/>
+    <numeric name="goal_x" data="0.50"/>
+    <numeric name="cube_half_size" data="0.018 0.018 0.060"/>
+    <numeric name="cylinder_size" data="0.018 0.060"/>
+  </custom>
+  
+  <worldbody>
+    <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <camera name="front" pos="1.25 0 0.95" euler="1.57 0 1.57" fovy="55"/>
+    <camera name="angle" pos="0.75 -0.75 1.35" euler="0.95 0 0.78" fovy="55"/>
+    <camera name="top" pos="0.15 0 2.35" euler="0 0 0" fovy="45"/>
+  </worldbody>
+</mujoco>
