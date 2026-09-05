@@ -89,6 +89,9 @@ python scripts/teleop_r1arm_sim.py --mock-xr
 # 连接 PICO，握右手柄 grip 激活跟踪，A 复位
 python scripts/teleop_r1arm_sim.py
 
+# trigger 控制 Dex1 开合（与 A7 相同：松开=开，按下=关）
+python scripts/teleop_r1arm_sim.py --mock-xr
+
 # 无显示环境
 python scripts/teleop_r1arm_sim.py --mock-xr --no-viewer --debug
 ```

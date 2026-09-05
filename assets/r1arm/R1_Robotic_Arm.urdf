@@ -224,4 +224,92 @@
     <axis xyz="0 0 -1"/>
     <limit lower="-1.571" upper="1.571" effort="10" velocity="37.7"/>
   </joint>
+
+  <!-- Dex1：贴 Link7 末端平面（y≈-0.0477），Rz(-π/2) 使 +X 沿 -Y 出轴；
+       xyz 落在 Link7 中轴（x=0,z=0），与末端面同轴，不再套用 A7 的 z=0.024 偏置。 -->
+  <joint name="dex1_base_joint" type="fixed">
+    <origin xyz="0 -0.047736 0" rpy="0 0 -1.57079632679"/>
+    <parent link="Link7"/>
+    <child link="dex1_base_link"/>
+  </joint>
+  <link name="dex1_base_link">
+    <inertial>
+      <origin xyz="0.043853 -0.0001306 1.4003E-05" rpy="0 0 0"/>
+      <mass value="0.19138"/>
+      <inertia ixx="7.4842E-05" ixy="1.6252E-07" ixz="-8.0516E-09" iyy="5.861E-05" iyz="-3.5931E-08" izz="3.9364E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/Dex1_base_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.79216 0.81961 0.93333 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/Dex1_base_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="dex1_finger_link_1">
+    <inertial>
+      <origin xyz="0.073453 -0.011173 0.0086355" rpy="0 0 0"/>
+      <mass value="0.086783"/>
+      <inertia ixx="2.5583E-05" ixy="5.1557E-07" ixz="-6.3178E-07" iyy="1.4549E-05" iyz="7.8542E-08" izz="3.6013E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/Dex1_finger_link_1.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.4 0.4 0.4 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/dex1_col_1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="dex1_finger_joint_1" type="prismatic">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="dex1_base_link"/>
+    <child link="dex1_finger_link_1"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-0.02" upper="0.0245" effort="20" velocity="0.2"/>
+  </joint>
+  <link name="dex1_finger_link_2">
+    <inertial>
+      <origin xyz="0.073453 0.011173 -0.0086355" rpy="0 0 0"/>
+      <mass value="0.086783"/>
+      <inertia ixx="2.5583E-05" ixy="-5.1557E-07" ixz="6.3178E-07" iyy="1.4549E-05" iyz="7.8542E-08" izz="3.6013E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/Dex1_finger_link_2.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.79216 0.81961 0.93333 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/dex1_col_2.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="dex1_finger_joint_2" type="prismatic">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="dex1_base_link"/>
+    <child link="dex1_finger_link_2"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.02" upper="0.0245" effort="20" velocity="0.2"/>
+  </joint>
 </robot>

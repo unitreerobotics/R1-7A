@@ -1,0 +1,32 @@
+<mujoco model="bowl_container">
+  <!-- 简易碗：底面圆盘 + 一圈薄壁（开口朝上） -->
+  <default>
+    <default class="bowl">
+      <geom friction="1.2 0.005 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"
+            condim="3" density="350" rgba="0.82 0.72 0.55 1"
+            contype="4" conaffinity="15"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <!-- 碗底贴地；内径约 8cm，壁高约 3.5cm -->
+    <body name="bowl" pos="-0.05 -0.32 0" childclass="bowl">
+      <freejoint name="bowl_free"/>
+      <!-- 底 -->
+      <geom name="bowl_bottom" type="cylinder" size="0.042 0.003" pos="0 0 0.003"/>
+      <!-- 壁：12 段薄板围成圆筒 -->
+      <geom name="bowl_w0"  type="box" size="0.006 0.012 0.02" pos="0.045 0 0.0205"/>
+      <geom name="bowl_w1"  type="box" size="0.006 0.012 0.02" pos="0.03897 0.0225 0.0205" euler="0 0 0.5236"/>
+      <geom name="bowl_w2"  type="box" size="0.006 0.012 0.02" pos="0.0225 0.03897 0.0205" euler="0 0 1.0472"/>
+      <geom name="bowl_w3"  type="box" size="0.006 0.012 0.02" pos="0 0.045 0.0205" euler="0 0 1.5708"/>
+      <geom name="bowl_w4"  type="box" size="0.006 0.012 0.02" pos="-0.0225 0.03897 0.0205" euler="0 0 2.0944"/>
+      <geom name="bowl_w5"  type="box" size="0.006 0.012 0.02" pos="-0.03897 0.0225 0.0205" euler="0 0 2.6180"/>
+      <geom name="bowl_w6"  type="box" size="0.006 0.012 0.02" pos="-0.045 0 0.0205" euler="0 0 3.1416"/>
+      <geom name="bowl_w7"  type="box" size="0.006 0.012 0.02" pos="-0.03897 -0.0225 0.0205" euler="0 0 3.6652"/>
+      <geom name="bowl_w8"  type="box" size="0.006 0.012 0.02" pos="-0.0225 -0.03897 0.0205" euler="0 0 4.1888"/>
+      <geom name="bowl_w9"  type="box" size="0.006 0.012 0.02" pos="0 -0.045 0.0205" euler="0 0 4.7124"/>
+      <geom name="bowl_w10" type="box" size="0.006 0.012 0.02" pos="0.0225 -0.03897 0.0205" euler="0 0 5.2360"/>
+      <geom name="bowl_w11" type="box" size="0.006 0.012 0.02" pos="0.03897 -0.0225 0.0205" euler="0 0 5.7596"/>
+    </body>
+  </worldbody>
+</mujoco>

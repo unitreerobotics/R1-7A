@@ -1,4 +1,4 @@
-"""MuJoCo 单臂仿真封装（位置伺服跟踪 IK 目标）。"""
+"""MuJoCo 单臂+Dex1 仿真封装（位置伺服跟踪 IK / 夹爪目标）。"""
 
 from __future__ import annotations
 
@@ -6,11 +6,19 @@ from pathlib import Path
 
 import numpy as np
 
+from robot.r1arm_config import ARM_JOINTS, DEX1_JOINTS
+
 
 class MujocoArmSim:
     """加载 r1arm MJCF，用 position actuator 跟踪目标关节角。"""
 
-    def __init__(self, mjcf_path: str | Path, q_init: np.ndarray | None = None, show_viewer: bool = True):
+    def __init__(
+        self,
+        mjcf_path: str | Path,
+        q_init: np.ndarray | None = None,
+        show_viewer: bool = True,
+        joint_names: list[str] | None = None,
+    ):
         import mujoco
         import mujoco.viewer
 
@@ -22,7 +30,6 @@ class MujocoArmSim:
         self.model = mujoco.MjModel.from_xml_path(str(self.mjcf_path))
         self.data = mujoco.MjData(self.model)
 
-        # actuator / joint 名 -> 索引
         self.joint_qposadr: dict[str, int] = {}
         self.actuator_ids: dict[str, int] = {}
         for j in range(self.model.njnt):
@@ -32,11 +39,11 @@ class MujocoArmSim:
         for a in range(self.model.nu):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, a)
             if name:
-                # act_J1 -> J1
                 joint_key = name[4:] if name.startswith("act_") else name
                 self.actuator_ids[joint_key] = a
 
-        self.joint_names = [n for n in ["J1", "J2", "J3", "J4", "J5", "J6", "J7"] if n in self.joint_qposadr]
+        ordered = list(joint_names or (ARM_JOINTS + DEX1_JOINTS))
+        self.joint_names = [n for n in ordered if n in self.joint_qposadr]
         if q_init is not None:
             self.set_q(np.asarray(q_init, dtype=float), also_ctrl=True)
         else:

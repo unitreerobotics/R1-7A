@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from robot.r1arm_config import ARM_JOINTS
+from robot.r1arm_config import ARM_JOINTS, DEX1_JOINTS
 
 
 class PlacoArmIKSolver:
-    """单末端 frame task 的 Placo QP 封装。"""
+    """单末端 frame task 的 Placo QP 封装；夹爪关节 hold 住。"""
 
     def __init__(
         self,
@@ -18,6 +18,7 @@ class PlacoArmIKSolver:
         ee_frame: str,
         joint_indices: dict[str, int],
         arm_joints: list[str] | None = None,
+        hold_joints: list[str] | None = None,
         arm_task_weight: float = 1.0,
     ):
         import placo
@@ -25,6 +26,7 @@ class PlacoArmIKSolver:
         self.ee_frame = ee_frame
         self.joint_indices = joint_indices
         self.arm_joints = list(arm_joints or ARM_JOINTS)
+        self.hold_joints = list(hold_joints if hold_joints is not None else DEX1_JOINTS)
         self.arm_task_weight = arm_task_weight
 
         self.placo_robot = placo.RobotWrapper(str(urdf_path))
@@ -41,6 +43,9 @@ class PlacoArmIKSolver:
 
         m_task = self.solver.add_manipulability_task(ee_frame, "both", 1.0)
         m_task.configure("ee_manip", "soft", 1e-2)
+
+        self.hold_task = self.solver.add_joints_task()
+        self.hold_task.configure("hold", "soft", 1.0)
 
         self.regularization_task = self.solver.add_joints_task()
         default_arm_joints = {}
@@ -64,6 +69,13 @@ class PlacoArmIKSolver:
             T[:3, :3] = self.placo_robot.get_T_world_frame(self.ee_frame)[:3, :3]
         T[:3, 3] = target_pos
         self.effector_task.T_world_frame = T
+
+        hold = {}
+        for name in self.hold_joints:
+            idx = self.joint_indices.get(name)
+            if idx is not None:
+                hold[name] = float(q[idx])
+        self.hold_task.set_joints(hold)
         self.regularization_task.set_joints(self._default_arm_joints)
 
         try:

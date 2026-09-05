@@ -98,6 +98,31 @@ def update_gripper_command(
     return float(current + np.clip(desired - current, -max_delta, max_delta))
 
 
+class Dex1SimGripper:
+    """单爪 Dex1 仿真开合（与 A7 GripperController 同款 trigger→位置映射）。"""
+
+    def __init__(
+        self,
+        open_value: float = 0.0245,
+        close_value: float = -0.02,
+        speed: float = 0.08,
+    ):
+        self.open_q = float(open_value)
+        self.close_q = float(close_value)
+        self.speed = float(speed)
+        self.current = self.open_q
+
+    def update(self, trigger_value: float, dt: float) -> float:
+        self.current = update_gripper_command(
+            self.current, trigger_value, self.open_q, self.close_q, self.speed, dt
+        )
+        return self.current
+
+    def reset(self) -> float:
+        self.current = self.open_q
+        return self.current
+
+
 def apply_gripper_command(q: np.ndarray, joint_indices: dict[str, int], command: GripperCommand) -> None:
     """Apply gripper command to joint configuration."""
     set_gripper_side(q, joint_indices, "left", command.left)

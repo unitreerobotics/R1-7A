@@ -1,0 +1,37 @@
+<mujoco model="cube">
+  <!-- 边长 2cm；contype=4 物体，与地面(1)/右臂(2)/左臂(8)/其他物体(4) 碰撞 -->
+  <default>
+    <default class="cube">
+      <geom friction="1.0 0.005 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"
+            condim="3" density="400" type="box" size="0.01 0.01 0.01"
+            contype="4" conaffinity="15"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="cube_0" pos="0.16 -0.28 0.01" childclass="cube">
+      <freejoint name="cube_0_free"/>
+      <geom name="cube_0_geom" rgba="0.90 0.35 0.22 1"/>
+    </body>
+    <body name="cube_1" pos="0.10 -0.26 0.01" childclass="cube">
+      <freejoint name="cube_1_free"/>
+      <geom name="cube_1_geom" rgba="0.25 0.55 0.90 1"/>
+    </body>
+    <body name="cube_2" pos="0.22 -0.30 0.01" childclass="cube">
+      <freejoint name="cube_2_free"/>
+      <geom name="cube_2_geom" rgba="0.30 0.75 0.40 1"/>
+    </body>
+    <body name="cube_3" pos="0.13 -0.34 0.01" childclass="cube">
+      <freejoint name="cube_3_free"/>
+      <geom name="cube_3_geom" rgba="0.95 0.75 0.20 1"/>
+    </body>
+    <body name="cube_4" pos="0.20 -0.24 0.01" childclass="cube">
+      <freejoint name="cube_4_free"/>
+      <geom name="cube_4_geom" rgba="0.70 0.35 0.85 1"/>
+    </body>
+    <body name="cube_5" pos="0.07 -0.31 0.01" childclass="cube">
+      <freejoint name="cube_5_free"/>
+      <geom name="cube_5_geom" rgba="0.20 0.80 0.80 1"/>
+    </body>
+  </worldbody>
+</mujoco>

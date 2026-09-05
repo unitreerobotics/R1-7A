@@ -25,19 +25,33 @@
     <mesh name="Link5" file="Link5.STL"/>
     <mesh name="Link6" file="Link6.STL"/>
     <mesh name="Link7" file="Link7.STL"/>
+    <mesh name="Dex1_base_link" file="Dex1_base_link.STL"/>
+    <mesh name="Dex1_finger_link_1" file="Dex1_finger_link_1.STL"/>
+    <mesh name="Dex1_finger_link_2" file="Dex1_finger_link_2.STL"/>
+    <mesh name="dex1_col_1" file="dex1_col_1.stl"/>
+    <mesh name="dex1_col_2" file="dex1_col_2.stl"/>
   </asset>
 
   <default>
+    <!-- contype=2 手臂；conaffinity=5(=1|4) 只碰地面与物体，不做臂自碰 -->
     <default class="arm">
       <joint damping="1.0" armature="0.01"/>
-      <geom type="mesh" contype="0" conaffinity="0" group="1"/>
+      <geom type="mesh" contype="2" conaffinity="5" group="1" condim="3"
+            friction="1.0 0.005 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"/>
       <position kp="200" dampratio="1" forcerange="-80 80"/>
+    </default>
+    <default class="dex1">
+      <joint damping="2.0" armature="0.001"/>
+      <geom type="mesh" contype="2" conaffinity="5" group="1" condim="3"
+            friction="1.5 0.01 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"/>
+      <position kp="100" dampratio="1" forcerange="-20 20"/>
     </default>
   </default>
 
   <worldbody>
     <light pos="1.5 0 2.5" dir="-0.4 0 -1" directional="true"/>
-    <geom name="floor" type="plane" size="0 0 0.05" material="groundplane"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="groundplane"
+          contype="1" conaffinity="6" friction="1.0 0.005 0.0001"/>
     <camera name="front" pos="0.9 -0.9 0.7" xyaxes="0.7 0.7 0 -0.35 0.35 0.87" fovy="50"/>
     <camera name="side" pos="1.2 0 0.55" xyaxes="0 1 0 -0.35 0 0.94" fovy="50"/>
 
@@ -88,7 +102,29 @@
                     <geom mesh="Link7" material="arm_link"/>
                     <inertial pos="-3.7143e-07 -0.018577 0.00595" mass="0.1048"
                               fullinertia="0.000105 7.3e-05 6.7e-05 0 0 0"/>
-                    <site name="ee" pos="0 0 0" size="0.01" rgba="1 0.2 0.2 0.8"/>
+
+                    <body name="dex1_base_link" pos="0 -0.047736 0" quat="0.707106781 0 0 -0.707106781" childclass="dex1">
+                      <!-- 与 URDF 一致：末端面 + 中轴对齐（无 z 偏置） -->
+                      <geom mesh="Dex1_base_link" material="arm_base"/>
+                      <inertial pos="0.043853 -0.0001306 1.4003e-05" mass="0.19138"
+                                fullinertia="7.4842e-05 5.861e-05 3.9364e-05 1.6252e-07 -8.0516e-09 -3.5931e-08"/>
+                      <site name="ee" pos="0 0 0" size="0.01" rgba="1 0.2 0.2 0.8"/>
+
+                      <body name="dex1_finger_link_1">
+                        <joint name="dex1_finger_joint_1" type="slide" axis="0 -1 0" range="-0.02 0.0245"/>
+                        <geom mesh="Dex1_finger_link_1" material="arm_link" contype="0" conaffinity="0" group="1"/>
+                        <geom mesh="dex1_col_1" contype="2" conaffinity="5" group="3" rgba="0.5 0.5 0.5 0"/>
+                        <inertial pos="0.073453 -0.011173 0.0086355" mass="0.086783"
+                                  fullinertia="2.5583e-05 1.4549e-05 3.6013e-05 5.1557e-07 -6.3178e-07 7.8542e-08"/>
+                      </body>
+                      <body name="dex1_finger_link_2">
+                        <joint name="dex1_finger_joint_2" type="slide" axis="0 1 0" range="-0.02 0.0245"/>
+                        <geom mesh="Dex1_finger_link_2" material="arm_base" contype="0" conaffinity="0" group="1"/>
+                        <geom mesh="dex1_col_2" contype="2" conaffinity="5" group="3" rgba="0.5 0.5 0.5 0"/>
+                        <inertial pos="0.073453 0.011173 -0.0086355" mass="0.086783"
+                                  fullinertia="2.5583e-05 1.4549e-05 3.6013e-05 -5.1557e-07 6.3178e-07 7.8542e-08"/>
+                      </body>
+                    </body>
                   </body>
                 </body>
               </body>
@@ -97,7 +133,12 @@
         </body>
       </body>
     </body>
+
+    <!-- 交互物：5cm 方块 + 碗（见 assets/object/） -->
   </worldbody>
+
+  <include file="../object/cube.xml"/>
+  <include file="../object/container.xml"/>
 
   <actuator>
     <position class="arm" name="act_J1" joint="J1"/>
@@ -107,10 +148,21 @@
     <position class="arm" name="act_J5" joint="J5"/>
     <position class="arm" name="act_J6" joint="J6"/>
     <position class="arm" name="act_J7" joint="J7"/>
+    <position class="dex1" name="act_dex1_finger_joint_1" joint="dex1_finger_joint_1"/>
+    <position class="dex1" name="act_dex1_finger_joint_2" joint="dex1_finger_joint_2"/>
   </actuator>
 
   <keyframe>
-    <!-- 与 robot/r1arm_config.ARM_INIT 对齐 -->
-    <key name="home" qpos="0 1.2 0 -1.2 0 0 0" ctrl="0 1.2 0 -1.2 0 0 0"/>
+    <!-- 臂 home + Dex1 开 + 6 cubes + bowl（qpos 序与 include 后 freejoint 一致） -->
+    <key name="home"
+         qpos="0 1.2 0 -1.2 0 0 0 0.0245 0.0245
+               0.16 -0.28 0.01 1 0 0 0
+               0.10 -0.26 0.01 1 0 0 0
+               0.22 -0.30 0.01 1 0 0 0
+               0.13 -0.34 0.01 1 0 0 0
+               0.20 -0.24 0.01 1 0 0 0
+               0.07 -0.31 0.01 1 0 0 0
+               -0.05 -0.32 0 1 0 0 0"
+         ctrl="0 1.2 0 -1.2 0 0 0 0.0245 0.0245"/>
   </keyframe>
 </mujoco>
