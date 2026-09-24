@@ -57,6 +57,16 @@ class PlacoArmIKSolver:
         self.regularization_task.set_joints(default_arm_joints)
         self.regularization_task.configure("joints_regularization", "soft", 1e-2)
 
+    def set_regularization_reference(self, q: np.ndarray) -> None:
+        """Use the measured startup pose as the posture preference for real teleop."""
+        reference = {}
+        for name in self.arm_joints:
+            idx = self.joint_indices.get(name)
+            if idx is not None:
+                reference[name] = float(q[idx])
+        self._default_arm_joints = reference
+        self.regularization_task.set_joints(reference)
+
     def solve(self, q: np.ndarray, target_pos: np.ndarray, target_quat: np.ndarray | None) -> np.ndarray | None:
         """求解单臂 IK，成功返回 q（URDF 序），失败返回 None。"""
         self.placo_robot.state.q[7:] = np.asarray(q, dtype=float).copy()

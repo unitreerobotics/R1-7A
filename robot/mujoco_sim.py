@@ -87,6 +87,10 @@ class MujocoArmSim:
     def step(self, n: int = 1) -> None:
         for _ in range(max(1, n)):
             self._mujoco.mj_step(self.model, self.data)
+        self.sync()
+
+    def sync(self) -> None:
+        """Refresh the passive viewer without advancing simulation time."""
         if self.viewer is not None:
             if not self.viewer.is_running():
                 self.show_viewer = False

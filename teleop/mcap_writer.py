@@ -12,8 +12,9 @@ Layout of one ``episode_XXXX.mcap``:
                            {idx, sample_time_ns, image_source_frame_id,
                             colors, states, actions}
 
-``colors`` holds the four cameras in the fixed ``CAMERA_ORDER`` below, each as
-a base64-encoded JPEG.
+``colors`` holds base64-encoded JPEG observations. The default remains the
+fixed four-camera R1-A7 order; simulation callers may explicitly select a
+subset through ``camera_order``.
 """
 
 from __future__ import annotations
@@ -37,13 +38,26 @@ class FourCameraMcapRecorder:
         "color_3_wrist_right",
     )
 
-    def __init__(self, task_dir: str, task_goal: str, frequency: float) -> None:
+    def __init__(
+        self,
+        task_dir: str,
+        task_goal: str,
+        frequency: float,
+        format_name: str = "r1_a7_four_camera_mcap_json_v1",
+        camera_order: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         from mcap.writer import Writer
 
         self._writer_type = Writer
         self.task_dir = os.path.abspath(task_dir)
         self.task_goal = str(task_goal)
         self.frequency = float(frequency)
+        self.format_name = str(format_name)
+        self.camera_order = tuple(camera_order or self.CAMERA_ORDER)
+        if not self.camera_order:
+            raise ValueError("camera_order must contain at least one camera key")
+        if len(set(self.camera_order)) != len(self.camera_order):
+            raise ValueError(f"camera_order contains duplicates: {self.camera_order}")
         os.makedirs(self.task_dir, exist_ok=True)
         self.episode_id = self._find_last_episode_id()
         self.file_handle = None
@@ -109,11 +123,14 @@ class FourCameraMcapRecorder:
         timestamp_ns = time.time_ns()
         meta = {
             "info": {
-                "format": "r1_a7_four_camera_mcap_json_v1",
+                "format": self.format_name,
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "frequency_hz": self.frequency,
-                "camera_order": list(self.CAMERA_ORDER),
-                "camera_positions": ["head_left", "head_right", "wrist_left", "wrist_right"],
+                "camera_order": list(self.camera_order),
+                "camera_positions": [
+                    name.removeprefix("color_").split("_", 1)[-1]
+                    for name in self.camera_order
+                ],
             },
             "text": {"goal": self.task_goal},
             "config": metadata,
@@ -145,18 +162,21 @@ class FourCameraMcapRecorder:
         states: dict,
         actions: dict,
         image_source_frame_id: int,
+        sample_time_ns: int | None = None,
     ) -> None:
-        """Append one sample. ``frames`` must follow ``CAMERA_ORDER``."""
+        """Append one sample. ``frames`` must follow ``self.camera_order``."""
         if self.writer is None or self.frame_channel_id is None:
             return
-        if len(frames) != 4:
-            raise ValueError(f"Expected four camera frames, got {len(frames)}")
+        if len(frames) != len(self.camera_order):
+            raise ValueError(
+                f"Expected {len(self.camera_order)} camera frames, got {len(frames)}"
+            )
 
         self.item_id += 1
-        timestamp_ns = time.time_ns()
+        timestamp_ns = time.time_ns() if sample_time_ns is None else int(sample_time_ns)
         colors = {
             name: self._encode_color(frame)
-            for name, frame in zip(self.CAMERA_ORDER, frames)
+            for name, frame in zip(self.camera_order, frames)
         }
         message = {
             "idx": self.item_id,

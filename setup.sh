@@ -19,8 +19,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_NAME="${ENV_NAME:-r1_teleop}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 
-CONDA_FORGE="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
-PIP_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
+CONDA_FORGE="${CONDA_FORGE:-https://conda.anaconda.org/conda-forge}"
+PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
 
 SKIP_APT=0
 SKIP_XRT=0
@@ -127,7 +127,7 @@ python -m pip install \
   "meshcat>=0.3.2" \
   "mujoco>=3.1" \
   "sshkeyboard>=2.3.1" \
-  tyro scipy mcap pyzmq opencv-python
+  tyro scipy mcap pyzmq opencv-python pytest
 
 # ---------------------------------------------------------------------------
 # 5. Unitree SDK2 Python

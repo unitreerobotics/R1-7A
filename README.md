@@ -100,11 +100,50 @@ python scripts/teleop_r1arm_sim.py --mock-xr --no-viewer --debug
 
 ### 3. 真机遥操作
 
+**独立 R1Arm 单臂（RS485 SDK）：**
+
+```bash
+# 第一次先编译桥接库（不控制机械臂）
+python scripts/build_r1arm_sdk_bridge.py \
+  --sdk-root /home/unitree/mjn_workspace/R1_arm_SDK_x86/r1_arm
+
+# 无硬件 dry-run
+python scripts/teleop_r1arm_real.py --mock-xr --debug
+
+# 真机；把串口替换为本机实际枚举到的设备
+python scripts/teleop_r1arm_real.py --motion-mode --port /dev/ttyUSB3
+
+# 单侧 Dex1 走 DDS，机械臂仍走串口
+python scripts/teleop_r1arm_real.py \
+  --motion-mode --port /dev/ttyUSB3 \
+  --enable-dex1 --dex1-net enp4s0
+```
+
+完整的启动流程、坐标映射和安全说明见
+[R1ARM_REAL_TELEOP.md](R1ARM_REAL_TELEOP.md)。
+
+**R1-A7 双臂人形机器人（DDS）：**
+
 ```bash
 python scripts/teleop_real.py --motion-mode --enable-dex1 --net enp5s0
 ```
 
 ### 4. 数据采集 / 回放
+
+R1Arm MuJoCo 单/双臂仿真采集和可视化回放请参阅
+[R1ARM_SIM_DATA_COLLECTION.md](R1ARM_SIM_DATA_COLLECTION.md)。仿真数据沿用下述
+R1-A7 MCAP 的 topic、图像和 state/action 结构，但关节向量严格采用 R1Arm
+仿真实际动作空间（单臂 8 维、双臂 16 维，不含 body）。无需连接真机或相机服务。
+
+```bash
+# R1Arm 仿真采集；episode_XXXX.mcap 直接写入指定目录
+python scripts/record_r1arm_sim.py \
+  --output-dir /home/unitree/datasets/r1arm/pick_demo
+
+# 在 MuJoCo 中回放
+python scripts/replay_r1arm_sim.py \
+  --episode /home/unitree/datasets/r1arm/pick_demo/episode_0000.mcap
+```
 
 ```bash
 # 开启机器人端图像服务端和夹爪驱动

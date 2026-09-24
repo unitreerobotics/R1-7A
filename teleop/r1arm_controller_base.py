@@ -69,10 +69,12 @@ class R1ArmTeleopControllerBase:
         mock_xr: bool = False,
         debug: bool = False,
         scale_factor: float | None = None,
+        allow_xr_fallback: bool = True,
     ):
         self.config = config
         self.mock_xr = mock_xr
         self.debug = debug
+        self.allow_xr_fallback = bool(allow_xr_fallback)
         self.scale_factor = float(config.scale_factor if scale_factor is None else scale_factor)
         self.dual_arm = bool(config.dual_arm)
         self.control_side = str(config.control_side).lower()
@@ -155,6 +157,10 @@ class R1ArmTeleopControllerBase:
                 self.xr_client = make_xr_client()
                 print("Connected to XRoboToolkit")
             except Exception as e:
+                if not self.allow_xr_fallback:
+                    raise RuntimeError(
+                        "Could not connect to XRoboToolkit and XR fallback is disabled"
+                    ) from e
                 print(f"Warning: Could not connect to XRoboToolkit: {e}")
                 print("Falling back to mock XR input")
                 self.xr_client = None
@@ -268,7 +274,13 @@ class R1ArmTeleopControllerBase:
             return False
 
         self._reset_blend_frame += 1
-        w_new = float(np.clip(self._reset_blend_frame / float(self.reset_blend_frames), 0.0, 1.0))
+        # Smoothstep: ease in and ease out so reset starts/stops softly while
+        # moving faster through the middle of the trajectory. The real output
+        # path still applies its speed and command-lead limits afterward.
+        w_linear = float(
+            np.clip(self._reset_blend_frame / float(self.reset_blend_frames), 0.0, 1.0)
+        )
+        w_new = w_linear * w_linear * (3.0 - 2.0 * w_linear)
         w_old = 1.0 - w_new
         self.q = clamp_configuration(self.model, w_old * self._q_blend_start + w_new * self._q_blend_goal)
         if self.dual_arm and self._q_left_blend_start is not None and self._q_left_blend_goal is not None:
@@ -308,11 +320,17 @@ class R1ArmTeleopControllerBase:
                 if xr_pose_is_valid(pose):
                     controller_poses[name] = np.asarray(pose, dtype=float)[:7]
                 else:
+                    if not self.allow_xr_fallback:
+                        if self.debug:
+                            print(f"XR pose invalid: {name}; holding current command")
+                        return {}, False
                     return make_mock_controller_poses(self.t), True
             return controller_poses, True
         except Exception as e:
             if self.debug:
                 print(f"XR read error: {e}")
+            if not self.allow_xr_fallback:
+                return {}, False
             return make_mock_controller_poses(self.t), True
 
     def get_grip_state(self, side: str | None = None) -> float:
@@ -483,6 +501,16 @@ class R1ArmTeleopControllerBase:
     def _on_stop(self):
         if self.hand_ctrl is not None:
             self.hand_ctrl.stop()
+        # The native XR service owns background threads. Closing it explicitly
+        # before interpreter teardown avoids occasional shutdown segfaults.
+        xr_client = self.xr_client
+        self.xr_client = None
+        if xr_client is not None:
+            try:
+                xr_client.close()
+            except Exception as exc:
+                if self.debug:
+                    print(f"XR close warning: {exc}")
 
     def get_joint_states(self) -> dict:
         return {name: float(self.q[idx]) for name, idx in self.joint_indices.items()}
@@ -516,15 +544,18 @@ class R1ArmTeleopControllerBase:
             print(f"Starting R1Arm teleoperation (rate={rate} Hz, side={self.control_side})")
             print(f"Hold {self.control_side} grip to activate arm tracking")
             print(f"Hold {self.control_side} trigger to close Dex1 gripper")
-        print(
-            f"Press A button to soft-reset to home "
-            f"({self.reset_blend_frames} frames cross-fade)"
-        )
+        if self.enable_a_button_reset:
+            print(
+                f"Press A button to soft-reset to home "
+                f"({self.reset_blend_frames} frames cross-fade)"
+            )
+        else:
+            print("A-button home reset is disabled")
         print("Press Ctrl+C to stop")
 
-        self._on_start()
         dt = 1.0 / rate
         try:
+            self._on_start()
             while self.running:
                 loop_start = time.time()
                 self.step(dt)
