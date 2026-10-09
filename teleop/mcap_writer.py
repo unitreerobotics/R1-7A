@@ -53,9 +53,9 @@ class FourCameraMcapRecorder:
         self.task_goal = str(task_goal)
         self.frequency = float(frequency)
         self.format_name = str(format_name)
-        self.camera_order = tuple(camera_order or self.CAMERA_ORDER)
-        if not self.camera_order:
-            raise ValueError("camera_order must contain at least one camera key")
+        # ``None`` falls back to the R1-A7 four-camera default; an explicit empty
+        # tuple is allowed for state/action-only recordings.
+        self.camera_order = tuple(self.CAMERA_ORDER if camera_order is None else camera_order)
         if len(set(self.camera_order)) != len(self.camera_order):
             raise ValueError(f"camera_order contains duplicates: {self.camera_order}")
         os.makedirs(self.task_dir, exist_ok=True)
@@ -163,8 +163,14 @@ class FourCameraMcapRecorder:
         actions: dict,
         image_source_frame_id: int,
         sample_time_ns: int | None = None,
+        camera_frame_times_ns: dict[str, int] | None = None,
     ) -> None:
-        """Append one sample. ``frames`` must follow ``self.camera_order``."""
+        """Append one sample. ``frames`` must follow ``self.camera_order``.
+
+        ``camera_frame_times_ns``（P3 对齐）: 每路相机该帧的到达时刻
+        （``time.time_ns()`` 基准）。与 ``sample_time_ns``（本样本写入
+        时刻）的差 = 每路图像相对 action 的实际偏移，可测而非假设。
+        """
         if self.writer is None or self.frame_channel_id is None:
             return
         if len(frames) != len(self.camera_order):
@@ -182,6 +188,10 @@ class FourCameraMcapRecorder:
             "idx": self.item_id,
             "sample_time_ns": timestamp_ns,
             "image_source_frame_id": int(image_source_frame_id),
+            "camera_frame_times_ns": (
+                {str(k): int(v) for k, v in camera_frame_times_ns.items()}
+                if camera_frame_times_ns else {}
+            ),
             "colors": colors,
             "states": states,
             "actions": actions,

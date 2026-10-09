@@ -58,8 +58,7 @@ def load_episode(path: Path) -> tuple[list[dict[str, Any]], dict, dict, dict]:
     frames.sort(key=lambda item: int(item.get("idx", 0)))
     expected_dof = int(config.get("action_dim", 16 if config.get("dual_arm", False) else 8))
     camera_order = tuple(info.get("camera_order") or frames[0].get("colors", {}).keys())
-    if not camera_order:
-        raise ValueError("MCAP contains no camera observations")
+    # An empty camera_order is a valid state/action-only episode.
     for frame in frames:
         validate_r1arm_frame(
             frame,
@@ -162,6 +161,9 @@ def replay(args: argparse.Namespace) -> None:
 
     recorded_hz = float(info.get("frequency_hz", 30.0))
     camera_order = tuple(info.get("camera_order") or frames[0]["colors"].keys())
+    if args.show_observations and not camera_order:
+        print("[Replay] WARNING: episode has no camera observations; skipping display")
+        args.show_observations = False
     hz = args.hz if args.hz > 0 else recorded_hz
     print(f"[MCAP] {episode}")
     print(f"[MCAP] frames={len(frames)} goal={text.get('goal', '')!r}")

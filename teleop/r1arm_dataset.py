@@ -223,7 +223,11 @@ def validate_r1arm_frame(
     if expected_dof not in (SINGLE_ARM_DATASET_DOF, DUAL_ARM_DATASET_DOF):
         raise ValueError(f"R1Arm expected_dof must be 8 or 16, got {expected_dof}")
     colors = frame.get("colors", {})
-    camera_keys = tuple(expected_camera_keys or FourCameraMcapRecorder.CAMERA_ORDER)
+    camera_keys = tuple(
+        FourCameraMcapRecorder.CAMERA_ORDER if expected_camera_keys is None else expected_camera_keys
+    )
+    # An explicit empty tuple means "state/action-only episode" — skip the
+    # camera checks instead of falling back to the four-camera default.
     missing = [key for key in camera_keys if key not in colors]
     if missing:
         raise ValueError(f"frame is missing camera observations: {missing}")
