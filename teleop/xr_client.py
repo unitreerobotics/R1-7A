@@ -72,6 +72,20 @@ class XrClient:
             f"Invalid name: {name!r}. Valid: 'headset', 'left_controller', 'right_controller'."
         )
 
+    def get_frame_stamp_ns(self) -> int | None:
+        """Server frame timestamp (ns), or None if the API is unavailable.
+
+        The server updates ``TimeStampNs`` on every pushed frame (gRPC
+        feedback loop in py_bindings.cpp). Callers poll faster than the
+        server pushes; comparing successive stamps tells them whether a
+        new frame arrived since the last poll — the frame clock the
+        control loop needs to avoid re-consuming stale poses.
+        """
+        try:
+            return int(self._xrt.get_time_stamp_ns())
+        except Exception:
+            return None
+
     # ---- triggers / grips (float 0…1) ------------------------------------
 
     def get_key_value_by_name(self, name: str) -> float:

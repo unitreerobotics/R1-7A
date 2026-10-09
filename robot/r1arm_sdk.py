@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import os
 from dataclasses import dataclass
@@ -37,6 +38,49 @@ def validate_calibration_file(path: str | Path) -> Path:
     calibration = Path(path).expanduser().resolve()
     if not calibration.is_file():
         raise FileNotFoundError(f"R1Arm calibration file not found: {calibration}")
+    return calibration
+
+
+def parse_gain(text: str, name: str = "gain") -> "float | np.ndarray":
+    """argparse type: scalar ("100") or 7 per-joint values ("100,100,100,100,50,50,50").
+
+    Returns a float for scalar input, an ndarray of 7 for per-joint input. The
+    scalar form keeps the legacy broadcast ABI; the per-joint form routes
+    through ``command_position``'s v2 ABI.
+    """
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{name} must be numbers separated by ','; got {text!r}")
+    if not values or any(not np.isfinite(v) for v in values):
+        raise argparse.ArgumentTypeError(f"{name} contains non-finite values: {text!r}")
+    if len(values) == 1:
+        return values[0]
+    if len(values) != JOINT_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"{name} must be 1 scalar or {JOINT_COUNT} comma-separated values; got {len(values)}"
+        )
+    return np.asarray(values, dtype=float)
+
+
+def format_gain(gain: "float | np.ndarray") -> str:
+    """One-line human-readable form of a scalar or per-joint gain."""
+    if np.isscalar(gain):
+        return f"{float(gain):g}"
+    values = np.asarray(gain, dtype=float).reshape(-1)
+    if values.size == 1:
+        return f"{float(values[0]):g}"
+    return "per-joint " + ",".join(f"{v:g}" for v in values)
+
+
+def as_gain_array(gain: "float | np.ndarray") -> np.ndarray:
+    """Broadcast a scalar-or-per-joint gain to a 7-vector (for metadata math)."""
+    values = np.asarray(gain, dtype=float).reshape(-1)
+    if values.size == 1:
+        return np.full(JOINT_COUNT, float(values[0]))
+    if values.size != JOINT_COUNT:
+        raise ValueError(f"gain must be 1 scalar or {JOINT_COUNT} values; got {values.size}")
+    return values
 
     seen: set[int] = set()
     for line_no, raw in enumerate(calibration.read_text(encoding="utf-8").splitlines(), 1):
@@ -125,6 +169,15 @@ class R1ArmSdkBus:
             *error_args,
         ]
         self._lib.r1arm_bridge_command_position.restype = ctypes.c_int
+        self._lib.r1arm_bridge_command_position_v2.argtypes = [
+            void_p,
+            float_p,
+            float_p,
+            float_p,
+            float_p,
+            *error_args,
+        ]
+        self._lib.r1arm_bridge_command_position_v2.restype = ctypes.c_int
         self._lib.r1arm_bridge_read_state.argtypes = [
             void_p,
             float_p,
@@ -170,16 +223,54 @@ class R1ArmSdkBus:
     def probe_once(self) -> None:
         self._call(self._lib.r1arm_bridge_probe, self._handle)
 
-    def command_position(self, q: np.ndarray, kp: float, kd: float) -> None:
+    def command_position(
+        self,
+        q: np.ndarray,
+        kp: "float | np.ndarray",
+        kd: "float | np.ndarray",
+        tau: "np.ndarray | None" = None,
+    ) -> None:
+        """Position command with scalar or per-joint gains (and optional tau ff).
+
+        Scalar kp/kd take the legacy broadcast ABI; arrays of 7 take the v2
+        ABI, which also forwards an optional per-joint torque feedforward.
+        """
         values = np.ascontiguousarray(q, dtype=np.float32).reshape(-1)
         if values.size != JOINT_COUNT or not np.all(np.isfinite(values)):
             raise ValueError(f"Position command must be {JOINT_COUNT} finite values")
+
+        def joint_array(gain, name: str) -> np.ndarray:
+            if np.isscalar(gain):
+                gain = np.full(JOINT_COUNT, float(gain))
+            array = np.ascontiguousarray(gain, dtype=np.float32).reshape(-1)
+            if array.size != JOINT_COUNT or not np.all(np.isfinite(array)):
+                raise ValueError(f"{name} must be a scalar or {JOINT_COUNT} finite values")
+            return array
+
+        if np.isscalar(kp) and np.isscalar(kd) and tau is None:
+            self._call(
+                self._lib.r1arm_bridge_command_position,
+                self._handle,
+                values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                float(kp),
+                float(kd),
+            )
+            return
+
+        kp_array = joint_array(kp, "kp")
+        kd_array = joint_array(kd, "kd")
+        tau_array = None
+        if tau is not None:
+            tau_array = joint_array(tau, "tau")
         self._call(
-            self._lib.r1arm_bridge_command_position,
+            self._lib.r1arm_bridge_command_position_v2,
             self._handle,
             values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            float(kp),
-            float(kd),
+            kp_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            kd_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            tau_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            if tau_array is not None
+            else None,
         )
 
     def read_state(self) -> R1ArmSdkState:

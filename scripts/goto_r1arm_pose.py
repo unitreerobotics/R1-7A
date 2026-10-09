@@ -38,13 +38,18 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from robot.r1arm_config import ARM_JOINTS, ARM_LIMITS
+from robot.arm_model import load_robot_model
+from robot.r1arm_config import ARM_JOINTS, ARM_LIMITS, DEFAULT_URDF_PATH
 from robot.r1arm_sdk import (
     DEFAULT_BRIDGE_LIBRARY,
     DEFAULT_SDK_ROOT,
     R1ArmSdkBus,
     R1ArmSdkState,
+    as_gain_array,
+    format_gain,
     model_to_sdk_q,
+    parse_gain,
+    sdk_to_model_q,
 )
 
 ARM_INIT_SDK = "0,1.2,0,1.2,0,0,0"
@@ -140,22 +145,53 @@ def _print_progress(state: R1ArmSdkState, target: np.ndarray) -> None:
     print()
 
 
+def gravity_feedforward(model, data, q_arm: np.ndarray, clip: float) -> np.ndarray:
+    """Gravity torque at ``q_arm`` (URDF frame, 7 arm joints) → SDK frame, clipped.
+
+    The URDF appends two Dex1 finger joints after the arm (nq=9); gravity
+    loads on them are negligible and their torque slots are dropped — only the
+    first 7 entries are forwarded. SDK torque signs mirror the joint sign
+    convention (J4), so the same per-joint flip as positions applies.
+    Clipped for safety: a URDF/model mismatch must not command unbounded
+    torque.
+    """
+    import pinocchio as pin
+
+    q_full = np.zeros(model.nq, dtype=float)
+    q_full[: len(ARM_JOINTS)] = np.asarray(q_arm, dtype=float).reshape(-1)
+    tau = pin.computeGeneralizedGravity(model, data, q_full)
+    tau = np.asarray(tau, dtype=float).reshape(-1)[: len(ARM_JOINTS)]
+    return np.clip(model_to_sdk_q(tau), -clip, clip)
+
+
 def run_position_goto(
     bus: R1ArmSdkBus,
     target: np.ndarray,
     *,
-    kp: float,
-    kd: float,
+    kp: "float | np.ndarray",
+    kd: "float | np.ndarray",
     rate: float,
     max_joint_speed: float,
     max_lead: float,
     hold_ms: int,
     done_rad: float,
     timeout_ms: float,
+    gravity: tuple | None = None,
 ) -> None:
-    """FOC 原位保持 → 位置控制爬行到 target → 保持。失败/中断由调用方停机。"""
+    """FOC 原位保持 → 位置控制爬行到 target → 保持。失败/中断由调用方停机。
+
+    ``gravity`` = (model, data, tau_clip): enables per-cycle gravity feedforward
+    computed at the *commanded* pose (not the measured one — no feedback loop),
+    converted to SDK torque signs and clipped.
+    """
     max_delta = max_joint_speed / rate
     period = 1.0 / rate
+
+    def tau_ff(command_sdk: np.ndarray) -> np.ndarray | None:
+        if gravity is None:
+            return None
+        model, data, tau_clip = gravity
+        return gravity_feedforward(model, data, sdk_to_model_q(command_sdk), tau_clip)
 
     # Phase 1: 零增益 FOC 已在探测时建立，这里把增益提上来做原位保持（目标=实测，
     # 误差≈0，无启动跳变），确认 7 轴都在 FOC。
@@ -164,7 +200,7 @@ def run_position_goto(
     _check_feedback(state, require_foc=False)
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
-        bus.command_position(state.q, kp, kd)
+        bus.command_position(state.q, kp, kd, tau=tau_ff(state.q))
         time.sleep(period)
         state = bus.read_state()
         if np.all(state.mode == 1):
@@ -185,7 +221,7 @@ def run_position_goto(
         command = limit_command(
             target, command, state.q, max_delta=max_delta, max_lead=max_lead
         )
-        bus.command_position(command, kp, kd)
+        bus.command_position(command, kp, kd, tau=tau_ff(command))
         now = time.monotonic()
         if now - last_print >= 1.0:
             last_print = now
@@ -203,7 +239,7 @@ def run_position_goto(
         deadline = time.monotonic() + hold_ms / 1000.0
         last_print = 0.0
         while time.monotonic() < deadline:
-            bus.command_position(target, kp, kd)
+            bus.command_position(target, kp, kd, tau=tau_ff(target))
             state = bus.read_state()
             _check_feedback(state, require_foc=True)
             now = time.monotonic()
@@ -249,10 +285,16 @@ def main() -> int:
     # 这个 SDK 里没有独立的"力矩模式"：mode 只有 0(stop)/1(FOC 位置环)，力矩是
     # 位置环的输出 tau = kp * clamp(q_target - q_meas, ±lead)，离目标越近越小。
     # 所以力矩的唯一旋钮就是 kp * --max-command-lead 这个乘积，别只调 kp 不看 lead。
-    parser.add_argument("--kp", type=float, default=40.0,
-                        help="位置环增益 Nm/rad（默认 40，同摇操）")
-    parser.add_argument("--kd", type=float, default=0.5,
-                        help="阻尼增益 Nm/(rad/s)（默认 0.5，同摇操）")
+    parser.add_argument("--kp", type=parse_gain, default=40.0,
+                        help="位置环增益 Nm/rad（默认 40，同摇操）；单个数=全关节广播，"
+                             "或 7 个逗号分隔值=逐关节（如 100,100,100,100,50,50,50）")
+    parser.add_argument("--kd", type=parse_gain, default=0.5,
+                        help="阻尼增益 Nm/(rad/s)（默认 0.5，同摇操）；同 --kp 可逐关节")
+    parser.add_argument("--gravity-ff", action="store_true",
+                        help="下发重力前馈力矩（URDF 模型在指令姿态处计算，clip 后经 tau 通道）；"
+                             "消除稳态悬垂 g/kp，比加 kp 更有效且无过冲代价")
+    parser.add_argument("--tau-clip", type=float, default=8.0,
+                        help="重力前馈单关节力矩限幅 Nm（默认 8）")
     parser.add_argument("--max-joint-speed", type=float, default=0.5,
                         help="目标爬行速度上限 rad/s（默认 0.5，同摇操）")
     parser.add_argument("--max-command-lead", type=float, default=0.15,
@@ -300,9 +342,19 @@ def main() -> int:
     print()
     print(f"  最大单关节移动: {np.abs(delta).max():.4f} rad "
           f"({np.degrees(np.abs(delta).max()):.1f}°)")
-    print(f"  位置控制      : kp={args.kp} kd={args.kd} "
+    # 力矩三项合计（FOC: tau = kp·Δq + kd·Δdq + tau_ff）的保守上界：
+    # 位置项 kp×lead + 阻尼项 kd×|dq|max + 前馈 clip。与电机峰值（60/50 系列
+    # ≈34/32 Nm）对比——留半峰值裕度，异常单拍被 lead 物理限幅。
+    kp_arr = as_gain_array(args.kp)
+    kd_arr = as_gain_array(args.kd)
+    torque_cap = float(np.max(kp_arr * args.max_command_lead
+                              + kd_arr * args.max_joint_speed
+                              + (args.tau_clip if args.gravity_ff else 0.0)))
+    motor_peak = 34.4
+    print(f"  位置控制      : kp={format_gain(args.kp)} kd={format_gain(args.kd)} "
           f"速度≤{args.max_joint_speed} rad/s 超前≤{args.max_command_lead} rad "
-          f"→ 力矩上限 {args.kp * args.max_command_lead:.1f} Nm")
+          f"→ 力矩上界 {torque_cap:.1f} Nm（三项合计，最大关节；"
+          f"电机峰值 {motor_peak} Nm 的 {torque_cap / motor_peak * 100:.0f}%）")
 
     # ---- 3. 安全检查 ------------------------------------------------------
     problems = []
@@ -337,6 +389,17 @@ def main() -> int:
 
     print("\n  ✓ 安全检查通过")
 
+    gravity = None
+    if args.gravity_ff:
+        model, data = load_robot_model(str(DEFAULT_URDF_PATH))
+        tau_sdk = gravity_feedforward(model, data, sdk_to_model_q(target), args.tau_clip)
+        print(f"\n  重力前馈（目标姿态处，SDK 坐标，clip ±{args.tau_clip:g} Nm）：")
+        for i, name in enumerate(ARM_JOINTS):
+            print(f"    {name:<6}{tau_sdk[i]:>+8.3f} Nm")
+        print("  （腕上挂了相机的臂实测负载比裸 URDF 大 ~35–40%，前馈只补偿模型部分；")
+        print("    剩余下垂 = 实测负载 - 前馈，由位置环承担）")
+        gravity = (model, data, float(args.tau_clip))
+
     if not args.move:
         print("\n这是预检模式（没有 --move），未执行任何运动。")
         print("确认上面的数字合理后，执行：")
@@ -350,9 +413,10 @@ def main() -> int:
     # ---- 4. 执行 ----------------------------------------------------------
     print()
     print(
-        f"即将用位置控制爬行到目标（kp={args.kp} kd={args.kd} "
+        f"即将用位置控制爬行到目标（kp={format_gain(args.kp)} kd={format_gain(args.kd)} "
         f"速度≤{args.max_joint_speed} rad/s 超前≤{args.max_command_lead} rad，"
-        f"力矩上限 {args.kp * args.max_command_lead:.1f} Nm）"
+        f"力矩上界 {torque_cap:.1f} Nm（三项合计）"
+        + ("，含重力前馈" if gravity is not None else "") + "）"
     )
     print("  ⚠️ 全程托住机械臂；急停放在手边。")
     print("  ⚠️ 到位后（--hold-ms 到点）机械臂会失去保持并下坠。")
@@ -375,6 +439,7 @@ def main() -> int:
             hold_ms=args.hold_ms,
             done_rad=args.done_rad,
             timeout_ms=args.goto_timeout * 1000.0,
+            gravity=gravity,
         )
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，停机。")

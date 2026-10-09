@@ -8,12 +8,20 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from robot.r1arm_config import R1ArmConfig
-from robot.r1arm_sdk import DEFAULT_BRIDGE_LIBRARY, DEFAULT_SDK_ROOT, validate_calibration_file
+from robot.r1arm_sdk import (
+    DEFAULT_BRIDGE_LIBRARY,
+    DEFAULT_SDK_ROOT,
+    as_gain_array,
+    format_gain,
+    parse_gain,
+    validate_calibration_file,
+)
 from teleop.r1arm_real_controller import R1ArmRealTeleopController
 
 
@@ -21,9 +29,16 @@ def confirm_motion(args: argparse.Namespace) -> None:
     print("\nREAL R1Arm MOTION IS ABOUT TO BE ENABLED")
     print(f"  serial:       {args.port} @ {args.baud}")
     print(f"  calibration:  {args.calib}")
-    print(f"  gains:        kp={args.kp}, kd={args.kd}")
+    print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
+          f"gravity_ff={'on' if args.gravity_ff else 'off'}")
     print(f"  max speed:    {args.max_joint_speed} rad/s")
-    print(f"  max lead:     {args.max_command_lead} rad")
+    kp_arr = as_gain_array(args.kp)
+    kd_arr = as_gain_array(args.kd)
+    torque_cap = float(np.max(kp_arr * args.max_command_lead
+                              + kd_arr * args.max_joint_speed
+                              + (args.tau_clip if args.gravity_ff else 0.0)))
+    print(f"  max lead:     {args.max_command_lead} rad → 力矩上界 {torque_cap:.1f} Nm"
+          f"（三项合计；电机峰值 34.4 Nm 的 {torque_cap / 34.4 * 100:.0f}%）")
     print(f"  controller:   {args.side} PICO controller")
     print("Keep the emergency stop reachable and support the arm during startup probing.")
     answer = input("Type MOVE to continue: ").strip()
@@ -53,11 +68,40 @@ def main() -> None:
     parser.add_argument("--urdf", type=Path, help="Simulation/IK URDF (same model as the working sim)")
     parser.add_argument("--side", choices=["left", "right"], default="right")
     parser.add_argument("--scale-factor", type=float, default=1.0)
-    parser.add_argument("--rate", type=float, default=50.0)
-    parser.add_argument("--kp", type=float, default=80.0)
-    parser.add_argument("--kd", type=float, default=2)
-    parser.add_argument("--max-joint-speed", type=float, default=1, help="rad/s")
-    parser.add_argument("--max-command-lead", type=float, default=1, help="rad")
+    parser.add_argument("--rate", type=float, default=30.0,
+                        help="控制环 Hz。默认 30（2026-10-09 定居：XR帧时钟 1:1 + "
+                             "IK + 执行 + 录制全链 30Hz，action/state 同拍统一）")
+    parser.add_argument(
+        "--ik-dt", type=float, default=0.0,
+        help="IK 积分步长 s；0 = 跟随 1/--rate（对齐）。100 Hz 下如果 dt 对齐后"
+             "出现振荡/噪声（IK 增益恢复全幅），试 0.02：保留指令密度收益、"
+             "压回 IK 每步增量",
+    )
+    parser.add_argument(
+        "--gravity-ff", dest="gravity_ff", action="store_true", default=True,
+        help="下发重力前馈力矩（指令姿态处计算，clip 后经 v2 tau 通道）；"
+             "默认开（P0 三重实测：J4 悬垂误差 −70%）。--no-gravity-ff 关闭",
+    )
+    parser.add_argument(
+        "--no-gravity-ff", dest="gravity_ff", action="store_false",
+        help="关闭重力前馈（回到 kp 硬扛悬垂的旧行为）",
+    )
+    parser.add_argument(
+        "--tau-clip", type=float, default=8.0,
+        help="重力前馈单关节力矩限幅 Nm（默认 8）",
+    )
+    parser.add_argument("--kp", type=parse_gain, default=80.0,
+                        help="位置环增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
+    parser.add_argument("--kd", type=parse_gain, default=2,
+                        help="阻尼增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
+    parser.add_argument("--max-joint-speed", type=float, default=1.0,
+                        help="rad/s（默认 1.5：电机能力 48%，与 QP/整形器三层同源）")
+    parser.add_argument(
+        "--max-command-lead", type=float, default=0.15,
+        help="命令相对实测的最大超前量 rad（默认 0.15）。它限制的是力矩公式"
+             "首项 kp×误差 的上界：异常单拍位移 ≤8.6°，三项合计力矩"
+             "（kp×lead + kd×|dq| + tau_ff）≈ 峰值一半；正常跟踪不触发",
+    )
     parser.add_argument("--feedback-timeout", type=float, default=3.0)
     parser.add_argument("--foc-timeout", type=float, default=1.0)
     parser.add_argument("--enable-dex1", action="store_true")
@@ -73,8 +117,9 @@ def main() -> None:
     parser.add_argument(
         "--reset-blend-frames",
         type=int,
-        default=100,
-        help="A/home reset duration in control frames (default: 100 = about 2 s at 50 Hz)",
+        default=60,
+        help="A/home reset 时长（控制帧数；blend 按 wall-clock frames/50Hz 计秒，"
+             "默认 60 ≈ 1.2s；想要旧 2s 体验传 100）",
     )
     parser.add_argument("--mock-xr", action="store_true", help="Dry-run only; rejected with --motion-mode")
     parser.add_argument("--debug", action="store_true")
@@ -133,6 +178,9 @@ def main() -> None:
         mock_xr=args.mock_xr,
         debug=args.debug,
         scale_factor=args.scale_factor,
+        ik_dt=args.ik_dt,
+        gravity_ff=args.gravity_ff,
+        tau_clip=args.tau_clip,
     )
     controller.enable_a_button_reset = bool(args.enable_a_reset)
     controller.run(rate=args.rate)

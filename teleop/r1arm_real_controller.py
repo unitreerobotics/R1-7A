@@ -56,8 +56,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         dex1_interface: str = "",
         dex1_domain: int = 0,
         grip_torque_limit: float = -1.0,
-        kp: float = 40.0,
-        kd: float = 0.5,
+        kp: "float | np.ndarray" = 40.0,
+        kd: "float | np.ndarray" = 0.5,
         rate: float = 50.0,
         max_joint_speed: float = 0.5,
         max_command_lead: float = 0.15,
@@ -67,6 +67,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         mock_xr: bool = False,
         debug: bool = False,
         scale_factor: float | None = None,
+        ik_dt: float = 0.0,
+        gravity_ff: bool = False,
+        tau_clip: float = 8.0,
         bus_factory: Callable[..., R1ArmSdkBus] = R1ArmSdkBus,
     ) -> None:
         if config.dual_arm:
@@ -92,10 +95,23 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.dex1_interface = str(dex1_interface)
         self.dex1_domain = int(dex1_domain)
         self.grip_torque_limit = float(grip_torque_limit)
-        self.kp = float(kp)
-        self.kd = float(kd)
+        # Scalar gains broadcast to all joints via the legacy bridge ABI; a
+        # 7-vector takes the per-joint v2 ABI (shoulders/elbows vs wrists).
+        self.kp = kp if isinstance(kp, np.ndarray) else float(kp)
+        self.kd = kd if isinstance(kd, np.ndarray) else float(kd)
         self.rate_hz = float(rate)
         self.max_delta = float(max_joint_speed) / self.rate_hz
+        # IK 积分 dt 跟实际控制频率对齐（基类构造时还不知道真实 rate）；
+        # ik_dt > 0 时显式覆盖（解耦：调噪声/振荡时保留指令密度、单独压
+        # IK 每步增量）
+        for solver in (self.placo_solver, self.placo_solver_left):
+            if solver is not None:
+                solver_dt = float(ik_dt) if ik_dt and ik_dt > 0 else 1.0 / self.rate_hz
+                solver.control_rate_hz = 1.0 / solver_dt
+                solver.solver_dt = solver_dt
+                solver.solver.dt = solver_dt
+        self.gravity_ff = bool(gravity_ff)
+        self.tau_clip = float(tau_clip)
         self.max_command_lead = float(max_command_lead)
         self.feedback_timeout = float(feedback_timeout)
         self.foc_timeout = float(foc_timeout)
@@ -177,7 +193,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         assert self.arm_bus is not None and self.command_sdk is not None
         deadline = time.monotonic() + self.foc_timeout
         while time.monotonic() < deadline:
-            self.arm_bus.command_position(self.command_sdk, self.kp, self.kd)
+            self.arm_bus.command_position(
+                self.command_sdk, self.kp, self.kd, tau=self._tau_ff(self.command_sdk)
+            )
             time.sleep(1.0 / self.rate_hz)
             state = self.arm_bus.read_state()
             self._check_feedback_range(state)
@@ -235,6 +253,52 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             self._safe_stop_arm()
             raise
 
+    def _tau_ff(self, command_sdk: np.ndarray) -> np.ndarray | None:
+        """Gravity feedforward at the *commanded* pose, SDK frame, clipped.
+
+        与 goto_r1arm_pose 同一套：pinocchio 在指令姿态处计算（非实测——
+        无反馈环），经 tau 通道随位置命令下发。消除稳态悬垂 g/kp，使位置环
+        不再需要高增益维持精度，噪声/振铃随 kp 一起降。
+        """
+        if not self.gravity_ff:
+            return None
+        import pinocchio as pin
+
+        q_full = np.zeros(self.model.nq, dtype=float)
+        q_full[: len(ARM_JOINTS)] = sdk_to_model_q(np.asarray(command_sdk, dtype=float))
+        tau = pin.computeGeneralizedGravity(self.model, self.data, q_full)
+        tau = np.asarray(tau, dtype=float).reshape(-1)[: len(ARM_JOINTS)]
+        return np.clip(model_to_sdk_q(tau), -self.tau_clip, self.tau_clip)
+
+    def _reconcile_ik_seed(self, target_sdk: np.ndarray, command_sdk: np.ndarray) -> None:
+        """Pull the IK seed back toward the actually-sent command when clipped.
+
+        P1: the IK integrates its internal self.q; the output limiter may clip
+        that to a slower slew. If clipping persists, the internal target runs
+        ahead of the hardware and the recorded action drifts from what was
+        sent. When the gap exceeds a threshold, re-seed self.q's arm joints
+        from the sent command — the solver keeps solving from the pose the
+        arm is actually tracking, so re-referenced grip re-anchoring doesn't
+        have a hidden backlog to snap toward.
+        """
+        gap = np.abs(command_sdk - target_sdk)
+        if not np.any(gap > self._IK_SEED_GAP_RAD):
+            return
+        if self._reset_blending:
+            return  # blend 段 q 由 start/goal 公式逐拍重写，gap 是 slew 瞬态；回写无意义且刷日志
+        drifted = np.flatnonzero(gap > self._IK_SEED_GAP_RAD)
+        q = self.q.copy()
+        cmd_model = sdk_to_model_q(command_sdk)
+        for i, idx in enumerate(self.arm_q_indices):
+            if i in drifted:
+                q[idx] = cmd_model[i]
+        self.q = q
+        if self.debug:
+            names = ", ".join(ARM_JOINTS[i] for i in drifted)
+            print(f"[seed] re-anchored IK seed to sent command ({names})")
+
+    _IK_SEED_GAP_RAD = 0.05  # clip gap that triggers a seed re-anchor
+
     def _output_command(self) -> None:
         if not self.motion_mode:
             if self.debug and time.monotonic() - self.last_report_time >= 1.0:
@@ -257,9 +321,10 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             max_delta=self.max_delta,
             max_lead=self.max_command_lead,
         )
-        self.arm_bus.command_position(command, self.kp, self.kd)
+        self.arm_bus.command_position(command, self.kp, self.kd, tau=self._tau_ff(command))
         self.command_sdk = command
         self.last_state = state
+        self._reconcile_ik_seed(target_sdk, command)
 
         if self.debug and time.monotonic() - self.last_report_time >= 1.0:
             self.last_report_time = time.monotonic()

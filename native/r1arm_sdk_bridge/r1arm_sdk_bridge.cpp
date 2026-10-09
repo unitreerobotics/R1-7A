@@ -149,6 +149,47 @@ int r1arm_bridge_command_position(void* handle,
         error_capacity);
 }
 
+int r1arm_bridge_command_position_v2(void* handle,
+                                     const float* q,
+                                     const float* kp,
+                                     const float* kd,
+                                     const float* tau,
+                                     char* error,
+                                     int error_capacity) {
+    if (handle == nullptr || q == nullptr || kp == nullptr || kd == nullptr) {
+        setError(error, error_capacity, "null bridge or position command_v2");
+        return -1;
+    }
+    const float* feedforward = tau == nullptr ? nullptr : tau;
+    return guarded(
+        [&]() {
+            std::array<ArmJointCmd, kArmJointCount> commands{};
+            for (int i = 0; i < kArmJointCount; ++i) {
+                commands[i].mode = 1;
+                commands[i].timed_out = false;
+                commands[i].q = q[i];
+                commands[i].dq = 0.f;
+                commands[i].tau = feedforward != nullptr ? feedforward[i] : 0.f;
+                commands[i].kp = kp[i];
+                commands[i].kd = kd[i];
+            }
+            asBridge(handle)->bus.step(commands);
+            const auto fresh = asBridge(handle)->bus.lastStepFeedback();
+            std::ostringstream missing;
+            for (int i = 0; i < kArmJointCount; ++i) {
+                if (!fresh[i]) {
+                    missing << (missing.tellp() > 0 ? ", J" : "J") << (i + 1);
+                }
+            }
+            if (missing.tellp() > 0) {
+                throw std::runtime_error(
+                    "R1Arm command cycle missing fresh feedback from " + missing.str());
+            }
+        },
+        error,
+        error_capacity);
+}
+
 int r1arm_bridge_read_state(void* handle,
                             float* q,
                             float* dq,
