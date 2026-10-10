@@ -1034,7 +1034,7 @@ JPEG）、`states`（实测）、`actions`（下发）。
 | `--bridge-lib` | `build/r1arm_sdk_bridge/libr1arm_sdk_bridge.so` | 桥接库 |
 | `--side` | right | 单臂控制侧 |
 | `--scale-factor` | 1.0 | 手柄位移缩放 |
-| `--rate` | 50.0 | 控制环频率 Hz |
+| `--rate` | 100.0 | 控制环频率 Hz（控制序列写入 `/r1arm/control_sample`） |
 | `--kp` / `--kd` | 80.0 / 2 | FOC 位置环增益 |
 | `--max-joint-speed` | 1 | 目标变化速率上限 rad/s |
 | `--max-command-lead` | 1 | 指令超前上限 rad |
@@ -1108,7 +1108,7 @@ JPEG）、`states`（实测）、`actions`（下发）。
 |------|------|------|
 | `--record-button` | `X` | 开始/停止录制的按键（X/Y = 左手柄，A/B = 右手柄） |
 | `--pause-button` | `B` | 暂停/恢复录制的按键（`none` = 关闭暂停） |
-| `--frequency` | 30.0 | MCAP 出帧频率 Hz |
+| `--frequency` | 30.0 | MCAP 图像 observation 出帧频率 Hz（与控制频率独立） |
 | `--output-dir` | "" | episode 输出目录（直接指定则忽略下面的规则） |
 | `--data-root` | `data/` | 未指定 `--output-dir` 时的根目录 |
 | `--task-dir-name` | `r1arm_real_task` | 任务子目录名 |
