@@ -8,6 +8,14 @@
 
 ## 一、时间线
 
+### 2026-10-10 · 真机记录拆分 100 Hz 控制流与 30 Hz 图像观测流
+
+- 真机 teleop 默认控制频率设为 100 Hz；录制 `--frequency` 仍为 30 Hz，分别表示控制周期和带图像的 observation 周期。
+- MCAP 新增 `/r1arm/control_sample`，按完整 `control_seq` 保存 `q_purpose`、raw IK、电机位置/速度目标、实测关节位置/速度/力矩、XR 和末端诊断；不依赖相机成功出帧。
+- 保留 `/whole_body/frame` 的旧结构与 30 Hz 采样，继续兼容现有 replay；meta 新增控制频率与高频 topic 说明。
+- B 暂停/恢复间通过 `record_segment` 切分，保存时汇报样本数、序号缺口和周期统计。chunk 转换仍需按图像时间戳对齐，不能把 30 Hz frame 当成高频 chunk。
+- 验证限于软件格式/单测；100 Hz 在真机上的控制周期余量和运行稳定性仍需由硬件实测确认。
+
 ### 2026-10-10 · 按用户要求撤销 XR cutoff 试验值
 
 - 更正此前回退目标：XR One-Euro 默认恢复为用户指出的调参前基线 `min_cutoff=2.0 Hz, beta=0.15`（不是 8.0/1.0）；轨迹器 16/8 及其他参数保持不变。

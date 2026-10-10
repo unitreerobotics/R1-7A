@@ -1,3 +1,22 @@
+python scripts/replay_r1arm_real.py \
+  --episode /home/ycb410/nt/r1arm_teleop/dataset/rate_diag_fixed/episode_0000.mcap \
+  --section action \
+  --start-frame 0 --end-frame -1 \
+  --reshape-raw-ik \
+  --trajectory-position-gain 28 \
+  --trajectory-velocity-gain 10.6 \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --rate 30 --speed 1.0 \
+  --max-frame-gap 0.08 \
+  --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --kp 150 --kd 3 \
+  --telemetry-csv /home/ycb410/nt/r1arm_teleop/dataset/rate_diag_fixed/episode_0000_replay_shape_kp28_kd10_6_sdk_kp150_kd3.csv
+
+
+
+
 # R1 系列机械臂遥操作与数据采集框架
 
 基于 Unitree R1 机械臂的 XR 遥操作框架：用 PICO VR 手柄遥操机械臂，并把
@@ -40,14 +59,16 @@ conda activate r1_teleop
 当前恢复到本轮 XR 滤波调参前使用的 cutoff=2.0、beta=0.15；轨迹器 position/velocity gain 保持 16/8。此次只恢复 XR 滤波基线，其他速度、整形器及电机参数不变：
 
 ```bash
+# 50 Hz
 python scripts/teleop_r1arm_real.py \
   --motion-mode \
   --port /dev/ttyUSB2 \
   --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
-  --rate 30 \
+  --rate 50 \
   --xr-filter-min-cutoff 2.0 --xr-filter-beta 0.15 \
   --trajectory-position-gain 16 --trajectory-velocity-gain 8 \
-  --kp 80 --kd 2 --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --kp 60 --kd 10 \
+  --max-joint-speed 1.0 --max-command-lead 0.15 \
   --enable-dex1 --dex1-net enp4s0 \
   --home-on-start --enable-a-reset
 ```
@@ -159,8 +180,8 @@ python scripts/replay_r1arm_real.py \
 
 | 默认 | 值 | 说明 |
 |------|-----|------|
-| `--rate` | 30 Hz | XR 帧时钟 / IK / 执行 / 录制**全链同拍** |
-| `--frequency` | 30 Hz | 录制采样率 |
+| `--rate` | 100 Hz（真机默认） | 控制环 / IK / 电机命令；XR 输入刷新仍约 30 Hz |
+| `--frequency` | 30 Hz | 图像与 observation 帧采样率；真机另存完整控制频率流 |
 | `--kp` `--kd` | 80 / 2 | 可逐关节：`--kp 80,80,80,60,80,80,80` |
 | `--gravity-ff` | **开** | 重力前馈（`--no-gravity-ff` 关闭） |
 | `--max-joint-speed` | 1.0 rad/s | 命令限速 |
@@ -903,12 +924,13 @@ scripts/start_dex1_local.sh   # 可用 DEX1_NETWORK / DEX1_PORT 环境变量覆�
 
 ## 10. 数据格式
 
-每条 episode 是一个 `episode_XXXX.mcap`，含两个 topic：
+仿真和旧数据每条 episode 至少含两个 topic。新版真机录制会额外写入高频控制流：
 
 | Topic | 内容 |
 |-------|------|
 | `/episode/meta` | 整条一条 JSON：`{info, text, config}` |
-| `/whole_body/frame` | 每控制帧一条 JSON |
+| `/whole_body/frame` | 每个 30 Hz 观测帧一条 JSON（图像 + 最近控制快照） |
+| `/r1arm/control_sample` | 每个真机控制周期一条 JSON（默认 100 Hz，无图像） |
 
 帧字段统一为：`idx`、`sample_time_ns`、`image_source_frame_id`、`colors`（base64
 JPEG）、`states`（实测）、`actions`（下发）。
@@ -934,8 +956,8 @@ JPEG）、`states`（实测）、`actions`（下发）。
 
 **R1Arm 真机**（`info.format = r1arm_real_multicamera_mcap_json_v1`，本机相机）：
 
-两个 topic、帧字段、8 维关节向量与上面 R1Arm 仿真**完全同构**，只是相机来自本机设备、
-`config` 多出真机信息。`scripts/replay_r1arm_sim.py` 可直接回放。
+`/whole_body/frame` 的帧字段、8 维关节向量与上面 R1Arm 仿真**完全同构**，只是相机来自本机设备、
+`config` 多出真机信息。新增 `/r1arm/control_sample` 不改变旧 topic；`scripts/replay_r1arm_sim.py` 仍从兼容的 30 Hz `actions.q_purpose` 回放。
 
 `/episode/meta` 的 `config`：
 
@@ -992,6 +1014,8 @@ JPEG）、`states`（实测）、`actions`（下发）。
 - 真机没有 body / 腰自由度，因此**不含 body**，关节向量与仿真单臂同构。
 - 出帧按 `--frequency` 的固定时基推进；某帧凑不齐相机时跳过该帧但不改变时基，
   结束时打印 `avg_fps`，低于请求值 90% 会告警。
+- 新版真机还记录 `info.control_frequency_hz` 和 `/r1arm/control_sample`；每条含完整 `control_seq`、`control_time_ns`、整形 action、IK 原始解、电机目标和实测 state。摄像头掉帧不会丢弃该控制流，暂停/恢复时通过 `record_segment` 切开。
+- `--rate 100 --frequency 30` 可用于 action chunk：每张图像之后，从高频流按时间戳取连续控制样本组成未来 chunk。30 Hz `/whole_body/frame` 本身仍不是高频 chunk；100 Hz 控制也不意味着每个样本都有新的 XR 手部输入（XR 约 30 Hz）。相机到达时间不是曝光时间，训练前仍需校准图像传输延迟。
 - 至少要有 1 路相机：`colors` 必须与 `camera_order` 一一对应，否则回放会拒绝。
 
 ---

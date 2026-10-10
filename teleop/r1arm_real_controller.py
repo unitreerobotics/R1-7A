@@ -159,6 +159,16 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             )
         return model_q
 
+    def _reset_feedback_state(self, side: str) -> tuple[np.ndarray, np.ndarray] | None:
+        if side != self.control_side or self.last_state is None:
+            return None
+        if not np.all(self.last_state.ready):
+            return None
+        return (
+            sdk_to_model_q(self.last_state.q),
+            sdk_to_model_q(self.last_state.dq),
+        )
+
     @staticmethod
     def _check_faults(state: R1ArmSdkState, require_foc: bool) -> None:
         faults = np.flatnonzero(state.error_code != 0)

@@ -170,7 +170,11 @@ def _stale_camera_summary(camera: LocalCameraSubscriber, max_age: float) -> str:
     if camera is None:
         return "waiting for a fresh camera packet"
     parts = []
+    active_keys = set(camera.active_keys)
     for key, (status, age) in camera.health().items():
+        # Dropped startup cameras are metadata warnings, not recording gates.
+        if active_keys and key not in active_keys:
+            continue
         if np.isfinite(age) and age <= max_age and status != "frozen":
             continue
         if np.isfinite(age):
@@ -180,6 +184,14 @@ def _stale_camera_summary(camera: LocalCameraSubscriber, max_age: float) -> str:
     if not parts:
         return "waiting for a fresh selected-camera packet"
     return "stale camera: " + "; ".join(parts) + " — samples are being skipped"
+
+
+def _stale_camera_keys(camera: LocalCameraSubscriber | None, max_age: float) -> list[str]:
+    """Return only selected cameras whose frames would block this record tick."""
+    if camera is None or max_age <= 0:
+        return []
+    ages = camera.frame_ages()
+    return sorted(key for key, age in ages.items() if not np.isfinite(age) or age > max_age)
 
 
 _RECORD_SAMPLE_FIELDS = (
@@ -196,6 +208,10 @@ def _record_sample_is_complete(sample: dict | None) -> bool:
     )
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    return float(np.percentile(values, percentile)) if values else float("nan")
+
+
 class R1ArmRealMcapRecord:
     """Run the real-arm hold/teleop loop and asynchronously write MCAP frames."""
 
@@ -210,8 +226,11 @@ class R1ArmRealMcapRecord:
         self.record_frame_count = 0
         self.record_start_monotonic = 0.0
         self.record_start_control_seq = -1
+        self.record_segment = 0
+        self.high_rate_diagnostics = {"written": 0, "seq_gaps": 0, "last_seq": None, "period_ms": []}
         self.record_pause_started_monotonic = 0.0
         self.record_paused_duration = 0.0
+        self.record_rate_diagnostics: dict = {}
         self.next_record_tick = 0.0
         self.active_episode_path: str | None = None
         self.previous_buttons = {args.record_button: False}
@@ -474,8 +493,25 @@ class R1ArmRealMcapRecord:
             if isinstance(sample, dict) and sample.get("control_seq") is not None
             else -1
         )
+        self.controller.start_control_sample_capture()
+        self.record_segment = 0
+        self.high_rate_diagnostics = {"written": 0, "seq_gaps": 0, "last_seq": None, "period_ms": []}
         self.record_paused = False
         self.record_frame_count = 0
+        self.record_rate_diagnostics = {
+            "due_ticks": 0,
+            "schedule_missed_ticks": 0,
+            "incomplete_control_sample": 0,
+            "control_sample_repeat": 0,
+            "control_sample_age_max_ms": 0.0,
+            "control_sample_period_ms": [],
+            "last_control_time_ns": None,
+            "pre_record_control_sample": 0,
+            "duplicate_control_sample": 0,
+            "camera_no_frame": 0,
+            "camera_stale": 0,
+            "camera_stale_by_key": {},
+        }
         self._action_samples: list[np.ndarray] = []
         self._gripper_samples: list[float] = []
         self._action_time_samples: list[int] = []
@@ -497,11 +533,20 @@ class R1ArmRealMcapRecord:
         self.record_paused = False
         self.record_pause_started_monotonic = 0.0
         with self.writer_lock:
+            self._flush_control_samples_locked(stop=True)
             self.writer.stop_episode()
         fps = self.record_frame_count / duration
         print(
             f"[Record] SAVED {self.active_episode_path} | "
             f"frames={self.record_frame_count} duration={duration:.2f}s avg_fps={fps:.1f}"
+        )
+        self._report_record_rate_diagnostics()
+        high = self.high_rate_diagnostics
+        print(
+            f"[Record] high-rate control samples: {high['written']} "
+            f"(seq gaps={high['seq_gaps']}, "
+            f"period p50/p95={_percentile(high['period_ms'], 50):.2f}/"
+            f"{_percentile(high['period_ms'], 95):.2f} ms)"
         )
         if self.record_frame_count == 0:
             print(
@@ -530,6 +575,34 @@ class R1ArmRealMcapRecord:
         self._report_gripper_channel()
         self._report_breakpoints()
         self._report_camera_alignment()
+
+    def _report_record_rate_diagnostics(self) -> None:
+        diag = self.record_rate_diagnostics
+        if not diag:
+            return
+        print(
+            "[Record] rate diagnostic: "
+            f"due_ticks={diag['due_ticks']} written={self.record_frame_count} "
+            f"schedule_missed={diag['schedule_missed_ticks']} "
+            f"incomplete_sample={diag['incomplete_control_sample']} "
+            f"control_sample_repeat={diag['control_sample_repeat']} "
+            f"control_sample_age_max={diag['control_sample_age_max_ms']:.1f}ms "
+            f"control_period_ms={self._control_period_summary(diag['control_sample_period_ms'])} "
+            f"pre_record_sample={diag['pre_record_control_sample']} "
+            f"duplicate_sample={diag['duplicate_control_sample']} "
+            f"camera_no_frame={diag['camera_no_frame']} "
+            f"camera_stale={diag['camera_stale']} "
+            f"stale_by_camera={diag['camera_stale_by_key']}"
+        )
+        if self.camera is not None:
+            print(f"[Record] camera final counters: {self.camera.describe()}")
+
+    @staticmethod
+    def _control_period_summary(periods_ms: list[float]) -> str:
+        if not periods_ms:
+            return "n/a"
+        p50, p95 = np.percentile(periods_ms, [50, 95])
+        return f"p50={p50:.1f},p95={p95:.1f}"
 
     def _report_breakpoints(self) -> None:
         """P3: where pauses split the frame sequence (chunking boundaries).
@@ -669,6 +742,8 @@ class R1ArmRealMcapRecord:
         self.record_paused = not self.record_paused
         if self.record_paused:
             self.record_pause_started_monotonic = now
+            with self.writer_lock:
+                self._flush_control_samples_locked(stop=True)
             # P3 断点：记录暂停发生处——训练转换时按这些 idx 切 chunk
             #（暂停两侧的 action chunk 跨越真实时间断点，直接拼接会产生
             # 隐式不连续）。恢复侧同样记（chunk 在恢复点开始新段）。
@@ -678,10 +753,40 @@ class R1ArmRealMcapRecord:
             self.record_paused_duration += now - self.record_pause_started_monotonic
             self.record_pause_started_monotonic = 0.0
             self.next_record_tick = now
+            self.record_segment += 1
+            self.high_rate_diagnostics["last_seq"] = None
+            self.high_rate_diagnostics["last_time_ns"] = None
+            with self.writer_lock:
+                self.controller.start_control_sample_capture()
             self._breakpoints.append((self.record_frame_count, now))
             for track in self.controller.track.values():
                 track.clear()
             print("[Record] RESUMED")
+
+    def _flush_control_samples_locked(self, *, stop: bool = False) -> dict | None:
+        """Write captured control cycles; caller must hold writer_lock."""
+        samples, latest = self.controller.drain_control_sample_capture(stop=stop)
+        if self.writer is None or self.writer.writer is None:
+            return latest
+        diag = self.high_rate_diagnostics
+        for sample in samples:
+            if not _record_sample_is_complete(sample):
+                continue
+            seq = int(sample["control_seq"])
+            if seq <= self.record_start_control_seq:
+                continue
+            prev_seq = diag["last_seq"]
+            if prev_seq is not None:
+                if seq > prev_seq + 1:
+                    diag["seq_gaps"] += seq - prev_seq - 1
+                prev_sample_time = diag.get("last_time_ns")
+                if prev_sample_time is not None:
+                    diag["period_ms"].append((int(sample["control_time_ns"]) - prev_sample_time) / 1e6)
+            self.writer.add_control_sample(sample, record_segment=self.record_segment)
+            diag["last_seq"] = seq
+            diag["last_time_ns"] = int(sample["control_time_ns"])
+            diag["written"] += 1
+        return latest
 
     def _button_edges(self) -> dict[str, bool]:
         edges = {}
@@ -775,21 +880,62 @@ class R1ArmRealMcapRecord:
             if now < self.next_record_tick:
                 time.sleep(min(self.next_record_tick - now, 0.005))
                 continue
-            while self.next_record_tick <= now:
-                self.next_record_tick += interval
+            ticks_due = max(1, int((now - self.next_record_tick) / interval) + 1)
+            self.record_rate_diagnostics["due_ticks"] += ticks_due
+            self.record_rate_diagnostics["schedule_missed_ticks"] += ticks_due - 1
+            self.next_record_tick += ticks_due * interval
 
-            sample = self.controller.control_sample()
+            try:
+                with self.writer_lock:
+                    if not self.is_recording or self.record_paused or self.writer is None:
+                        continue
+                    sample = self._flush_control_samples_locked()
+            except BaseException as exc:
+                self.record_error = exc
+                self.running = False
+                return
             if not _record_sample_is_complete(sample):
+                self.record_rate_diagnostics["incomplete_control_sample"] += 1
                 continue
+            diag = self.record_rate_diagnostics
+            control_time_ns = int(sample["control_time_ns"])
+            sample_age_ms = max(0.0, (time.time_ns() - control_time_ns) / 1e6)
+            diag["control_sample_age_max_ms"] = max(
+                diag["control_sample_age_max_ms"], sample_age_ms
+            )
+            previous_time_ns = diag["last_control_time_ns"]
+            if previous_time_ns == control_time_ns:
+                diag["control_sample_repeat"] += 1
+            elif previous_time_ns is not None and control_time_ns > previous_time_ns:
+                diag["control_sample_period_ms"].append(
+                    (control_time_ns - previous_time_ns) / 1e6
+                )
+            diag["last_control_time_ns"] = control_time_ns
             control_seq = int(sample["control_seq"])
-            if (
-                control_seq <= self.record_start_control_seq
-                or control_seq == last_control_seq
-            ):
+            if control_seq <= self.record_start_control_seq:
+                self.record_rate_diagnostics["pre_record_control_sample"] += 1
+                continue
+            if control_seq == last_control_seq:
+                self.record_rate_diagnostics["duplicate_control_sample"] += 1
                 continue
 
             frames, frame_id, received_at_ns, _ = self._camera_snapshot()
-            if frames is None or not self._camera_is_fresh(received_at_ns):
+            if frames is None:
+                self.record_rate_diagnostics["camera_no_frame"] += 1
+                stale_keys = _stale_camera_keys(self.camera, self.args.max_image_age)
+                per_camera = self.record_rate_diagnostics["camera_stale_by_key"]
+                for key in stale_keys:
+                    per_camera[key] = per_camera.get(key, 0) + 1
+                if now - self.last_stale_warning >= 1.0:
+                    print(f"[Record] {_stale_camera_summary(self.camera, self.args.max_image_age)}")
+                    self.last_stale_warning = now
+                continue
+            if not self._camera_is_fresh(received_at_ns):
+                stale_keys = _stale_camera_keys(self.camera, self.args.max_image_age)
+                self.record_rate_diagnostics["camera_stale"] += 1
+                per_camera = self.record_rate_diagnostics["camera_stale_by_key"]
+                for key in stale_keys:
+                    per_camera[key] = per_camera.get(key, 0) + 1
                 if now - self.last_stale_warning >= 1.0:
                     print(f"[Record] {_stale_camera_summary(self.camera, self.args.max_image_age)}")
                     self.last_stale_warning = now
@@ -928,6 +1074,7 @@ class R1ArmRealMcapRecord:
                 frequency=self.args.frequency,
                 format_name="r1arm_real_multicamera_mcap_json_v1",
                 camera_order=(),
+                control_frequency=self.args.rate,
             )
             print("[Camera] recording state/action only (no cameras)")
             return
@@ -964,6 +1111,7 @@ class R1ArmRealMcapRecord:
             frequency=self.args.frequency,
             format_name="r1arm_real_multicamera_mcap_json_v1",
             camera_order=self.camera_keys,
+            control_frequency=self.args.rate,
         )
 
     def run(self) -> None:
@@ -1115,8 +1263,8 @@ def build_parser() -> argparse.ArgumentParser:
     teleop.add_argument("--bridge-lib", type=Path, default=DEFAULT_BRIDGE_LIBRARY)
     teleop.add_argument("--urdf", type=Path)
     teleop.add_argument("--scale-factor", type=float, default=1.0)
-    teleop.add_argument("--rate", type=float, default=30.0,
-                        help="控制环 Hz。默认 30（全链 30Hz 统一：每拍一条 action 一条 state）")
+    teleop.add_argument("--rate", type=float, default=100.0,
+                        help="控制环 Hz（默认 100；MCAP 图像/观测采样仍由 --frequency 默认 30Hz）")
     teleop.add_argument("--xr-filter-min-cutoff", type=float, default=2.0)
     teleop.add_argument("--xr-filter-beta", type=float, default=0.15)
     teleop.add_argument("--trajectory-position-gain", type=float, default=16.0,

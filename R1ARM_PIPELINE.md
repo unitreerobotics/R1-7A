@@ -299,7 +299,7 @@ bus.step(commands);              // 同步串口往返
 
 - **`q`**：SDK 坐标；经 `sdk_to_model_q()`（乘 `MODEL_TO_SDK_SIGN = [1,1,1,−1,1,1,1]`，仅 J4 取反）转模型坐标后进 `states.joint_state`。
 - **`dq` / `tau_est`**：SDK 原生；用于诊断与遥测。
-- 录制时 state 取 `controller.last_state`（最近一次 50/30 Hz 读到的反馈）。
+- 30 Hz observation 从与控制样本原子发布的快照取 state；真机完整控制频率 state 另见 `/r1arm/control_sample`（例如 100 Hz）。
 
 ---
 
@@ -311,8 +311,8 @@ bus.step(commands);              // 同步串口往返
 
 | 线程 | 名字 | 频率 | 职责 |
 |---|---|---|---|
-| **主线程** | — | `--rate` (30 Hz) | 控制环 `step()` / `_output_command()`、按键处理、`_publish_preview_state()`（轻量拼图 + 原子发布）、`--duration` 判定 |
-| **录制线程** | `r1arm-real-mcap-record` (daemon) | `--frequency` (30 Hz) | 相机快照 + 读取控制线程原子发布的最新 `ControlSample` + MCAP 写入 |
+| **主线程** | — | `--rate` (默认 100 Hz) | 控制环 `step()` / `_output_command()`、按键处理、`_publish_preview_state()`（轻量拼图 + 原子发布）、`--duration` 判定 |
+| **录制线程** | `r1arm-real-mcap-record` (daemon) | `--frequency` (默认 30 Hz) | 逐周期排空高频控制样本，同时按频率写相机观测帧 |
 | **预览线程** | `r1arm-preview` (daemon) | `--preview-hz` (12 Hz) | `namedWindow` / `imshow` / `waitKey(1)`（Qt 事件泵 + q/ESC 退出）；等待期 10 ms 粒度 sleep |
 | **相机 worker** ×N | `camera-<key>` (daemon) | 设备帧率 | 抓帧 → 解码 BGR → 加锁写 `_frame` + `_received_at_ns`；内容冻结检测 |
 
@@ -348,15 +348,16 @@ while not stop:
 
 ### 9.3 MCAP 格式（`teleop/mcap_writer.py`）
 
-**两个 topic**：
+**真机录制三个 topic**（仿真和旧录制格式仍可只有前两个）：
 
 | topic | schema | 频率 |
 |---|---|---|
 | `/episode/meta` | `r1_a7.episode_meta` | 1 条 |
-| `/whole_body/frame` | `r1_a7.four_camera_frame` | 每帧 |
+| `/whole_body/frame` | `r1_a7.four_camera_frame` | `--frequency`（默认 30 Hz），带图像及该时刻最近的控制样本 |
+| `/r1arm/control_sample` | `r1arm.control_sample` | 真机 `--rate`（默认 100 Hz），每个完整 `control_seq` 一条，无图像 |
 
 **`/episode/meta`** = `{info, text, config}`：
-- `info`：`format`（`r1arm_real_multicamera_mcap_json_v1`）、`created_at`、`frequency_hz`、`camera_order`、`camera_positions`
+- `info`：`format`（`r1arm_real_multicamera_mcap_json_v1`）、`created_at`、`frequency_hz`（观测/图像采样率）、`control_frequency_hz`、`control_sample_topic`、`camera_order`、`camera_positions`
 - `text`：`goal`（任务描述）
 - `config`：`robot`、`eef`、`simulator`、`motion_mode`、`teleop_stack`、`dual_arm`、`control_side`、`urdf_path`、`serial_port`、`camera_keys`、`camera_source_streams`、`camera_inactive`、`camera_devices`、`mcap_color_keys`、`joint_names`（8）、`state_dim`/`action_dim`（8）、`state_layout`、`sim_q_layout`、`teleop_rate_hz`、`teleop_max_joint_speed`、`teleop_max_command_lead`、`teleop_kp`/`kd`（标量或 null）、`teleop_kp_list`/`kd_list`（恒 7 值）、`teleop_gravity_ff`、`teleop_tau_clip`、`ik_max_acc_per_s2`、`trajectory_max_speed_rad_s`、`ik_qp_velocity_limit`、**`field_contract`**
 
@@ -387,7 +388,13 @@ gripper_unit  = "sim value +0.0245 open / -0.02 closed"
 
 `log_time` = `publish_time` = `sample_time_ns`。
 
-### 9.4 保存时质检（6 项，全部打印）
+**`/r1arm/control_sample`** 每条是控制器原子快照的完整副本，字段包含 `control_seq`、`control_time_ns`、`q_purpose/dq_purpose/ddq_purpose`、`q_ik_raw`、`q_motor_target/dq_target`、实测 `q_measured/dq_measured/tau_est`、XR/末端意图及夹爪诊断。`record_segment` 在每次 B 键恢复后递增；chunk 不应跨 segment。此流即使某个相机帧不可用也照常保存。保存时打印控制样本数、序号缺口和周期统计；`control_seq` 可用于逐周期完整性校验。
+
+### 9.4 30 Hz observation 与 100 Hz action chunk
+
+使用 `--rate 100 --frequency 30` 时，MCAP 同时保留 30 Hz 的图像观测帧和 100 Hz 的控制流。`/whole_body/frame` 仍是一张图像配一个最近控制快照，不能把它解释为高频 chunk；训练转换应按观测图像时间戳，在 `/r1arm/control_sample` 中找对应时刻之后的连续 `control_seq`，再截取固定长度/时长的未来 `q_purpose`（需要时也可选 `q_motor_target`）作为 chunk。优先使用 `camera_frame_times_ns` 里的相机到达时间与 `control_time_ns` 对齐；它是主机接收时间而非传感器曝光时间，部署训练前仍要测量相机传输延迟。XR 本身约 30 Hz，因此 100 Hz 记录体现的是整形器/执行侧的中间更新和 state 反馈，不代表每 10 ms 都有新的人手意图。
+
+### 9.5 保存时质检（全部打印）
 
 1. **action smoothness** — 逐关节 `|v|p95 / |a|p95 / |a|max`（30 Hz 差分）；`a_p95 > 25` 警告
 2. **gripper** — 常数时点名两种成因（未启用 Dex1 → 0.0245 是仿真回退值；已启用但 trigger 没动）
@@ -578,11 +585,11 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 | 频率 | 环节 | 代码 | 关系 |
 |---|---|---|---|
 | **~30 Hz** | XR 服务端推送帧 | 原生 SDK | 新帧才读入并滤波；无新帧时复用上次位姿 |
-| **`--rate` 30 Hz** | 控制环（IK + 执行 + 命令） | `controller.run(rate)` | 每拍：取新/缓存 XR → tracking/IK → 整形 → 命令 → 反馈；因此高于 XR 频率时会对缓存位姿重复求解 |
-| **`--frequency` 30 Hz** | 录制采样上限 | `_record_loop` | 读取新的原子控制样本；一帧绑定一个 `control_seq`，重复序号不写入 |
+| **`--rate` 100 Hz 默认** | 控制环（IK + 执行 + 命令） | `controller.run(rate)` | 每拍：取新/缓存 XR → tracking/IK → 整形 → 命令 → 反馈；高于 XR 频率时会对缓存位姿重复求解 |
+| **`--frequency` 30 Hz 默认** | 图像 observation 采样 | `_record_loop` | 一帧绑定一个最近的 `control_seq`；完整控制序列同时逐周期写入 `/r1arm/control_sample` |
 
 录制端按新的 control_seq 采样：每条样本把该控制周期的 action、最终命令和反馈绑定在一起，不重复写入同一个控制周期；相机仍按最近快照采样，并保存各路到达时间用于对齐分析。
-（回放端 `--rate` 默认也是 30，与 30 Hz episode 1:1。）
+（回放端 `--rate` 默认仍为 30；旧 episode 和 `/whole_body/frame` 均保持兼容。）
 
 ---
 

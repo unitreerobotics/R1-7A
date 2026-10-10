@@ -37,9 +37,14 @@ def confirm_motion(args: argparse.Namespace) -> None:
           f"gravity_ff={'on' if args.gravity_ff else 'off'}")
     print(f"  max speed:    {args.max_joint_speed} rad/s")
     if not args.unshaped_ik and not args.qp_constrained_ik:
-        print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
-              f"kd={args.trajectory_velocity_gain:g} s^-1; "
-              f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
+        if args.velocity_only_shaper:
+            print(f"  q_purpose shaper: velocity-only; "
+                  f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s "
+                  "(acceleration/jerk disabled during grip tracking)")
+        else:
+            print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
+                  f"kd={args.trajectory_velocity_gain:g} s^-1; "
+                  f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
     kp_arr = as_gain_array(args.kp)
     kd_arr = as_gain_array(args.kd)
     torque_cap = float(np.max(kp_arr * args.max_command_lead
@@ -84,9 +89,8 @@ def main() -> None:
     parser.add_argument("--urdf", type=Path, help="Simulation/IK URDF (same model as the working sim)")
     parser.add_argument("--side", choices=["left", "right"], default="right")
     parser.add_argument("--scale-factor", type=float, default=1.0)
-    parser.add_argument("--rate", type=float, default=30.0,
-                        help="控制环 Hz。默认 30（2026-10-09 定居：XR帧时钟 1:1 + "
-                             "IK + 执行 + 录制全链 30Hz，action/state 同拍统一）")
+    parser.add_argument("--rate", type=float, default=100.0,
+                        help="控制环 Hz。默认 100；XR 输入约 30Hz，录制图像频率单独配置")
     parser.add_argument("--xr-filter-min-cutoff", type=float, default=2.0,
                         help="XR One-Euro pose filter minimum cutoff Hz")
     parser.add_argument("--xr-filter-beta", type=float, default=0.15,
@@ -155,6 +159,10 @@ def main() -> None:
         help="Experimental direct IK tracking; retain SDK and transition safety limits",
     )
     parser.add_argument(
+        "--velocity-only-shaper", action="store_true",
+        help="Limit active IK tracking to a per-cycle joint-speed bound only; no acceleration/jerk shaping",
+    )
+    parser.add_argument(
         "--qp-constrained-ik", action="store_true",
         help="Experimental active IK with velocity/acceleration bounds inside Placo QP",
     )
@@ -165,8 +173,8 @@ def main() -> None:
 
     if args.motion_mode and args.mock_xr:
         parser.error("--mock-xr cannot be combined with --motion-mode")
-    if args.unshaped_ik and args.qp_constrained_ik:
-        parser.error("--unshaped-ik and --qp-constrained-ik are mutually exclusive")
+    if sum((args.unshaped_ik, args.velocity_only_shaper, args.qp_constrained_ik)) > 1:
+        parser.error("--unshaped-ik, --velocity-only-shaper, and --qp-constrained-ik are mutually exclusive")
     if args.qp_jerk_limit is not None and args.qp_jerk_limit <= 0.0:
         parser.error("--qp-jerk-limit must be positive")
     if args.trajectory_position_gain <= 0.0 or args.trajectory_velocity_gain <= 0.0:
@@ -246,6 +254,7 @@ def main() -> None:
         tau_clip=args.tau_clip,
     )
     controller.enable_a_button_reset = bool(args.enable_a_reset)
+    controller.velocity_only_shaper = bool(args.velocity_only_shaper)
     controller.run(rate=args.rate)
 
 

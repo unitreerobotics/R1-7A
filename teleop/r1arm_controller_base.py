@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -193,12 +194,15 @@ class R1ArmTeleopControllerBase:
         self._trajectory_q_cmd: dict[str, np.ndarray] = {}
         self._trajectory_v_cmd: dict[str, np.ndarray] = {}
         self._trajectory_a_cmd: dict[str, np.ndarray] = {}
+        self.velocity_only_shaper = False
         self._trigger_samples: dict[str, tuple[float, bool, float]] = {
             side: (0.0, False, 0.0) for side in self.control_sides
         }
         self._control_seq = 0
         self._control_sample: dict | None = None
         self._control_sample_lock = threading.Lock()
+        self._capture_control_samples = False
+        self._captured_control_samples: deque[dict] = deque()
         self._last_ee_intent: dict[str, dict] = {}
         self._last_ik_raw: dict[str, np.ndarray] = {}
         self._last_ik_solver: dict[str, str] = {}
@@ -219,6 +223,7 @@ class R1ArmTeleopControllerBase:
         self.rate_hz = 50.0
         self._reset_blending = False
         self._reset_blend_deadline = 0.0
+        self._reset_settle_count = 0
         # Kept as reset lifecycle markers; the actual path is the shared
         # trajectory generator, not a separate cross-fade interpolation.
         self._q_blend_start: np.ndarray | None = None
@@ -332,9 +337,22 @@ class R1ArmTeleopControllerBase:
                 - self.config.trajectory_velocity_gain * v_cmd[k],
                 -a_max, a_max,
             ))
-            a_lower = max(-a_max, a_cmd[k] - jerk_max * dt, (-v_max - v_cmd[k]) / dt)
-            a_upper = min(a_max, a_cmd[k] + jerk_max * dt, (v_max - v_cmd[k]) / dt)
-            a_cmd[k] = float(np.clip(a_desired, a_lower, a_upper))
+            # Acceleration/velocity are hard bounds; jerk is a smoothness
+            # bound. At a speed boundary those intervals can be disjoint
+            # (e.g. still accelerating toward +v_max while jerk forbids
+            # braking quickly enough). In that case relax jerk for this
+            # sample instead of passing an invalid [lower, upper] to clip,
+            # which would otherwise silently exceed the speed limit.
+            a_lower = max(-a_max, (-v_max - v_cmd[k]) / dt)
+            a_upper = min(a_max, (v_max - v_cmd[k]) / dt)
+            jerk_lower = max(-a_max, a_cmd[k] - jerk_max * dt)
+            jerk_upper = min(a_max, a_cmd[k] + jerk_max * dt)
+            feasible_lower = max(a_lower, jerk_lower)
+            feasible_upper = min(a_upper, jerk_upper)
+            if feasible_lower <= feasible_upper:
+                a_cmd[k] = float(np.clip(a_desired, feasible_lower, feasible_upper))
+            else:
+                a_cmd[k] = float(np.clip(a_desired, a_lower, a_upper))
             v_new = v_cmd[k] + a_cmd[k] * dt
             q_new = q_cmd[k] + 0.5 * (v_cmd[k] + v_new) * dt
             q_cmd[k] = q_new
@@ -350,6 +368,33 @@ class R1ArmTeleopControllerBase:
                 v_cmd[k] = 0.0
                 a_cmd[k] = 0.0
         self._trajectory_q_cmd[side] = q_cmd
+        self._trajectory_v_cmd[side] = v_cmd
+        self._trajectory_a_cmd[side] = a_cmd
+        return q_next
+
+    def _velocity_only_step(
+        self, side: str, q_reference: np.ndarray, q_desired: np.ndarray
+    ) -> np.ndarray:
+        """Track the IK target with only a per-cycle joint-speed bound."""
+        rate_hz = getattr(self, "rate_hz", 50.0) or 50.0
+        dt = min(max(float(getattr(self, "_step_dt", 1.0 / rate_hz)), 1e-4), 0.1)
+        self._ensure_trajectory_state(side, q_reference)
+        q_cmd = self._trajectory_q_cmd[side].copy()
+        v_prev = self._trajectory_v_cmd[side].copy()
+        v_limit = self.config.trajectory_max_speed_rad_s
+        v_max = float(v_limit) if v_limit is not None and v_limit > 0 else float("inf")
+        q_next = q_reference.copy()
+        for k, idx in enumerate(self.arm_q_indices):
+            q_target = float(q_desired[idx])
+            q_cmd[k] += float(np.clip(q_target - q_cmd[k], -v_max * dt, v_max * dt))
+            q_next[idx] = q_cmd[k]
+        q_next = clamp_configuration(self.model, q_next)
+        v_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
+        v_cmd = (v_cmd - self._trajectory_q_cmd[side]) / dt
+        a_cmd = (v_cmd - v_prev) / dt
+        self._trajectory_q_cmd[side] = np.asarray(
+            [q_next[idx] for idx in self.arm_q_indices], dtype=float
+        )
         self._trajectory_v_cmd[side] = v_cmd
         self._trajectory_a_cmd[side] = a_cmd
         return q_next
@@ -370,10 +415,33 @@ class R1ArmTeleopControllerBase:
     def publish_control_sample(self, sample: dict) -> None:
         """Atomically publish a complete, single-control-cycle snapshot."""
         with self._control_sample_lock:
-            self._control_sample = {
+            snapshot = {
                 key: value.copy() if isinstance(value, np.ndarray) else value
                 for key, value in sample.items()
             }
+            self._control_sample = snapshot
+            if self._capture_control_samples:
+                self._captured_control_samples.append(snapshot)
+
+    def start_control_sample_capture(self) -> None:
+        with self._control_sample_lock:
+            self._captured_control_samples.clear()
+            self._capture_control_samples = True
+
+    def drain_control_sample_capture(self, *, stop: bool = False) -> tuple[list[dict], dict | None]:
+        """Atomically drain captured cycles and return the matching latest snapshot."""
+        with self._control_sample_lock:
+            if stop:
+                self._capture_control_samples = False
+            samples = list(self._captured_control_samples)
+            self._captured_control_samples.clear()
+            latest = self._control_sample
+            if latest is not None:
+                latest = {
+                    key: value.copy() if isinstance(value, np.ndarray) else value
+                    for key, value in latest.items()
+                }
+            return samples, latest
 
     def control_sample(self) -> dict | None:
         with self._control_sample_lock:
@@ -396,7 +464,8 @@ class R1ArmTeleopControllerBase:
                     q_next[idx] = sol[idx]
                 self._last_ik_raw[side] = np.array([q_next[i] for i in self.arm_q_indices])
                 self._last_ik_solver[side] = "placo"
-                q_shaped = self._trajectory_step(side, q, q_next)
+                q_shaped = (self._velocity_only_step(side, q, q_next)
+                            if self.velocity_only_shaper else self._trajectory_step(side, q, q_next))
                 self._set_q_for_side(side, q_shaped)
                 self._solver_seeds[side] = q_shaped.copy()
                 return
@@ -407,7 +476,8 @@ class R1ArmTeleopControllerBase:
         q_raw = self._solve_dls(solver_seed, target_pos, target_quat)
         self._last_ik_raw[side] = np.array([q_raw[i] for i in self.arm_q_indices])
         self._last_ik_solver[side] = "dls"
-        q_shaped = self._trajectory_step(side, q, q_raw)
+        q_shaped = (self._velocity_only_step(side, q, q_raw)
+                    if self.velocity_only_shaper else self._trajectory_step(side, q, q_raw))
         self._set_q_for_side(side, q_shaped)
         self._solver_seeds[side] = q_shaped.copy()
 
@@ -422,6 +492,8 @@ class R1ArmTeleopControllerBase:
         # governed by the shared q/v/a trajectory state below.
         rate_hz = getattr(self, "rate_hz", 50.0) or 50.0
         self._reset_blend_deadline = time.monotonic() + self.reset_blend_frames / rate_hz
+        self._reset_settle_count = 0
+        self._reset_last_diag_time = 0.0
         self._reset_blending = True
 
         for st in self.track.values():
@@ -452,16 +524,54 @@ class R1ArmTeleopControllerBase:
 
         at_goal = True
         stopped = True
+        feedback_settled = True
+        diagnostics = []
         for side, goal in (("right", self._q_blend_goal), ("left", self._q_left_blend_goal)):
             if side == "left" and not self.dual_arm:
                 continue
             q_cmd, v_cmd, a_cmd = self._trajectory_state(side, self._q_for_side(side))
-            at_goal &= np.max(np.abs(q_cmd - goal[self.arm_q_indices])) < 1e-3
-            stopped &= (
-                np.max(np.abs(v_cmd)) < 0.02
-                and np.max(np.abs(a_cmd)) < 0.1
+            q_cmd_error = float(np.max(np.abs(q_cmd - goal[self.arm_q_indices])))
+            v_cmd_max = float(np.max(np.abs(v_cmd)))
+            a_cmd_max = float(np.max(np.abs(a_cmd)))
+            side_at_goal = q_cmd_error < 1e-3
+            side_stopped = v_cmd_max < 0.02 and a_cmd_max < 0.1
+            at_goal &= side_at_goal
+            stopped &= side_stopped
+            measured = self._reset_feedback_state(side)
+            if measured is not None:
+                q_measured, dq_measured = measured
+                q_measured_error = float(np.max(np.abs(q_measured - goal[self.arm_q_indices])))
+                dq_measured_max = float(np.max(np.abs(dq_measured)))
+                side_feedback_settled = q_measured_error < 0.05 and dq_measured_max < 0.05
+                feedback_settled &= side_feedback_settled
+            else:
+                q_measured_error = dq_measured_max = None
+                side_feedback_settled = True
+            diagnostics.append(
+                f"{side}: cmd_err={q_cmd_error:.5f}rad v={v_cmd_max:.4f} a={a_cmd_max:.4f} "
+                f"cmd_ok={side_at_goal and side_stopped} "
+                f"meas_err={'n/a' if q_measured_error is None else f'{q_measured_error:.5f}rad'} "
+                f"meas_dq={'n/a' if dq_measured_max is None else f'{dq_measured_max:.4f}'} "
+                f"meas_ok={side_feedback_settled}"
             )
-        if time.monotonic() >= self._reset_blend_deadline and at_goal and stopped:
+        if at_goal and stopped and feedback_settled:
+            self._reset_settle_count += 1
+        else:
+            self._reset_settle_count = 0
+        settle_cycles = max(1, int(math.ceil(0.1 * (getattr(self, "rate_hz", 50.0) or 50.0))))
+        now = time.monotonic()
+        if now - self._reset_last_diag_time >= 1.0:
+            self._reset_last_diag_time = now
+            print(
+                "[reset] settling: " + "; ".join(diagnostics)
+                + f"; settle={self._reset_settle_count}/{settle_cycles}"
+                + f" deadline={'passed' if now >= self._reset_blend_deadline else 'pending'}"
+            )
+        if (
+            now >= self._reset_blend_deadline
+            and at_goal and stopped and feedback_settled
+            and self._reset_settle_count >= settle_cycles
+        ):
             self._solver_seeds["right"] = self.q.copy()
             if self.dual_arm and self._q_left_blend_goal is not None:
                 self._solver_seeds["left"] = self.q_left.copy()
@@ -477,12 +587,20 @@ class R1ArmTeleopControllerBase:
             self._q_blend_goal = None
             self._q_left_blend_start = None
             self._q_left_blend_goal = None
-            if self.debug:
-                print("[reset] trajectory reached home and stopped")
+            print("[reset] home reached and measured arm settled; grip tracking enabled")
             return False
         return True
 
+    def _reset_feedback_state(self, side: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """Optional measured ``(q, dq)`` in model arm-joint order for reset settling."""
+        return None
+
     def _publish_ik_diagnostics(self, controller_poses: dict, xr_valid: bool) -> None:
+        # Real controllers publish the authoritative sample after feedback and
+        # command output. Publishing this interim IK-only snapshot races the
+        # recorder and creates apparent multi-second sample gaps.
+        if getattr(self, "motion_mode", False):
+            return
         self._control_seq += 1
         control_time_ns = time.monotonic_ns()
         xr_frame_stamp_ns = self._xr_last_stamp or self._xr_filter_last_stamp_ns

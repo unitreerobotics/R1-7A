@@ -11,6 +11,7 @@ Layout of one ``episode_XXXX.mcap``:
   ``/whole_body/frame``    one JSON message per sample:
                            {idx, sample_time_ns, image_source_frame_id,
                             colors, states, actions}
+  ``/r1arm/control_sample`` optional, one JSON message per control cycle
 
 ``colors`` holds base64-encoded JPEG observations. The default remains the
 fixed four-camera R1-A7 order; simulation callers may explicitly select a
@@ -45,6 +46,7 @@ class FourCameraMcapRecorder:
         frequency: float,
         format_name: str = "r1_a7_four_camera_mcap_json_v1",
         camera_order: tuple[str, ...] | list[str] | None = None,
+        control_frequency: float | None = None,
     ) -> None:
         from mcap.writer import Writer
 
@@ -53,6 +55,7 @@ class FourCameraMcapRecorder:
         self.task_goal = str(task_goal)
         self.frequency = float(frequency)
         self.format_name = str(format_name)
+        self.control_frequency = None if control_frequency is None else float(control_frequency)
         # ``None`` falls back to the R1-A7 four-camera default; an explicit empty
         # tuple is allowed for state/action-only recordings.
         self.camera_order = tuple(self.CAMERA_ORDER if camera_order is None else camera_order)
@@ -63,6 +66,7 @@ class FourCameraMcapRecorder:
         self.file_handle = None
         self.writer = None
         self.frame_channel_id = None
+        self.control_channel_id = None
         self.item_id = -1
         self.current_path = None
 
@@ -120,6 +124,15 @@ class FourCameraMcapRecorder:
         self.frame_channel_id = self.writer.register_channel(
             topic="/whole_body/frame", message_encoding="json", schema_id=frame_schema_id
         )
+        if self.control_frequency is not None:
+            control_schema_id = self.writer.register_schema(
+                name="r1arm.control_sample",
+                encoding="jsonschema",
+                data=json.dumps({"type": "object"}, ensure_ascii=False).encode("utf-8"),
+            )
+            self.control_channel_id = self.writer.register_channel(
+                topic="/r1arm/control_sample", message_encoding="json", schema_id=control_schema_id
+            )
 
         timestamp_ns = time.time_ns()
         meta = {
@@ -127,6 +140,11 @@ class FourCameraMcapRecorder:
                 "format": self.format_name,
                 "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "frequency_hz": self.frequency,
+                **({
+                    "control_frequency_hz": self.control_frequency,
+                    "control_sample_topic": "/r1arm/control_sample",
+                    "control_sample_semantics": "one complete controller snapshot per control_seq; record_segment separates pause/resume intervals",
+                } if self.control_frequency is not None else {}),
                 "camera_order": list(self.camera_order),
                 "camera_positions": [
                     name.removeprefix("color_").split("_", 1)[-1]
@@ -206,6 +224,24 @@ class FourCameraMcapRecorder:
             data=json.dumps(message, ensure_ascii=False).encode("utf-8"),
         )
 
+    def add_control_sample(self, sample: dict, record_segment: int = 0) -> None:
+        """Append one complete high-rate controller snapshot, without an image."""
+        if self.writer is None or self.control_channel_id is None:
+            return
+        message = dict(sample)
+        message["record_segment"] = int(record_segment)
+        timestamp_ns = int(message["control_time_ns"])
+        self.writer.add_message(
+            channel_id=self.control_channel_id,
+            log_time=timestamp_ns,
+            publish_time=timestamp_ns,
+            data=json.dumps(
+                message,
+                ensure_ascii=False,
+                default=lambda value: value.tolist() if hasattr(value, "tolist") else value.item(),
+            ).encode("utf-8"),
+        )
+
     def stop_episode(self) -> None:
         """Finalize and close the open episode, if any."""
         if self.writer is not None:
@@ -215,6 +251,7 @@ class FourCameraMcapRecorder:
             self.file_handle.close()
             self.file_handle = None
         self.frame_channel_id = None
+        self.control_channel_id = None
 
     def delete_last_episode(self):
         """Delete the latest closed episode and return its ``(id, path)``.

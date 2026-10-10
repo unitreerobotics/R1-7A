@@ -30,6 +30,39 @@ def test_model_sdk_joint_mapping_only_flips_j4() -> None:
     np.testing.assert_allclose(sdk_to_model_q(sdk), model)
 
 
+def test_real_motion_does_not_publish_incomplete_ik_snapshot() -> None:
+    controller = R1ArmTeleopControllerBase.__new__(R1ArmTeleopControllerBase)
+    controller.motion_mode = True
+    controller._control_seq = 10
+    complete_sample = {"control_seq": 9, "q_measured": np.zeros(7)}
+    controller._control_sample = complete_sample
+    controller._control_sample_lock = threading.Lock()
+
+    controller._publish_ik_diagnostics({}, xr_valid=True)
+
+    assert controller._control_seq == 10
+    sample = controller.control_sample()
+    assert sample["control_seq"] == 9
+    np.testing.assert_array_equal(sample["q_measured"], np.zeros(7))
+
+
+def test_control_capture_preserves_each_cycle_and_can_flush_on_stop() -> None:
+    controller = R1ArmTeleopControllerBase.__new__(R1ArmTeleopControllerBase)
+    controller._control_sample = None
+    controller._control_sample_lock = threading.Lock()
+    controller._capture_control_samples = False
+    controller._captured_control_samples = controller_base.deque()
+    controller.start_control_sample_capture()
+    for seq in range(3):
+        controller.publish_control_sample({"control_seq": seq, "q": np.array([seq])})
+
+    samples, latest = controller.drain_control_sample_capture(stop=True)
+
+    assert [sample["control_seq"] for sample in samples] == [0, 1, 2]
+    assert latest["control_seq"] == 2
+    assert controller.drain_control_sample_capture()[0] == []
+
+
 def test_sdk_limits_match_positive_j4_convention() -> None:
     assert np.isclose(SDK_LOWER[3], 0.0)
     assert np.isclose(SDK_UPPER[3], 3.1415)
@@ -86,6 +119,26 @@ def test_trajectory_generator_brakes_without_snapping_velocity(monkeypatch) -> N
     assert 0.0 < controller._trajectory_v_cmd["right"][0] < 1.0
     assert controller._trajectory_a_cmd["right"][0] == -80.0 / 30.0
     assert q_next[0] > 0.0
+
+
+def test_velocity_only_shaper_limits_speed_without_acceleration_bound(monkeypatch) -> None:
+    monkeypatch.setattr(controller_base, "clamp_configuration", lambda _model, q: q)
+    controller = R1ArmTeleopControllerBase.__new__(R1ArmTeleopControllerBase)
+    controller.config = SimpleNamespace(trajectory_max_speed_rad_s=1.0)
+    controller.rate_hz = 10.0
+    controller._step_dt = 0.1
+    controller.arm_q_indices = list(range(7))
+    controller.model = object()
+    controller._trajectory_q_cmd = {"right": np.zeros(7)}
+    controller._trajectory_v_cmd = {"right": np.zeros(7)}
+    controller._trajectory_a_cmd = {"right": np.zeros(7)}
+
+    first = controller._velocity_only_step("right", np.zeros(7), np.ones(7))
+    second = controller._velocity_only_step("right", first, -np.ones(7))
+    assert np.allclose(first, 0.1)
+    assert np.allclose(second, 0.0)
+    assert np.max(np.abs(controller._trajectory_v_cmd["right"])) <= 1.0 + 1e-9
+    assert controller._trajectory_a_cmd["right"][0] == -20.0
 
 
 def test_idle_tracking_initializes_trajectory_state_before_stopping(monkeypatch) -> None:
@@ -172,6 +225,9 @@ def test_trajectory_generator_settles_at_fixed_home_target(monkeypatch) -> None:
     controller._q_left_blend_goal = None
     controller._reset_blending = True
     controller._reset_blend_deadline = 0.0
+    controller._reset_last_diag_time = 0.0
+    measured_q = np.full(7, 0.05)
+    controller._reset_feedback_state = lambda _side: (measured_q.copy(), np.zeros(7))
     controller._solver_seeds = {"right": q.copy()}
     controller._last_ik_raw = {"right": np.zeros(7)}
     controller._last_ik_solver = {}
@@ -184,10 +240,44 @@ def test_trajectory_generator_settles_at_fixed_home_target(monkeypatch) -> None:
         if not controller._step_reset_blend():
             break
 
+    assert controller._reset_blending  # command reached home, measured arm did not
+    measured_q[:] = 0.0
+    measured_q[3] = 0.04  # home tolerance matches replay's default approach tolerance
+    for _ in range(120):
+        if not controller._step_reset_blend():
+            break
+
     assert not controller._reset_blending
     np.testing.assert_allclose(controller._trajectory_q_cmd["right"], np.zeros(7), atol=1e-3)
     np.testing.assert_allclose(controller._trajectory_v_cmd["right"], np.zeros(7), atol=0.02)
     np.testing.assert_allclose(controller._trajectory_a_cmd["right"], np.zeros(7), atol=0.1)
+
+
+def test_trajectory_speed_bound_wins_when_jerk_interval_is_infeasible(monkeypatch) -> None:
+    monkeypatch.setattr(controller_base, "clamp_configuration", lambda _model, q: q)
+
+    class DummyController(R1ArmTeleopControllerBase):
+        pass
+
+    controller = DummyController.__new__(DummyController)
+    controller.config = SimpleNamespace(
+        trajectory_max_speed_rad_s=1.0,
+        ik_max_acc_per_s2=6.0,
+        ik_max_jerk_per_s3=80.0,
+        trajectory_position_gain=20.0,
+        trajectory_velocity_gain=9.0,
+    )
+    controller.rate_hz = 30.0
+    controller._step_dt = 1.0 / 30.0
+    controller.arm_q_indices = list(range(7))
+    controller.model = object()
+    controller._trajectory_q_cmd = {"right": np.zeros(7)}
+    controller._trajectory_v_cmd = {"right": np.array([-1.0, 0, 0, 0, 0, 0, 0])}
+    controller._trajectory_a_cmd = {"right": np.array([-3.94, 0, 0, 0, 0, 0, 0])}
+
+    controller._trajectory_step("right", np.zeros(7), np.full(7, -10.0))
+
+    assert np.max(np.abs(controller._trajectory_v_cmd["right"])) <= 1.0 + 1e-9
 
 
 def test_trajectory_follower_gains_change_position_and_velocity_response(monkeypatch) -> None:
