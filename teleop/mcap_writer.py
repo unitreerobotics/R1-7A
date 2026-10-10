@@ -84,6 +84,7 @@ class FourCameraMcapRecorder:
                 "idx": {"type": "integer"},
                 "sample_time_ns": {"type": "integer"},
                 "image_source_frame_id": {"type": "integer"},
+                "control_seq": {"type": ["integer", "null"]},
                 "colors": {"type": "object"},
                 "states": {"type": "object"},
                 "actions": {"type": "object"},
@@ -164,6 +165,7 @@ class FourCameraMcapRecorder:
         image_source_frame_id: int,
         sample_time_ns: int | None = None,
         camera_frame_times_ns: dict[str, int] | None = None,
+        control_seq: int | None = None,
     ) -> None:
         """Append one sample. ``frames`` must follow ``self.camera_order``.
 
@@ -188,6 +190,7 @@ class FourCameraMcapRecorder:
             "idx": self.item_id,
             "sample_time_ns": timestamp_ns,
             "image_source_frame_id": int(image_source_frame_id),
+            "control_seq": None if control_seq is None else int(control_seq),
             "camera_frame_times_ns": (
                 {str(k): int(v) for k, v in camera_frame_times_ns.items()}
                 if camera_frame_times_ns else {}

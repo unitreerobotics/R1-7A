@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Replay recorded R1Arm state trajectories on the real arm.
 
-Reads the ``states.joint_state`` vectors (7 arm joints + 1 Dex1 gripper) from an
-MCAP episode written by ``record_r1arm_real.py`` and commands the real arm to
-follow the recorded motion, so the recording can be verified by eye.
+Reads ``actions.q_purpose`` (the already-shaped action) or measured
+``states.joint_state`` from an MCAP episode written by ``record_r1arm_real.py``.
+The action trajectory is replayed without another trajectory shaper.
 
-The arm is driven in FOC position mode through ``R1ArmSdkBus`` with the same
-lead/limit guards as teleoperation (``limit_sdk_position_command``).  Frames
-are paced by their recorded ``sample_time_ns`` (scaled by ``--speed``; gaps
-longer than ``--max-frame-gap`` seconds are compressed), and the command slew
-cap defaults to the recorded peak joint speed x 1.2 so fast recorded segments
-are not rate-limited away.  After the last frame the arm converges onto the
-final recorded state before holding it.
+The arm is driven in FOC position mode through ``R1ArmSdkBus`` with SDK-side
+slew, lead, and joint-limit guards. Frames use recorded ``sample_time_ns``;
+``--section action`` replays the shaped action directly, with no second v/a
+shaper. A per-run CSV records targets and motor feedback.
 
 The 7 arm joints are always replayed. With ``--enable-dex1`` the recorded Dex1
 gripper value (index 7, a sim-space position) is also converted back to a closed
@@ -25,8 +22,8 @@ reachable and support the arm during startup probing.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -86,10 +83,8 @@ def load_episode_states(
 ) -> tuple[list[np.ndarray], list[dict], dict, dict]:
     """Return ordered 8-DoF vectors (arm 7 + gripper 1), raw frames, metadata.
 
-    ``section_mode="state"`` reads ``states.joint_state`` (measured poses);
-    ``"action"`` reads ``actions.action`` (the commands teleop sent, which the
-    arm tracked under gravity sag — replaying them reproduces the commanded
-    heights rather than the sagged ones).
+    ``section_mode="state"`` reads measured ``states.joint_state``;
+    ``"action"`` prefers the shaped ``actions.q_purpose`` trajectory.
     """
     frames: list[dict] = []
     info: dict = {}
@@ -108,18 +103,20 @@ def load_episode_states(
         raise SystemExit("MCAP contains no /whole_body/frame messages")
     frames.sort(key=lambda item: int(item.get("idx", 0)))
     if section_mode == "action":
-        section_name, primary_key, fallback_key = "actions", "action", "robot_q_desired"
+        section_name, primary_key, fallback_key = "actions", "q_purpose", "action"
     else:
         section_name, primary_key, fallback_key = "states", "joint_state", "robot_q_current"
     states: list[np.ndarray] = []
     for frame in frames:
         section = frame.get(section_name, {})
         vec = section.get(primary_key, section.get(fallback_key, []))
+        if section_mode == "action" and not vec:
+            vec = section.get("robot_q_desired", [])
         arr = np.asarray(vec, dtype=float).reshape(-1)
-        if arr.size < JOINT_COUNT:
+        if arr.size < JOINT_COUNT + 1 or not np.all(np.isfinite(arr[:JOINT_COUNT + 1])):
             raise SystemExit(
-                f"frame {frame.get('idx')} {section_name}.{primary_key} has {arr.size} "
-                f"values; expected >= {JOINT_COUNT}"
+                f"frame {frame.get('idx')} {section_name}.{primary_key} must contain "
+                f"at least {JOINT_COUNT + 1} finite arm/gripper values"
             )
         states.append(arr.copy())
     return states, frames, info, config
@@ -304,34 +301,6 @@ def gravity_feedforward(model_pin, data_pin, q_arm: np.ndarray, clip: float) -> 
     return np.clip(model_to_sdk_q(tau), -clip, clip)
 
 
-class ReplayTrajectoryShaper:
-    """速度/加速度整形（与录制端 _clamp_ik_step 同源逻辑的回放版）。
-
-    录制的 action 在 50Hz 控制流上经过了 v≤1 / a≤8 斜坡；MCAP 存的是 30Hz
-    采样点，回放逐点直发等于把斜坡重新变成 33ms 阶梯——力矩公式首项
-    kp×阶梯 是可听噪声的主要来源之一。本类在回放环内对连续命令做与
-    录制一致的变化率限制，把阶梯还原成斜坡。SDK 层的 slew/lead 仍在
-    下游兜底（两层语义同录制链）。
-    """
-
-    def __init__(self, rate: float, v_max: float, a_max: float):
-        self.dt = 1.0 / max(rate, 1.0)
-        self.v_max = float(v_max)
-        self.a_max = float(a_max)
-        self.v = np.zeros(7, dtype=float)
-
-    def reset(self) -> None:
-        self.v = np.zeros(7, dtype=float)
-
-    def shape(self, prev_sdk: np.ndarray, target_sdk: np.ndarray) -> np.ndarray:
-        """Slew toward target with the recorded-chain velocity/accel limits."""
-        v_target = (target_sdk - prev_sdk) / self.dt
-        v_new = np.clip(v_target, self.v - self.a_max * self.dt, self.v + self.a_max * self.dt)
-        v_new = np.clip(v_new, -self.v_max, self.v_max)
-        self.v = v_new
-        return prev_sdk + v_new * self.dt
-
-
 def safe_stop(bus: R1ArmSdkBus, rate: float) -> None:
     try:
         if bus.is_open:
@@ -356,11 +325,11 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
     print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
           f"gravity_ff={'on' if args.gravity_ff is not False else 'off'}"
           f"{'' if args.gravity_ff is None else ' (user)'}")
-    print(f"  shaper:       {'on' if not args.no_shaper else 'off'}"
-          f"（录制链 v/a 斜坡重建）")
+    print("  replay shaping: off (q_purpose is already shaped)")
     print(f"  max speed:    {args.max_joint_speed if args.max_joint_speed is not None else 'auto (peak x 1.2, capped)'}")
     print(f"  approach speed: {args.approach_speed} rad/s")
     print(f"  max lead:     {args.max_command_lead} rad")
+    print(f"  telemetry:    {args.telemetry_csv or 'auto-generated beside the episode'}")
     print("The arm will move through the recorded trajectory.")
     print("Keep the emergency stop reachable and support the arm during startup probing.")
     if input("Type MOVE to continue: ").strip() != "MOVE":
@@ -420,18 +389,15 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     teleop_speed = float(config.get("teleop_max_joint_speed", 0.0) or 0.0)
     if args.max_joint_speed is None:
         if args.section == "action" and teleop_speed > 0:
-            # Recorded actions are raw IK targets. Teleop never sent them to the
-            # motors as-is: every cycle went through the SDK command limiter
-            # (recorded as teleop_max_joint_speed). Replay the same shaping so
-            # IK activation transients (10+ rad/s single-frame jumps the arm
-            # never physically executed) stay filtered out.
+            # q_purpose is already trajectory-shaped; this is only a final
+            # SDK-side safety slew cap during replay.
             max_joint_speed = teleop_speed
             speed_source = f"recorded teleop slew limit {teleop_speed:.2f}"
             if peak_speed > teleop_speed:
                 print(
-                    f"[Replay] recorded action peak {peak_speed:.2f} rad/s exceeds the "
-                    f"teleop slew limit {teleop_speed:.2f} rad/s; those are IK transients "
-                    f"the arm never executed and will be rate-limited"
+                    f"[Replay] sampled q_purpose speed peak {peak_speed:.2f} rad/s exceeds "
+                    f"the replay SDK safety slew cap {teleop_speed:.2f} rad/s; affected "
+                    f"commands may be clipped (see telemetry CSV)"
                 )
         else:
             # Auto = recorded peak x 1.2 so fast segments are not rate-limited
@@ -467,10 +433,6 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     # 旧 episode 无字段时也默认开（P0 三重实测有效无害）。
     use_ff = args.gravity_ff if args.gravity_ff is not None else bool(
         config.get("teleop_gravity_ff", True))
-    # 整形器参数与录制契约同源（无字段时用当前默认）
-    rec_v = float(config.get("teleop_max_joint_speed", 0.0) or 0.0) or 1.0
-    rec_a = float(config.get("ik_max_acc_per_s2", 8.0) or 8.0)
-    use_shaper = not args.no_shaper
     print(f"[Replay] episode    = {episode}")
     print(f"[Replay] section    = {args.section} "
           f"({'measured poses (gravity sag included)' if args.section == 'state' else 'teleop commands (sag-free)'})")
@@ -480,7 +442,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     print(f"[Replay] peak speed = {peak_speed:.2f} rad/s; slew cap {max_joint_speed:.2f} ({speed_source})")
     print(f"[Replay] gravity_ff = {'on' if use_ff else 'off'}"
           f"{' (episode meta)' if args.gravity_ff is None else ' (user)'}"
-          f"; shaper = {'on (v≤%.1f, a≤%.0f)' % (rec_v, rec_a) if use_shaper else 'off'}")
+          "; additional trajectory shaping = off")
     print(f"[Replay] pacing     = {'recorded sample_time_ns' if paced else 'uniform frame interval'}"
           f" (gap cap {args.max_frame_gap:g}s)")
     print(f"[Replay] start state= {np.array2string(arm_traj[0], precision=4)}")
@@ -503,6 +465,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     bus: R1ArmSdkBus | None = None
     hand: Dex1Single | None = None
     command_sdk: np.ndarray | None = None
+    telemetry_stream = None
     # FF 模型（同 goto/trajectory_test 的加载与用法）
     gravity: tuple | None = None
     if use_ff:
@@ -515,8 +478,27 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         def tau_ff(cmd_sdk: np.ndarray) -> np.ndarray | None:
             return None
 
-    shaper = ReplayTrajectoryShaper(
-        rate=float(args.rate), v_max=rec_v, a_max=rec_a) if use_shaper else None
+    telemetry_path = (
+        Path(args.telemetry_csv).expanduser().resolve()
+        if args.telemetry_csv else episode.with_name(
+            f"{episode.stem}_replay_{time.time_ns()}.csv"
+        )
+    )
+    if telemetry_path.exists():
+        raise SystemExit(f"Refusing to overwrite replay telemetry: {telemetry_path}")
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+    telemetry_stream = telemetry_path.open("x", newline="", encoding="utf-8")
+    telemetry_fields = [
+        "frame_index", "source_frame_idx", "sample_time_ns", "feedback_time_ns",
+        "command_time_ns", "command_dt_s", "kp", "kd", "gravity_ff",
+        "max_joint_speed_rad_s", "max_command_lead_rad", "replay_speed",
+        "control_seq", "q_purpose_rad", "dq_purpose_rad_s", "q_motor_target_rad",
+        "dq_target_rad_s", "sdk_limiter_delta_rad", "q_measured_rad",
+        "dq_measured_rad_s", "tau_est_nm", "purpose_tracking_error_rad",
+        "motor_tracking_error_rad",
+    ]
+    telemetry = csv.DictWriter(telemetry_stream, fieldnames=telemetry_fields)
+    telemetry.writeheader()
 
     try:
         bus = R1ArmSdkBus(args.bridge_lib)
@@ -564,8 +546,6 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
             """Slew from wherever the arm is onto ``target_model``."""
             nonlocal command_sdk
             target_sdk = model_to_sdk_q(target_model)
-            if shaper is not None:
-                shaper.reset()  # 接近段结束后从静止斜坡进轨迹
             deadline = time.monotonic() + args.approach_timeout
             last_model = None
             while time.monotonic() < deadline:
@@ -588,23 +568,59 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         print(f"  reached start pose (max err {np.max(np.abs(model_q - arm_traj[0])):.3f} rad)")
         command_gripper(gripper_traj[0])
 
+        last_command_mono = time.monotonic()
+        print(f"[Replay] telemetry CSV: {telemetry_path}")
         print(f"Playing {len(arm_traj)} frames at {freq:.1f} Hz x {args.speed:.2f} speed...")
         while True:
             tick_origin = time.monotonic()
             for i, model_target in enumerate(arm_traj):
                 target_sdk = model_to_sdk_q(model_target)
                 st = bus.read_state()
+                feedback_time_ns = time.time_ns()
                 model_q = check_feedback_range(st)
                 check_faults(st, require_foc=True)
-                # 整形：先对连续命令做与录制一致的 v/a 斜坡（重建被 30Hz
-                # 采样削掉的平滑），再走 SDK 层 slew/lead 兜底。
-                if shaper is not None:
-                    target_sdk = shaper.shape(command_sdk, target_sdk)
                 cmd = limit_sdk_position_command(
                     target_sdk, command_sdk, st.q,
                     max_delta=play_delta, max_lead=args.max_command_lead,
                 )
-                bus.command_position(cmd, args.kp, args.kd, tau=tau_ff(cmd))
+                command_mono = time.monotonic()
+                command_dt = float(np.clip(command_mono - last_command_mono, 1e-4, 0.1))
+                dq_target_sdk = (cmd - command_sdk) / command_dt
+                bus.command_position(cmd, args.kp, args.kd, tau=tau_ff(cmd), dq=dq_target_sdk)
+                command_time_ns = time.time_ns()
+                measured_model_q = sdk_to_model_q(st.q)
+                measured_model_dq = sdk_to_model_q(st.dq)
+                command_model_q = sdk_to_model_q(cmd)
+                dq_target_model = sdk_to_model_q(dq_target_sdk)
+                source_frame = frames[i] if control_hz <= 0.0 and i < len(frames) else {}
+                telemetry.writerow({
+                    "frame_index": i,
+                    "source_frame_idx": source_frame.get("idx", ""),
+                    "sample_time_ns": source_frame.get("sample_time_ns", ""),
+                    "feedback_time_ns": feedback_time_ns,
+                    "command_time_ns": command_time_ns,
+                    "command_dt_s": command_dt,
+                    "kp": format_gain(args.kp), "kd": format_gain(args.kd),
+                    "gravity_ff": int(use_ff), "max_joint_speed_rad_s": max_joint_speed,
+                    "max_command_lead_rad": args.max_command_lead,
+                    "replay_speed": args.speed,
+                    "control_seq": source_frame.get("actions", {}).get("control_seq", ""),
+                    "q_purpose_rad": json.dumps(model_target.tolist()),
+                    "dq_purpose_rad_s": json.dumps(
+                        source_frame.get("actions", {}).get("dq_purpose", [])
+                    ),
+                    "q_motor_target_rad": json.dumps(command_model_q.tolist()),
+                    "dq_target_rad_s": json.dumps(dq_target_model.tolist()),
+                    "sdk_limiter_delta_rad": json.dumps((command_model_q - model_target).tolist()),
+                    "q_measured_rad": json.dumps(measured_model_q.tolist()),
+                    "dq_measured_rad_s": json.dumps(measured_model_dq.tolist()),
+                    "tau_est_nm": json.dumps(sdk_to_model_q(st.tau_est).tolist()),
+                    "purpose_tracking_error_rad": json.dumps((model_target - measured_model_q).tolist()),
+                    "motor_tracking_error_rad": json.dumps((command_model_q - measured_model_q).tolist()),
+                })
+                if i % 30 == 0:
+                    telemetry_stream.flush()
+                last_command_mono = command_mono
                 command_sdk = cmd
                 command_gripper(gripper_traj[i])
                 if args.debug and (i % 10 == 0 or i == len(arm_traj) - 1):
@@ -646,6 +662,8 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     except KeyboardInterrupt:
         print("\n[Replay] interrupted")
     finally:
+        if telemetry_stream is not None and not telemetry_stream.closed:
+            telemetry_stream.close()
         if hand is not None:
             try:
                 hand.stop()
@@ -668,11 +686,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--section",
         choices=("state", "action"),
-        default="state",
+        default="action",
         help=(
             "Replay 'states.joint_state' (measured poses, gravity sag included) "
-            "or 'actions.action' (the commands teleop sent — reproduces the "
-            "commanded heights; avoids double sag on replay)"
+            "or 'actions.q_purpose' (the already-shaped teleop joint action)"
         ),
     )
     parser.add_argument(
@@ -749,9 +766,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="重力前馈单关节力矩限幅 Nm（默认 8）",
     )
     parser.add_argument(
-        "--no-shaper", action="store_true",
-        help="关闭回放命令整形（录制链的 v/a 斜坡重建）。默认开——30Hz 采样点"
-             "直发是 33ms 阶梯，是电机噪声的来源之一",
+        "--telemetry-csv", type=Path,
+        help="per-replay telemetry CSV (default: unique file beside the source episode)",
     )
     parser.add_argument("--feedback-timeout", type=float, default=3.0)
     parser.add_argument("--foc-timeout", type=float, default=1.0)

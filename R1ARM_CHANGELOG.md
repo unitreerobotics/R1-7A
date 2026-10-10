@@ -8,6 +8,39 @@
 
 ## 一、时间线
 
+### 2026-10-10 · 按用户要求撤销 XR cutoff 试验值
+
+- 更正此前回退目标：XR One-Euro 默认恢复为用户指出的调参前基线 `min_cutoff=2.0 Hz, beta=0.15`（不是 8.0/1.0）；轨迹器 16/8 及其他参数保持不变。
+
+### 2026-10-10 · 恢复轨迹器温和响应并选用 XR 滤波试验基线
+
+- 将基线 `trajectory_position_gain/trajectory_velocity_gain` 从 20/9 恢复为 16/8；两者仍保持近临界阻尼关系，预期响应带宽略低，需由用户真机手感确认是否减少抖动及是否增加滞后。
+- XR One-Euro 默认设为 `min_cutoff=5.0 Hz, beta=1.0`：作为 cutoff 5 与 8 之间的保守试验基线。已有不同手速 episode 中 raw/filtered 位姿差异较小，数据不足以证明它是全局最优值。
+- 同步更新 R1Arm 配置、真机遥操/录制 CLI 默认值及 README/Pipeline；速度、加速度、jerk、电机增益与 SDK 限幅保持不变。
+
+### 2026-10-10 · 整形器速度上限改用 rad/s
+
+- 用 `trajectory_max_speed_rad_s` 替换 50 Hz 标定语义的 `ik_max_step_per_cycle`；整形器直接读取 rad/s，不再乘 50。实时遥操与录制入口未显式传 `--trajectory-max-speed` 时沿用 `--max-joint-speed`，录制 metadata 保存直接速度值。
+- 保持默认 30 Hz 与 `1.0 rad/s` 数值不变；单测确认速度限制不随控制频率换算。
+
+### 2026-10-09 · 增加 direct-IK 手感对照入口
+
+- 新增 `teleop_r1arm_real_unshaped.py`：active Placo 结果直接进入 SDK；QP 速度限幅设为 `--max-joint-speed`，DLS 每周期只迭代一步并按相同速度限制步长。
+- 仍保留 SDK 硬限位/slew/lead，以及 home/reset、松 grip 刹停的轨迹过渡；active tracking 不做独立加速度/jerk 整形。此实验版未做真机验证。
+
+### 2026-10-09 · 修复 home/reset 目标附近振荡
+
+- 固定目标时将“剩余距离限速”改为临界阻尼位置/速度反馈，之后仍受同一速度、加速度和 jerk 限制；补充固定 home 目标的收敛测试。
+- reset 完成条件同时检查位置误差、速度和加速度；双臂模式要求两侧均停稳，避免尚在运动时恢复 grip 跟踪。
+- 单元测试覆盖数值收敛；尚未真机回归，需托臂并保持急停可触及后低速验证。
+
+### 2026-10-09 · 遥操连续性与 Dex1 输入修正
+
+- SDK 命令每周期在 hard-limit、previous±slew、measured±lead 的可行区间内裁剪；区间无交集时保持 hard-limit/slew 并逐周期追近反馈，避免旧 limiter 在 lead clip 后突破 slew。
+- 轨迹器统一推进 `q_cmd/v_cmd/a_cmd`，真实 `dt` 下限制速度、加速度和 jerk；松开 grip 刹停、重新 grip、目标反向及 reset/home 都保持状态连续。
+- 每周期独立更新 XR trigger 与 Dex1 DDS，不再依赖机械臂 pose/IK 有效；录制样本附带 trigger 有效性/年龄、Dex1 命令与反馈开度及估算力矩，便于定位夹爪不响应。
+- 修复尚未经过真机回归；首次运行仍需托住机械臂并保持急停可触及。
+
 ### 阶段 0 · 9/20–9/24 — 基础栈打通（来源：git log + 文件 mtime）
 
 提交历史：
@@ -102,6 +135,9 @@
 
 ### 阶段 6 · 10/9 — 30 Hz 全链定居 + P3
 
+- **XR 输入滤波 + bridge v3 速度前馈**：跳变拒绝之后、相对位姿映射之前加入按 XR 帧时间戳推进的 One-Euro 位置/姿态滤波（姿态走 SLERP，可调 `--xr-filter-min-cutoff` / `--xr-filter-beta`）；采集帧同时写入原始和滤波后手柄位姿。C ABI v3 新增 `dq[7]`，实时遥操把最终安全限幅后的 SDK 位置目标按实际周期差分，作为与同一目标轨迹匹配的 `dq_target` 下发；MCAP 保存 `actions.dq_target`。原 v1/v2 ABI 保留兼容。已本机构建 bridge；尚未连接机械臂实测。
+- **修复 home 后无 grip 自运动**：旧 jerk 整形器的制动距离/越点处理不完整，home 后可能越点反追形成往返极限环。现按剩余距离计算制动速度、越点即落在目标；未按 grip 时用状态机停车，停稳后维持停止目标，不再硬同步到上一条 SDK command。另恢复 7 关节标定文件完整性校验。
+
 **30 Hz 基线**：
 - `--rate` 默认 50 → **30**（teleop / record / replay）；`--reset-blend-frames` 100 → 60（blend 按 wall-clock 计秒）。
 - `ik_max_step_per_cycle` 澄清为 **50 Hz 标定语义**（0.02 → 任意 rate 恒 1.0 rad/s）；`ik_max_acc_per_s2` 8 → 6。
@@ -118,6 +154,14 @@
 - 30 Hz 基线 episode（`hz30_baseline`，1432 帧 / 47.7 s）：action 流零单帧跳变、a_p95 ≈ 10（= a_max 上限）；state 侧 22 帧 >0.04 rad 的「跳」——**根因是 30 Hz 阶梯变粗（0.033 vs 50 Hz 的 0.02 rad）+ kp 追赶**，与限位无关（发生在 J4 = −0.73~−1.16，离模型限位 0.0 很远）。
 - 7.5 Hz 停住振荡诊断：今天数据中残余振荡是**衰减瞬态**（<0.8 s 归零），非持续振荡；1.5 rad/s 时代因能量 ×2.25 而明显。
 - 修复中抓到一个真 bug（已随软着陆删除而消失）：`k_note` **软着陆刹停曲线未封顶 v_max**，30 Hz 下在 margin 边缘解出 1.33 rad/s 超上限。
+
+### 阶段 7 · 10/9 — 控制样本同步与统一轨迹连续性
+
+- **原子控制样本**：真机控制线程每次完成 SDK 输出后发布带 `control_seq`、命令/反馈时刻、IK 意图、最终电机目标和同周期反馈的快照。录制线程只消费新序号，不再分别采样共享的 `controller.q` 与 `last_state`。
+- **训练 action 契约**：新增 `actions.q_purpose`（整形后的 IK 关节意图，8 维，训练主 action）；保留 `actions.action` 作为兼容别名。并保存 `q_ik_raw`（7 维）、`q_motor_target`（7 维）、`ee_intent`（robot_base 目标位置 + xyzw 姿态）、`control_seq`、反馈时间、`dq` 和 `tau_est`。
+- **独立 q/v/a 状态机**：Placo/DLS 解、grip 松开减速、重新接入与 home/reset 共用每关节轨迹状态；速度、加速度及 jerk 限制按真实 top-to-top dt。最终电机目标只更新 IK solver seed，不回写 `q_purpose` 轨迹。
+- **录制质检**：动作导数使用有符号速度、控制时间戳和非均匀采样周期计算 acceleration/jerk，避免等速换向被绝对值差分漏检。
+- **验证状态**：Python 静态编译和 bridge 本机构建通过；未进行真机 A/B，滤波延迟与速度目标效果需托臂低速测试。
 
 ---
 
@@ -158,11 +202,18 @@
 
 ## 三、还没尝试的优化点
 
+### 阶段 7 · 10/9 — XR 平滑 + 单一 q/v/a 轨迹状态机 + SDK v3
+
+- XR 按新 frame stamp 做 One-Euro 位置滤波与 SLERP 姿态滤波，默认 cutoff=2 Hz、beta=0.15；jump rejection 仍先运行，持续搬位被接受时重置滤波状态。record 同拍保存 `xr_raw/xr_filtered`。
+- IK 原解作为目标进入唯一 per-side `q_cmd/v_cmd/a_cmd` 状态机，负责 tracking、grip release braking、regrip 和 reset/home 连续性。SDK slew/lead/hard joint limits 保留为安全兜底；grip release 不再硬冻结 q 到上一条 SDK command。
+- bridge C ABI v3 新增期望速度数组 `dq[7]`；实时路径按最终安全裁剪后位置命令的实际周期差分 dq，并和同一 q 一起下发。v1/v2 保留。MCAP 增加 `dq_purpose/ddq_purpose/dq_target` 用于区分轨迹意图和最终电机目标。
+- 本次实现尚未做真机实测。首次测试需托住机械臂、急停可触及；先用低速短动作验证松 grip 刹停、重新 grip 接入、home 过程连续性。
+
 按「预期收益 ÷ 实施成本」排列。**加粗**为有明确机制支撑、值得优先试的。
 
 ### A. 执行层
 
-1. **dq 前馈（需要 bridge v3）** —— 当前 v2 把 `commands[i].dq = 0.f` 硬编码，阻尼项只对实测速度起作用。传目标速度可以压住「阶跳瞬间的力矩锤」，是继重力 FF 之后的下一个结构性修复。
+1. **dq 前馈真机验证** —— 代码已新增 bridge v3，把安全限幅后的位置目标导数作为 `dq_target`，C++ 已本机构建；待无负载/低速真机验证方向、单位与跟踪收益。
 2. **200 Hz 控制环实测** —— 串口预算 7.3 ms，100 Hz（10 ms）只剩 ~3 ms；若要更高频率需先确认 p95/p99 尾部，或换更低延迟的通信方式。
 3. **库仑摩擦补偿** —— 重力 FF 只补了重力分量；J2/J4 在低速段的 stick-slip 是「慢速段不跟手」的候选成因。
 4. **温升测量** —— P0 清单要求「记录电机温升」，至今未测；持续高频微动对电机热负载的影响未知。
@@ -171,9 +222,9 @@
 
 ### B. IK / XR
 
-7. **XR 输入去抖滤波** —— 当前只做跳变拒绝（30 cm / 57° 硬阈值）；手柄 0.5–2 cm 级微抖直通 IK（离线实测 2 mm 噪声即可产生 v_p95 0.13 rad/s 的命令流）。有界低延迟滤波未试。
+7. **XR 滤波参数真机/数据集调优** —— 已加入基于 XR 帧时间戳的 One-Euro 位置/姿态滤波，默认最小截止频率 2 Hz、beta 0.15，原始与滤波后位姿均写入记录；待按实测噪声与动作滞后调参。
 8. **Placo 奇异 / 不可达处理** —— 求解失败率、限位接近度从未统计；工作空间边界的目标投影/限速未实现（当前靠 DLS 回退 + 步长钳制兜底）。
-9. **`ik_max_acc_per_s2` 的换算不一致** —— v_max 的 rate 换算恒为 `limit×50`（正确），a_max 却是 `acc×50/rate`（30 Hz 下放大 1.67×，config 6 → 实际 10 rad/s²）。这条不一致是 P2 遗留，尚未统一。
+9. **XR 帧时钟与控制循环重复求解** —— 当前缓存重复 XR 帧，但仍每个控制 tick 调用 tracking/IK；若 `--rate` 高于 XR 更新率，就会在保持输入上重复求解。需要决定保持周期求解还是仅新帧求解，并用日志验证控制语义。
 
 ### C. 数据 / 训练
 

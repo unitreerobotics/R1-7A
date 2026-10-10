@@ -18,10 +18,10 @@
                         ↓ teleop/xr_client.py（ctypes 预载 .so + 薄封装）
 ┌─ 控制器基类 R1ArmTeleopControllerBase（teleop/r1arm_controller_base.py）─┐
 │ step(dt)：                                                   │
-│   ① read_controller_poses()  ← 帧时钟感知 + 跳变拒绝          │
+│   ① read_controller_poses()  ← 帧时钟感知 + 跳变拒绝 + One-Euro │
 │   ② _track_side()  相对位移 → 末端目标 pos/quat（R_TELEOP_TO_BASE）│
 │   ③ _solve() → Placo QP（主）或 DLS（回退）                   │
-│   ④ _clamp_ik_step()  速度/加速度整形 → self.q                │
+│   ④ q_cmd/v_cmd/a_cmd 独立轨迹状态机 → self.q                 │
 │   ⑤ _update_dex1_side() + _send_dex1_all()  （DDS 夹爪）      │
 │   ⑥ _output_command()  → 实机子类覆写                        │
 └──────────────────────────────────────────────────────────────┘
@@ -31,12 +31,12 @@
 │ model_to_sdk_q()（J4 符号镜像）                               │
 │ limit_sdk_position_command()  硬限位 + slew + 实测超前限制     │
 │ _tau_ff()  重力前馈（pinocchio @ 指令姿态，clip ±8 Nm）        │
-│ bus.command_position(cmd, kp, kd, tau=...)                    │
+│ bus.command_position(cmd, kp, kd, tau=..., dq=dq_target) [v3]  │
 │ _reconcile_ik_seed()  命令-IK 目标 gap > 0.05 rad 时重播种     │
 └──────────────────────────────────────────────────────────────┘
         ↓ robot/r1arm_sdk.py（ctypes）
 ┌─ C++ 桥接 libr1arm_sdk_bridge.so ─────────────────────────────┐
-│ ArmJointCmd{ mode=1, q, dq=0, kp, kd, tau } × 7              │
+│ ArmJointCmd{ mode=1, q, dq_target, kp, kd, tau } × 7         │
 │ bus.step(commands)  ← 同步串口往返（6 Mbaud），检查新鲜反馈     │
 └──────────────────────────────────────────────────────────────┘
         ↓ /dev/ttyUSB2 @ 6,000,000 baud
@@ -75,19 +75,19 @@
 ### 2.1 `step(dt)` 分支顺序
 
 1. `_reset_blending` 中 → `_step_reset_blend()` + `_output_command()` + return
-2. `read_controller_poses()` 返回 invalid → `_output_command()` + return（**保持当前命令**，不更新 IK）
+2. `read_controller_poses()` 返回 invalid → `_track_side(side,{})` 请求状态机平滑刹停，再 `_output_command()` + return
 3. A 键触发 → `reset()` + blend
-4. `_track_side(side)` 逐侧跟踪
+4. `_track_side(side)` 逐侧跟踪，IK 解进入 per-side `q_cmd/v_cmd/a_cmd` 状态机
 5. `_update_dex1_side()` + `_send_dex1_all()`
 6. `clamp_configuration()` → `_output_command()`
 
-### 2.2 `read_controller_poses()` —— 帧时钟感知（2026-10-09 加入）
+### 2.2 `read_controller_poses()` —— 帧时钟感知 + One-Euro（2026-10-09）
 
 ```python
 stamp = self.xr_client.get_frame_stamp_ns()
 if stamp is not None and stamp == self._xr_last_stamp:
     return self._xr_pose_cache, True      # 服务端没出新帧 → 沿用上拍位姿
-... 读三路位姿 → _reject_xr_jumps() → 写缓存 + 记 stamp
+... 读三路位姿 → 保存 raw → _reject_xr_jumps() → timestamp-aware One-Euro（位置 + quaternion SLERP）→ 写缓存 + 记 stamp
 ```
 - **动机**：XR 服务端 ~30 Hz 推帧、控制环 30/50 Hz 轮询；不感知帧时钟时同一帧被重复消费且节拍不均（33 ms 与 20 ms 不成整数比）→ IK 目标成为「阶梯 × 采样」的拍频调制信号。
 - **退化**：`stamp is None`（API 不可用）→ 每拍照读，等同旧行为。
@@ -108,31 +108,26 @@ if stamp is not None and stamp == self._xr_last_stamp:
 - `st.active = get_grip_state(side) > 0.9`（握 grip 才跟踪）
 - 首次激活（`ref_ee_pos is None`）：记录 `ref_ee_pos / ref_ee_quat`（当前末端）、`ref_controller_pos / ref_controller_rot`（当前手柄）、`ref_heading_yaw`；并调 `solver.set_regularization_reference(q)` 把 Placo 姿态正则参考重锚到当前姿态。
 - 之后：`delta_pos = ctrl_pos − ref_controller_pos`（按参考 yaw 旋转到基座系）→ `target_pos = ref_ee_pos + delta_pos_base × scale_factor`；姿态同理用 rotvec 增量。
-- 松 grip / 位姿缺失 → `st.clear()` + `self._ik_velocities.pop(side)`（整形器速度状态清零，重锚后从静止斜坡起步）。
+- 松 grip / 位姿缺失 → 清跟踪锚并保持当前目标；重新握住时从当前姿态重新锚定。
 
-### 2.5 `_clamp_ik_step()` —— IK 输出整形器
+### 2.5 `_trajectory_step()` —— 唯一 q/v/a 连续轨迹状态机
 
 ```python
-rate_hz = self.rate_hz ; dt = 1/rate_hz
-v_max = limit * 50.0 / rate_hz / dt        # 恒 = limit × 50 rad/s
-a_max = config.ik_max_acc_per_s2 * 50.0 / rate_hz
-for 每个臂关节:
-    v_target = (q_next − q_prev) / dt                       # 求解器想要的
-    if |v_target| > v_max×1.05 + 1e-6:  记 overshoot → clip 到 ±v_max
-    v_shaped = clip(v_target, v_prev ± a_max·dt)            # 加速度斜坡
-    q_out = q_prev + v_shaped·dt
-    v_state 保存为下一拍 v_prev
-overshoot 时：clamp_configuration() 投影 + 按实际输出回写 v_state
+q_ik_raw = Placo/DLS(raw solution)
+q_cmd, v_cmd, a_cmd = trajectory_state(q_cmd, v_cmd, a_cmd, q_ik_raw, actual_dt)
+q_motor = SDK_safety_limit(q_cmd, measured_q, previous_motor_q)
+dq_target = diff(q_motor, previous_motor_q) / actual_dt
 ```
 
-- **速率语义**：`v_max` 的换算（`limit×50/rate/(1/rate) = limit×50`）使它在**任意 rate 下恒为 `limit × 50` rad/s** —— `ik_max_step_per_cycle = 0.02` 即 1.0 rad/s。`a_max` 换算是 `acc × 50/rate`，**不是** rate 不变的（30 Hz 下 ×1.67，config 6 → 实际 10 rad/s²）—— 已知换算不一致，见变更史 §三.9。
-- **打印限频**：`[IK] shaped solver speed` 每秒最多一行（快速遥操顶格是常态，避免刷屏）。
+- **唯一运动整形状态**：每侧独立维护 `q_cmd/v_cmd/a_cmd`；Placo 与 DLS 的输出都只作为目标，动态约束只在此状态机执行。默认 `v_max = trajectory_max_speed_rad_s = 1.0 rad/s`、`a_max=6 rad/s²`、`jerk_max=80 rad/s³`，使用实际 top-to-top `dt`。
+- 轨迹器用临界阻尼位置/速度反馈 `a_desired=clip(16·error−8·v_cmd, ±a_max)`，再施加加速度、jerk 和速度约束；避免仅按距离计算制动速度导致离散越点极限环。grip 松开时每周期以当前轨迹位置为停止目标；重新按下及目标反向都保留 q/v/a 状态。reset/home 共用同一轨迹器，并要求各受控臂都同时满足位置、速度、加速度阈值后才退出。
+- SDK slew/lead/hard-limit 仅作安全兜底，正常情况下应不触发；状态机的 `q_purpose` 与最终 `q_motor_target` 分开记录。若 safety limiter 长期触发，说明 command/state 脱节，须先排查而不是把差值当普通训练 action。
 - **限位**：**无**软着陆逻辑（2026-10-09 删除）；只依赖 ① Placo 的 `enable_joint_limits` ② 循环末尾的 `clamp_configuration()` 投影 ③ SDK 层的 `bounded = clip`。
 
 ### 2.6 复位与 blend
 
-- `reset()`：记录 `_q_blend_start`（当前 q）/ `_q_blend_goal`（`ARM_INIT`），`_reset_blend_deadline = monotonic() + reset_blend_frames / 50.0`（**wall-clock**）。
-- `_step_reset_blend()`：`w = smoothstep((now − start) / duration)`，`q = w_old·start + w_new·goal`；到点后停在下发目标并复位 Dex1 夹爪。
+- `reset()`：把 `ARM_INIT` 作为共享轨迹目标；不额外插入 smoothstep cross-fade。
+- `_step_reset_blend()`：在目标到达且速度降为零后结束 reset 并复位 Dex1 夹爪。
 - `reset_blend_frames = 60` → 1.2 s。
 
 ---
@@ -185,7 +180,7 @@ solver.enable_velocity_limits(True)
 `manipulability_threshold=0.05`、`joint_limit_margin=0.15`、`joint_limit_weight=2.0`、
 `max_step=0.03`、`iterations=100`。
 
-语义：输出同样经过 `_clamp_ik_step()`（速度/加速度整形），因此最坏情况是按限速朝 DLS 解爬行，而非瞬时跳变。
+语义：原始 DLS 解同样只作为目标输入独立 q/v/a 轨迹状态机，速度/加速度连续性不会在 QP→DLS 时重置。
 
 ---
 
@@ -218,10 +213,11 @@ self._reconcile_ik_seed(target_sdk, command)
 ### 5.3 `limit_sdk_position_command()`（SDK 层限幅）
 
 ```python
-bounded = clip(target, SDK_LOWER, SDK_UPPER)                       # ① 硬限位
-slewed  = previous + clip(bounded − previous, ±max_delta)           # ② 速度限幅
-return    measured + clip(slewed − measured, ±max_lead)             # ③ 实测超前限制
+slew_interval = [previous - max_delta, previous + max_delta] ∩ hard_limits
+lead_interval = [measured - max_lead, measured + max_lead]
+command       = clip(target, slew_interval ∩ lead_interval)
 ```
+- 若 measured 与 previous 已分离到两区间无交集，则单周期优先保持硬限位和 slew，逐周期追近实测值；这种反馈/命令脱节不能在一个周期同时满足两个限制。
 - `max_delta = max_joint_speed / rate_hz`（默认 1.0 / 30 = 0.0333 rad/拍）
 - `max_lead = 0.15 rad` —— 命令相对**实测**的最大超前量；它同时是力矩上界的第一项。
 - **力矩三项上界**（脚本打印用）：`kp×lead + kd×max_speed + tau_clip` = 80×0.15 + 2×1.0 + 8 = **22.0 Nm**（电机峰值 34.4 Nm 的 64%）。
@@ -254,7 +250,7 @@ struct Bridge { ArmMotorBus bus; };
 commands[i].mode = 1 ;           // FOC 位置环
 commands[i].timed_out = false;
 commands[i].q   = q[i];
-commands[i].dq  = 0.f;           // ★ 目标速度恒 0（阻尼项只对实测速度起作用）
+commands[i].dq  = dq[i];         // v3 期望速度，与相邻位置目标差分一致
 commands[i].tau = tau ? tau[i] : 0.f;
 commands[i].kp  = kp[i]; commands[i].kd = kd[i];
 bus.step(commands);              // 同步串口往返
@@ -268,10 +264,11 @@ bus.step(commands);              // 同步串口往返
 - `r1arm_bridge_probe(handle, ...)` —— 零力矩探测
 - `r1arm_bridge_command_position(handle, q, kp, kd, err, cap)` —— **v1 广播 ABI**
 - `r1arm_bridge_command_position_v2(handle, q, kp[7], kd[7], tau[7]|NULL, err, cap)` —— **v2 逐关节 + 力矩前馈**
+- `r1arm_bridge_command_position_v3(handle, q, dq, kp[7], kd[7], tau[7]|NULL, err, cap)` —— **v3 逐关节位置/速度目标 + 力矩前馈**
 - `r1arm_bridge_read_state(handle, q, dq, tau_est, mode, timeout, error_code, ready, err, cap)`
 - `r1arm_bridge_stop(handle, ...)` / `r1arm_bridge_close(handle, ...)`
 
-**路由规则**（`robot/r1arm_sdk.py::command_position`）：标量 kp/kd 且 `tau is None` → v1；否则 v2。
+**路由规则**（`robot/r1arm_sdk.py::command_position`）：仅位置标量命令 → v1；kp/kd/tau → v2；提供 dq 时 → v3。
 
 **标定**：`joint_calib_candidate.txt`（每行 `joint dir scale offset`，例：`j0 dir=-1 scale=1 offset=4.18628`）。
 
@@ -282,7 +279,7 @@ bus.step(commands);              // 同步串口往返
 - **串口**：`/dev/ttyUSB2 @ 6,000,000 baud`（实测 `read_state` + `command_position` 往返 ≈ **7.3 ms**，p95 9.4 ms）。
 - **控制模式**：`mode` 字段只有 0 = 停机、1 = FOC 位置环；**无独立力矩模式**——力矩是位置环的输出：
   `tau_motor = kp·(q_target − q_meas) + kd·(dq_target − dq_meas) + tau_ff`
-  其中 `dq_target = 0`（bridge 硬编码）。
+  当前实现使用 bridge v3 下发 q/dq 目标；期望速度是受安全限幅后的命令位置差分，不是测得的电机速度。`kd` 项基于 `dq_target - dq_meas`，应低速、托臂条件下逐步验证，不能仅凭接口存在就假设整机已调好阻抗。
 - **故障码**：`error_code`（实测 0x8 = 瞬态欠压，曾在回放降速不当的爬行段触发）；`timeout` 标志位。
 - **硬件规格**（厂商）：
 
@@ -315,7 +312,7 @@ bus.step(commands);              // 同步串口往返
 | 线程 | 名字 | 频率 | 职责 |
 |---|---|---|---|
 | **主线程** | — | `--rate` (30 Hz) | 控制环 `step()` / `_output_command()`、按键处理、`_publish_preview_state()`（轻量拼图 + 原子发布）、`--duration` 判定 |
-| **录制线程** | `r1arm-real-mcap-record` (daemon) | `--frequency` (30 Hz) | 相机快照 + `_state_action()` + `writer.add_frame()`（持 `writer_lock`） |
+| **录制线程** | `r1arm-real-mcap-record` (daemon) | `--frequency` (30 Hz) | 相机快照 + 读取控制线程原子发布的最新 `ControlSample` + MCAP 写入 |
 | **预览线程** | `r1arm-preview` (daemon) | `--preview-hz` (12 Hz) | `namedWindow` / `imshow` / `waitKey(1)`（Qt 事件泵 + q/ESC 退出）；等待期 10 ms 粒度 sleep |
 | **相机 worker** ×N | `camera-<key>` (daemon) | 设备帧率 | 抓帧 → 解码 BGR → 加锁写 `_frame` + `_received_at_ns`；内容冻结检测 |
 
@@ -339,9 +336,13 @@ while not stop:
                                        camera_frame_times_ns=cam_times)
 ```
 
-**`_state_action()`**：
-- `commanded_arm = controller.arm_q("right")` —— **★ 训练 action = 整形后的 IK 目标**
-- `measured_arm = sdk_to_model_q(last_state.q)`（motion_mode）/ 否则等于 commanded
+**`_state_action(sample)`**：读取同一个 `control_seq` 的原子控制快照，不再独立读取可变的 `controller.q` 和 `last_state`。
+- `actions.q_purpose` / 兼容别名 `actions.action` = 整形后的 IK 关节意图（模型坐标，7 轴 + 夹爪），训练主 action。
+- `actions.q_ik_raw` = 该周期的原始 Placo/DLS 关节解（7 轴）。
+- `actions.q_motor_target` = 经坐标转换、硬限位、slew、lead 后实际送给 SDK 的 7 轴位置目标（模型坐标）；`dq_target` 是最终位置命令的实际周期差分。
+- `actions.dq_purpose` / `ddq_purpose` = 独立轨迹状态机的期望速度/加速度；`xr_raw` / `xr_filtered` 可用于分析输入滤波影响。
+- `actions.ee_intent` = robot_base 下目标末端位置和 xyzw 四元数。
+- `states.joint_state`、`dq`、`tau_est` = 同一 `control_seq` 读取的实测值；state 反馈时间单独记在 `feedback_time_ns`。
 - 夹爪：`_gripper_state_command()` → 有 Dex1 时读 **DDS 真值**（`hand.get_record_data()` 的 `hand_state`/`hand_cmd`，经 `_dex1_open_ratio_to_sim` 转 sim 值）；无 Dex1 时回退仿真开度（**该回退会在保存时被质检点名**）
 - 拼 8 维 `[7 臂 + 夹爪]`，各含 2 份手指槽位 → `adapter.frame_data()` 生成 states/actions 字典
 
@@ -357,13 +358,16 @@ while not stop:
 **`/episode/meta`** = `{info, text, config}`：
 - `info`：`format`（`r1arm_real_multicamera_mcap_json_v1`）、`created_at`、`frequency_hz`、`camera_order`、`camera_positions`
 - `text`：`goal`（任务描述）
-- `config`：`robot`、`eef`、`simulator`、`motion_mode`、`teleop_stack`、`dual_arm`、`control_side`、`urdf_path`、`serial_port`、`camera_keys`、`camera_source_streams`、`camera_inactive`、`camera_devices`、`mcap_color_keys`、`joint_names`（8）、`state_dim`/`action_dim`（8）、`state_layout`、`sim_q_layout`、`teleop_rate_hz`、`teleop_max_joint_speed`、`teleop_max_command_lead`、`teleop_kp`/`kd`（标量或 null）、`teleop_kp_list`/`kd_list`（恒 7 值）、`teleop_gravity_ff`、`teleop_tau_clip`、`ik_max_acc_per_s2`、`ik_max_step_per_cycle`、`ik_qp_velocity_limit`、**`field_contract`**
+- `config`：`robot`、`eef`、`simulator`、`motion_mode`、`teleop_stack`、`dual_arm`、`control_side`、`urdf_path`、`serial_port`、`camera_keys`、`camera_source_streams`、`camera_inactive`、`camera_devices`、`mcap_color_keys`、`joint_names`（8）、`state_dim`/`action_dim`（8）、`state_layout`、`sim_q_layout`、`teleop_rate_hz`、`teleop_max_joint_speed`、`teleop_max_command_lead`、`teleop_kp`/`kd`（标量或 null）、`teleop_kp_list`/`kd_list`（恒 7 值）、`teleop_gravity_ff`、`teleop_tau_clip`、`ik_max_acc_per_s2`、`trajectory_max_speed_rad_s`、`ik_qp_velocity_limit`、**`field_contract`**
 
 **`field_contract`**（P3，转换器据此选字段）：
 ```
-train_action  = actions.action      # 整形后 IK 目标（模型坐标、J4 负号、8 维）
-train_state   = states.joint_state  # 电机实测
-diagnostics   = frame.camera_frame_times_ns
+train_action  = actions.q_purpose  # 整形后 IK 意图；actions.action 是兼容别名
+q_ik_raw      = actions.q_ik_raw   # 原始 IK 解，7 维
+q_motor       = actions.q_motor_target # 最终 SDK 位置目标，7 维
+ee_intent     = actions.ee_intent  # 末端目标位姿，robot_base / quaternion_xyzw
+train_state   = states.joint_state # 同 control_seq 的电机实测
+diagnostics   = control_seq + feedback_time_ns + camera_frame_times_ns + dq/tau_est
 frame         = "model"
 j4_sign       = "negative (URDF convention)"
 gripper_unit  = "sim value +0.0245 open / -0.02 closed"
@@ -396,17 +400,17 @@ gripper_unit  = "sim value +0.0245 open / -0.02 closed"
 
 ## 10. 回放链路
 
-**文件**：`scripts/replay_r1arm_real.py`（802 行）
+**文件**：`scripts/replay_r1arm_real.py`
 
 ### 10.1 加载与参数推导
 
 1. 读 episode → `arm_traj` / `gripper_traj` / `intervals`（由 `sample_time_ns` 差分，异常间隔用 `1/frequency_hz`）
 2. `freq = args.frequency or recorded_hz`；`peak_speed` = 轨迹最大关节速度
 3. **slew cap**：
-   - `--section action` → 用 episode 的 `teleop_max_joint_speed`（复现录制时整形）
+   - `--section action` → 读取已整形的 `actions.q_purpose`；不做二次轨迹整形，仍保留 SDK 安全 slew/lead/关节限位
    - `--section state` → `max(peak×1.2, 1.0)`，上限 `--auto-speed-cap`（5.0）
 4. `use_ff` = `--gravity-ff` / `--no-gravity-ff`，缺省读 `config.teleop_gravity_ff`（旧 episode 无字段则默认开）
-5. `shaper` = `ReplayTrajectoryShaper(rate=--rate, v_max=meta.teleop_max_joint_speed, a_max=meta.ik_max_acc_per_s2)`，除非 `--no-shaper`
+5. 回放 action 时不串 `ReplayTrajectoryShaper`；逐周期按最终安全位置目标的有限差分计算 `dq_target` 并下发 SDK v3
 
 ### 10.2 执行
 
@@ -415,18 +419,17 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 → approach(arm_traj[0])                        独立限速 --approach-speed，走 SDK 层限幅
 → play loop（逐帧）：
       target_sdk = model_to_sdk_q(frame)
-      target_sdk = shaper.shape(command_sdk, target_sdk)      # 速度/加速度斜坡重建
       cmd = limit_sdk_position_command(target_sdk, command_sdk, measured,
                                        max_delta = max_joint_speed/freq, max_lead=0.15)
-      bus.command_position(cmd, kp, kd, tau=tau_ff(cmd))
+      dq = (cmd - command_sdk) / actual_command_dt
+      bus.command_position(cmd, kp, kd, tau=tau_ff(cmd), dq=dq)
+      CSV: q_purpose / q_motor_target / dq_target / q,dq,tau_est / tracking errors
       command_gripper(gripper_traj[i])                        # 需 --enable-dex1
       按 sample_time_ns 调度（gap > --max-frame-gap 压缩）
 → approach(arm_traj[-1])  收敛
 → hold 最后姿态 --hold-time 秒（带 FF）
 → safe_stop
 ```
-
-**`ReplayTrajectoryShaper`**（与录制端整形器同源逻辑）：`v_new = clip(v_target, v_prev ± a_max·dt)` 再 clip ±`v_max`，`q_out = prev + v_new·dt`；`reset()` 在接近段后调用，让轨迹从静止斜坡起步。
 
 ### 10.3 与录制端的参数继承
 
@@ -435,8 +438,8 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 | `--kp` / `--kd` | 默认 80/2（不自动继承；episode 里存了 `teleop_kp_list` 备查） |
 | 重力前馈 | `config.teleop_gravity_ff` |
 | slew cap | `config.teleop_max_joint_speed` |
-| 整形器 a_max | `config.ik_max_acc_per_s2` |
 | 控制环 | `--rate`（默认 30，与 30 Hz episode 1:1） |
+| 回放遥测 | 每轮 CSV 记录 q_purpose、q_motor_target、dq_target、实测 q/dq/tau_est 与误差 |
 
 ---
 
@@ -478,11 +481,11 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 | `--tau-clip` | 8.0 Nm | 前馈单关节限幅 |
 | `--max-joint-speed` | 1.0 rad/s | SDK 层 slew（→ `max_delta = 1/rate`） |
 | `--max-command-lead` | 0.15 rad | 命令相对实测的超前上限 |
-| `ik_max_step_per_cycle` | 0.02 | IK 输出速度上限（50 Hz 标定语义 → 任意 rate 恒 `×50` rad/s） |
+| `trajectory_max_speed_rad_s` | 1.0 | 轨迹整形器速度上限（rad/s，直接使用，不依赖控制频率） |
 | `ik_max_acc_per_s2` | 6.0 | IK 加速度上限（换算 `×50/rate` → 30 Hz 实际 **10 rad/s²**） |
-| `ik_qp_velocity_limit` | 1.0 rad/s | QP 内关节速度上限（`None` = 不启用） |
+| `ik_qp_velocity_limit` | `None` | QP 内关节速度上限（关闭；设置数值才启用） |
 | `ik_joint_velocity_limits` | `None` | 逐关节覆盖，如 `{"J5": 0.8}` |
-| `--ik-dt` | 0.0 | 覆盖 Placo `solver.dt`（0 = 跟随 1/rate） |
+| `--ik-dt` | 0.0 | 覆盖 Placo `solver.dt`（0 = `1/rate`；当前 QP 速度限制关闭时不改变 raw IK 解） |
 | `--reset-blend-frames` | 60 | A/home 复位时长（wall-clock，`frames/50` 秒 = 1.2 s） |
 | `arm_task_weight` | 1.0 | Placo ee 任务权重 |
 | `--trace / --debug` | off | 每秒打印实测/命令/误差 |
@@ -511,11 +514,11 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--section` | `state` | `state`（实测，含悬垂）/ `action`（指令，无二次悬垂） |
+| `--section` | `action` | `action`（已整形 q_purpose）/ `state`（实测位姿） |
 | `--rate` | 30.0 | 控制/接近环 |
 | `--speed` | 1.0 | 时间轴倍率 |
 | `--frequency` | 0.0 | 播放帧率（0 = 用 episode 的 `frequency_hz`） |
-| `--control-hz` | 0.0 | >0 时线性插值到更密控制格（注意：与 shaper 是两条不同路径） |
+| `--control-hz` | 0.0 | >0 时线性插值到更密控制格；默认按原始采样时刻回放 |
 | `--max-joint-speed` | `None` | None = 按 section 自动推导 |
 | `--auto-speed-cap` | 5.0 | state 模式自动 cap 上限 |
 | `--approach-speed` | 1.0 | 接近段关节速度 |
@@ -523,7 +526,7 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 | `--approach-timeout` | 10.0 s | |
 | `--max-frame-gap` | 2.0 s | 长间隔压缩 |
 | `--hold-time` | 2.0 s | 末姿态保持 |
-| `--no-shaper` | off | 关闭回放整形 |
+| `--telemetry-csv` | auto | 每轮回放遥测 CSV；默认在源 episode 旁生成唯一文件 |
 | `--gravity-ff` / `--no-gravity-ff` | `None` | 缺省读 episode 元数据 |
 | `--loop` | off | 循环回放 |
 | `--start-frame` / `--end-frame` | 0 / −1 | 片段 |
@@ -574,11 +577,11 @@ open bus → wait_for_feedback → enable_foc_hold(tau=tau_ff)
 
 | 频率 | 环节 | 代码 | 关系 |
 |---|---|---|---|
-| **~30 Hz** | XR 服务端推送帧 | 原生 SDK | 帧时钟；`_track_side` 只在新帧时更新目标 |
-| **`--rate` 30 Hz** | 控制环（IK + 执行 + 命令） | `controller.run(rate)` | 每拍：读 XR → IK → 整形 → 命令 → 反馈 |
-| **`--frequency` 30 Hz** | 录制采样 | `_record_loop` | 每拍：相机快照 + `arm_q()` + `last_state` → MCAP 一帧 |
+| **~30 Hz** | XR 服务端推送帧 | 原生 SDK | 新帧才读入并滤波；无新帧时复用上次位姿 |
+| **`--rate` 30 Hz** | 控制环（IK + 执行 + 命令） | `controller.run(rate)` | 每拍：取新/缓存 XR → tracking/IK → 整形 → 命令 → 反馈；因此高于 XR 频率时会对缓存位姿重复求解 |
+| **`--frequency` 30 Hz** | 录制采样上限 | `_record_loop` | 读取新的原子控制样本；一帧绑定一个 `control_seq`，重复序号不写入 |
 
-30 Hz 定居后三者同拍：**一条 action = 一条 state = 一个电机命令周期**，零抽取、零相位假设。
+录制端按新的 control_seq 采样：每条样本把该控制周期的 action、最终命令和反馈绑定在一起，不重复写入同一个控制周期；相机仍按最近快照采样，并保存各路到达时间用于对齐分析。
 （回放端 `--rate` 默认也是 30，与 30 Hz episode 1:1。）
 
 ---

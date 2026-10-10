@@ -80,6 +80,9 @@ class R1ArmSimMcapRecorder:
             dual_arm=args.use_dual_arm,
             control_side=args.side,
             reset_blend_frames=args.reset_blend_frames,
+            trajectory_max_speed_rad_s=args.max_joint_speed,
+            xr_filter_min_cutoff=args.xr_filter_min_cutoff,
+            xr_filter_beta=args.xr_filter_beta,
         )
         if args.urdf:
             config.urdf_path = args.urdf
@@ -96,7 +99,9 @@ class R1ArmSimMcapRecorder:
             scale_factor=args.scale_factor,
             show_viewer=not args.no_viewer,
             sim_substeps=args.sim_substeps,
+            ik_dt=args.ik_dt if args.ik_dt > 0.0 else 1.0 / max(args.rate, 1.0),
         )
+        self.controller.rate_hz = float(args.rate)
         # Keep the exact R1Arm teleop behavior: A remains the soft-reset key.
         self.controller.enable_a_button_reset = True
         self.adapter = R1ArmDatasetAdapter(
@@ -186,6 +191,7 @@ class R1ArmSimMcapRecorder:
                     task["actions"],
                     task["image_frame_id"],
                     sample_time_ns=task["sample_time_ns"],
+                    control_seq=task["control_seq"],
                 )
                 with self._count_lock:
                     self.record_frame_count += 1
@@ -233,6 +239,23 @@ class R1ArmSimMcapRecorder:
             "sim_q_layout": "right_arm(7)+right_hand(2)+left_arm(7)+left_hand(2)"
             if self.args.use_dual_arm
             else "arm(7)+hand_fingers(2)",
+            "teleop_rate_hz": float(self.args.rate),
+            "record_frequency_hz": float(self.args.frequency),
+            "trajectory_max_speed_rad_s": float(self.config.trajectory_max_speed_rad_s),
+            "ik_dt_s": float(self.args.ik_dt) if self.args.ik_dt > 0 else 1.0 / float(self.args.rate),
+            "xr_filter_min_cutoff": float(self.config.xr_filter_min_cutoff),
+            "xr_filter_beta": float(self.config.xr_filter_beta),
+            "trajectory_position_gain": float(self.config.trajectory_position_gain),
+            "trajectory_velocity_gain": float(self.config.trajectory_velocity_gain),
+            "ik_max_acc_per_s2": float(self.config.ik_max_acc_per_s2),
+            "ik_max_jerk_per_s3": float(self.config.ik_max_jerk_per_s3),
+            "diagnostic_action_fields": [
+                "q_ik_raw", "q_purpose", "dq_purpose", "ddq_purpose",
+                "ee_intent", "ik_solver", "xr_valid", "xr_raw", "xr_filtered",
+                "xr_poses_raw", "xr_poses_filtered", "xr_frame_stamp_ns",
+                "xr_poses_jump_rejected", "xr_filter_state", "xr_jump_reject_count",
+                "control_seq", "control_time_ns", "grip_active", "teleop_anchor",
+            ],
         }
 
     def _active_duration(self, now: float | None = None) -> float:
@@ -366,11 +389,44 @@ class R1ArmSimMcapRecorder:
         measured = self.controller.sim.get_q()
         commanded = self.controller.sim_q()
         states, actions = self.adapter.frame_data(measured, commanded)
+        control_sample = self.controller.control_sample() or {}
+        side = self.args.side
+        ee_intent = control_sample.get("ee_intent", {})
+        actions.update({
+            "q_ik_raw": np.asarray(
+                control_sample.get("q_ik_raw", self.controller.arm_q(side)), dtype=float
+            ).tolist(),
+            "q_purpose": np.asarray(
+                control_sample.get("q_purpose", self.controller.arm_q(side)), dtype=float
+            ).tolist(),
+            "dq_purpose": np.asarray(control_sample.get("dq_purpose", np.zeros(7)), dtype=float).tolist(),
+            "ddq_purpose": np.asarray(control_sample.get("ddq_purpose", np.zeros(7)), dtype=float).tolist(),
+            "ee_intent": {
+                "position": np.asarray(ee_intent.get("position", []), dtype=float).tolist(),
+                "quaternion_xyzw": np.asarray(ee_intent.get("quaternion_xyzw", []), dtype=float).tolist(),
+                "frame": ee_intent.get("frame", "robot_base"),
+            },
+            "ik_solver": str(control_sample.get("ik_solver", "unknown")),
+            "xr_valid": bool(control_sample.get("xr_valid", False)),
+            "xr_raw": control_sample.get("xr_raw", {}),
+            "xr_filtered": control_sample.get("xr_filtered", {}),
+            "xr_poses_raw": control_sample.get("xr_poses_raw", {}),
+            "xr_poses_filtered": control_sample.get("xr_poses_filtered", {}),
+            "xr_poses_jump_rejected": control_sample.get("xr_poses_jump_rejected", {}),
+            "xr_filter_state": control_sample.get("xr_filter_state", {}),
+            "xr_jump_reject_count": control_sample.get("xr_jump_reject_count", 0),
+            "xr_frame_stamp_ns": control_sample.get("xr_frame_stamp_ns"),
+            "control_seq": control_sample.get("control_seq"),
+            "control_time_ns": control_sample.get("control_time_ns"),
+            "grip_active": bool(control_sample.get("grip_active", False)),
+            "teleop_anchor": control_sample.get("teleop_anchor", {}),
+        })
         self.image_frame_id += 1
         data = self.controller.sim.data
         self._frame_queue.put(
             {
                 "sample_time_ns": time.time_ns(),
+                "control_seq": control_sample.get("control_seq"),
                 "image_frame_id": self.image_frame_id,
                 "states": states,
                 "actions": actions,
@@ -454,6 +510,12 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--mock-xr", action="store_true")
     sim.add_argument("--debug", action="store_true")
     sim.add_argument("--rate", type=float, default=50.0)
+    sim.add_argument("--ik-dt", type=float, default=0.0,
+                     help="Placo IK timestep seconds; 0 aligns it to 1/--rate")
+    sim.add_argument("--xr-filter-min-cutoff", type=float, default=8.0)
+    sim.add_argument("--xr-filter-beta", type=float, default=1.0)
+    sim.add_argument("--max-joint-speed", type=float, default=1.0,
+                     help="q_purpose shaper speed limit rad/s")
     sim.add_argument("--no-viewer", action="store_true")
     sim.add_argument("--sim-substeps", type=int, default=10)
     sim.add_argument("--reset-blend-frames", type=int, default=100)

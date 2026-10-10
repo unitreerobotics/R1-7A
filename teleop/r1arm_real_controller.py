@@ -9,8 +9,10 @@ from typing import Callable
 import numpy as np
 
 from robot.r1arm_config import ARM_JOINTS, ARM_LIMITS, R1ArmConfig
+from robot.arm_model import clamp_configuration
 from robot.r1arm_sdk import R1ArmSdkBus, R1ArmSdkState, model_to_sdk_q, sdk_to_model_q
 from teleop.r1arm_controller_base import R1ArmTeleopControllerBase
+from teleop.r1arm_placo_solver import joint_delta_bounds
 
 
 MODEL_LOWER = np.array([ARM_LIMITS[name][0] for name in ARM_JOINTS], dtype=float)
@@ -35,9 +37,19 @@ def limit_sdk_position_command(
     measured = np.asarray(measured, dtype=float).reshape(7)
     if not all(np.all(np.isfinite(values)) for values in (target, previous, measured)):
         raise RuntimeError("Non-finite R1Arm command/feedback")
-    bounded = np.clip(target, SDK_LOWER, SDK_UPPER)
-    slewed = previous + np.clip(bounded - previous, -abs(max_delta), abs(max_delta))
-    return measured + np.clip(slewed - measured, -abs(max_lead), abs(max_lead))
+    delta = abs(float(max_delta))
+    lead = abs(float(max_lead))
+    slew_lower = np.maximum(SDK_LOWER, previous - delta)
+    slew_upper = np.minimum(SDK_UPPER, previous + delta)
+    lower = np.maximum(slew_lower, measured - lead)
+    upper = np.minimum(slew_upper, measured + lead)
+    feasible = lower <= upper
+    command = np.clip(target, slew_lower, slew_upper)
+    command[feasible] = np.clip(target[feasible], lower[feasible], upper[feasible])
+    # If measured position is already farther from the previous command than
+    # lead + slew permits, preserve the hard per-cycle slew and catch up over
+    # subsequent cycles; both constraints cannot hold on this one cycle.
+    return np.clip(command, SDK_LOWER, SDK_UPPER)
 
 
 class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
@@ -101,9 +113,10 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.kd = kd if isinstance(kd, np.ndarray) else float(kd)
         self.rate_hz = float(rate)
         self.max_delta = float(max_joint_speed) / self.rate_hz
-        # IK 积分 dt 跟实际控制频率对齐（基类构造时还不知道真实 rate）；
-        # ik_dt > 0 时显式覆盖（解耦：调噪声/振荡时保留指令密度、单独压
-        # IK 每步增量）
+        self.max_joint_speed = float(max_joint_speed)
+        # Set Placo's velocity-limit timestep to the control period (or an
+        # explicit override). In the current unconstrained pose-IK mode this
+        # value does not scale the raw IK step.
         for solver in (self.placo_solver, self.placo_solver_left):
             if solver is not None:
                 solver_dt = float(ik_dt) if ik_dt and ik_dt > 0 else 1.0 / self.rate_hz
@@ -119,6 +132,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.bus_factory = bus_factory
         self.arm_bus: R1ArmSdkBus | None = None
         self.command_sdk: np.ndarray | None = None
+        self._last_command_time_ns: int | None = None
+        self._last_command_monotonic_s: float | None = None
+        self._last_command_dt = 1.0 / self.rate_hz
         self.last_state: R1ArmSdkState | None = None
         self.last_report_time = 0.0
 
@@ -181,6 +197,7 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         for index, value in zip(self.arm_q_indices, model_q):
             q[index] = value
         self.q = q
+        self._solver_seeds[self.control_side] = q.copy()
         if self.placo_solver is not None:
             self.placo_solver.set_regularization_reference(self.q)
         for track in self.track.values():
@@ -188,6 +205,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.active = False
         self.command_sdk = state.q.copy()
         self.last_state = state
+        self._reset_trajectory_state(self.control_side, q)
+        self._last_command_monotonic_s = time.monotonic()
 
     def _enable_foc_hold(self) -> R1ArmSdkState:
         assert self.arm_bus is not None and self.command_sdk is not None
@@ -271,36 +290,102 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         return np.clip(model_to_sdk_q(tau), -self.tau_clip, self.tau_clip)
 
     def _reconcile_ik_seed(self, target_sdk: np.ndarray, command_sdk: np.ndarray) -> None:
-        """Pull the IK seed back toward the actually-sent command when clipped.
+        """Use the issued motor target as next cycle's IK solver seed.
 
-        P1: the IK integrates its internal self.q; the output limiter may clip
-        that to a slower slew. If clipping persists, the internal target runs
-        ahead of the hardware and the recorded action drifts from what was
-        sent. When the gap exceeds a threshold, re-seed self.q's arm joints
-        from the sent command — the solver keeps solving from the pose the
-        arm is actually tracking, so re-referenced grip re-anchoring doesn't
-        have a hidden backlog to snap toward.
+        The shaped IK trajectory in ``self.q`` stays independent and
+        continuous; only the solver posture seed follows the motor command.
         """
         gap = np.abs(command_sdk - target_sdk)
-        if not np.any(gap > self._IK_SEED_GAP_RAD):
-            return
-        if self._reset_blending:
-            return  # blend 段 q 由 start/goal 公式逐拍重写，gap 是 slew 瞬态；回写无意义且刷日志
         drifted = np.flatnonzero(gap > self._IK_SEED_GAP_RAD)
-        q = self.q.copy()
+        seed = self.q.copy()
         cmd_model = sdk_to_model_q(command_sdk)
         for i, idx in enumerate(self.arm_q_indices):
-            if i in drifted:
-                q[idx] = cmd_model[i]
-        self.q = q
-        if self.debug:
+            seed[idx] = cmd_model[i]
+        self._solver_seeds[self.control_side] = seed
+        if self.debug and drifted.size:
             names = ", ".join(ARM_JOINTS[i] for i in drifted)
-            print(f"[seed] re-anchored IK seed to sent command ({names})")
+            print(f"[seed] updated IK solver seed from issued command ({names})")
 
     _IK_SEED_GAP_RAD = 0.05  # clip gap that triggers a seed re-anchor
 
+    def _control_diagnostics(self) -> dict:
+        trigger, valid, sampled_at = self._trigger_samples.get(
+            self.control_side, (0.0, False, 0.0)
+        )
+        closed_ratio = float(np.clip(
+            (self.config.dex1_open - self.grippers[self.control_side].current)
+            / max(self.config.dex1_open - self.config.dex1_close, 1e-9),
+            0.0, 1.0,
+        ))
+        diagnostics = {
+            "trigger_value": float(trigger),
+            "trigger_valid": bool(valid),
+            "trigger_age_s": max(0.0, time.monotonic() - sampled_at) if sampled_at else None,
+            "dex1_command_open_ratio": 1.0 - closed_ratio,
+            "dex1_state_open_ratio": None,
+            "dex1_tau_est": None,
+            "dex1_feedback_valid": False,
+            "dex1_feedback_age_s": None,
+            "dex1_feedback_time_ns": None,
+            "dex1_command_age_s": None,
+            "dex1_command_time_ns": None,
+            "dex1_command_count": 0,
+            "dex1_publish_ok": None,
+            "dex1_publish_fail_count": 0,
+        }
+        if self.hand_ctrl is not None:
+            try:
+                data = self.hand_ctrl.get_record_data()
+                diagnostics["dex1_command_open_ratio"] = float(data["hand_cmd"][0])
+                diagnostics["dex1_state_open_ratio"] = float(data["hand_state"][0])
+                diagnostics["dex1_tau_est"] = float(data["hand_torque"][0])
+                diagnostics["dex1_feedback_age_s"] = data.get("feedback_age_s")
+                diagnostics["dex1_feedback_time_ns"] = data.get("feedback_time_ns")
+                diagnostics["dex1_feedback_valid"] = bool(data.get("feedback_valid", False))
+                diagnostics["dex1_command_age_s"] = data.get("command_age_s")
+                diagnostics["dex1_command_time_ns"] = data.get("command_time_ns")
+                diagnostics["dex1_command_count"] = int(data.get("command_count", 0))
+                diagnostics["dex1_publish_ok"] = data.get("command_publish_ok")
+                diagnostics["dex1_publish_fail_count"] = int(
+                    data.get("command_publish_fail_count", 0)
+                )
+            except Exception:
+                pass
+        return diagnostics
+
     def _output_command(self) -> None:
+        purpose_model = self.arm_q().copy()
+        _, purpose_velocity, purpose_acceleration = self._action_trajectory_state(
+            self.control_side, self.q
+        )
+        xr_raw = self._xr_pose_raw or {}
+        xr_filtered = self._xr_pose_cache or {}
+        xr_raw_pose = xr_raw.get(f"{self.control_side}_controller")
+        xr_filtered_pose = xr_filtered.get(f"{self.control_side}_controller")
+        diagnostics = self._control_diagnostics()
         if not self.motion_mode:
+            self._control_seq += 1
+            ee_intent = self._last_ee_intent.get(self.control_side, {})
+            command_time_ns = time.time_ns()
+            self.publish_control_sample({
+                "control_seq": self._control_seq,
+                "control_time_ns": command_time_ns,
+                "command_time_ns": command_time_ns,
+                "q_purpose": purpose_model,
+                "dq_purpose": purpose_velocity,
+                "ddq_purpose": purpose_acceleration,
+                "q_ik_raw": self._last_ik_raw.get(self.control_side, purpose_model).copy(),
+                "q_motor_target": purpose_model.copy(),
+                "dq_target": purpose_velocity.copy(),
+                "q_measured": purpose_model.copy(),
+                "dq_measured": np.zeros(7),
+                "tau_est": np.zeros(7),
+                "ee_intent": ee_intent,
+                "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
+                "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
+                "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+                **diagnostics,
+            })
             if self.debug and time.monotonic() - self.last_report_time >= 1.0:
                 self.last_report_time = time.monotonic()
                 print("[dry-run] model q =", np.array2string(self.arm_q(), precision=3))
@@ -310,22 +395,61 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         if not Path(self.port).exists():
             raise RuntimeError(f"R1Arm serial device disappeared: {self.port}")
 
+        feedback_time_ns = time.time_ns()
         state = self.arm_bus.read_state()
         self._check_feedback_range(state)
         self._check_faults(state, require_foc=True)
         target_sdk = model_to_sdk_q(self.arm_q())
+        now_mono_ns = time.monotonic_ns()
+        now_mono_s = time.monotonic()
+        command_dt = (
+            now_mono_s - self._last_command_monotonic_s
+            if self._last_command_monotonic_s is not None else 1.0 / self.rate_hz
+        )
+        command_dt = float(np.clip(command_dt, 1e-4, 0.1))
         command = limit_sdk_position_command(
             target_sdk,
             self.command_sdk,
             state.q,
-            max_delta=self.max_delta,
+            max_delta=self._sdk_max_delta(command_dt),
             max_lead=self.max_command_lead,
         )
-        self.arm_bus.command_position(command, self.kp, self.kd, tau=self._tau_ff(command))
+        dq_target_sdk = (command - self.command_sdk) / command_dt
+        self.arm_bus.command_position(
+            command, self.kp, self.kd, tau=self._tau_ff(command), dq=dq_target_sdk
+        )
+        command_time_ns = time.time_ns()
+        self._last_command_monotonic_s = now_mono_s
+        self._last_command_dt = command_dt
         self.command_sdk = command
         self.last_state = state
         self._reconcile_ik_seed(target_sdk, command)
-
+        purpose_model = self.arm_q().copy()
+        _, purpose_velocity, purpose_acceleration = self._action_trajectory_state(
+            self.control_side, self.q
+        )
+        self._control_seq += 1
+        ee_intent = self._last_ee_intent.get(self.control_side, {})
+        self.publish_control_sample({
+            "control_seq": self._control_seq,
+            "control_time_ns": command_time_ns,
+            "command_time_ns": command_time_ns,
+            "feedback_time_ns": feedback_time_ns,
+            "q_purpose": purpose_model,
+            "dq_purpose": purpose_velocity,
+            "ddq_purpose": purpose_acceleration,
+            "q_ik_raw": self._last_ik_raw.get(self.control_side, purpose_model).copy(),
+            "q_motor_target": sdk_to_model_q(command),
+            "dq_target": sdk_to_model_q(dq_target_sdk),
+            "q_measured": sdk_to_model_q(state.q.copy()),
+            "dq_measured": sdk_to_model_q(state.dq.copy()),
+            "tau_est": sdk_to_model_q(state.tau_est.copy()),
+            "ee_intent": ee_intent,
+            "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
+            "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
+            "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+            **diagnostics,
+        })
         if self.debug and time.monotonic() - self.last_report_time >= 1.0:
             self.last_report_time = time.monotonic()
             error = command - state.q
@@ -337,6 +461,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                 " error=",
                 np.array2string(error, precision=3),
             )
+
+    def _sdk_max_delta(self, dt: float) -> float:
+        return self.max_delta
 
     def _safe_stop_arm(self) -> None:
         bus = self.arm_bus
@@ -360,3 +487,170 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
     def _on_stop(self) -> None:
         self._safe_stop_arm()
         super()._on_stop()
+
+
+class R1ArmUnshapedIKTeleopController(R1ArmRealTeleopController):
+    """Direct IK tracking; home and grip-release transitions stay shaped."""
+
+    def __init__(self, config: R1ArmConfig, *, max_joint_speed: float = 0.5, **kwargs) -> None:
+        # Move the speed constraint into the IK solvers instead of post-IK shaping.
+        config.ik_qp_velocity_limit = float(max_joint_speed)
+        super().__init__(config, max_joint_speed=max_joint_speed, **kwargs)
+        self._dls_max_step = self.max_delta
+
+    def _solve(self, side: str, target_pos: np.ndarray, target_quat: np.ndarray | None) -> None:
+        q = self._q_for_side(side)
+        solver_seed = self._solver_seeds.get(side, q)
+        solver = self._placo_for_side(side)
+        q_next = None
+        solver_name = "dls"
+        if self.use_placo and solver is not None:
+            sol = solver.solve(solver_seed, target_pos, target_quat)
+            if sol is not None:
+                q_next = q.copy()
+                for idx in self.arm_q_indices:
+                    q_next[idx] = sol[idx]
+                solver_name = "placo"
+        if q_next is None:
+            q_next = self._solve_dls(solver_seed, target_pos, target_quat)
+        q_next = clamp_configuration(self.model, q_next)
+        dt = min(max(float(getattr(self, "_step_dt", 1.0 / self.rate_hz)), 1e-4), 0.1)
+        self._ensure_trajectory_state(side, q)
+        q_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
+        v_cmd = (q_cmd - self._trajectory_q_cmd[side]) / dt
+        a_cmd = np.clip(
+            (v_cmd - self._trajectory_v_cmd[side]) / dt,
+            -self.config.ik_max_acc_per_s2,
+            self.config.ik_max_acc_per_s2,
+        )
+        # Keep transition state current for a smooth release, without shaping
+        # the active IK result itself.
+        self._trajectory_q_cmd[side] = q_cmd
+        self._trajectory_v_cmd[side] = v_cmd
+        self._trajectory_a_cmd[side] = a_cmd
+        self._set_q_for_side(side, q_next)
+        self._solver_seeds[side] = q_next.copy()
+        self._last_ik_raw[side] = q_cmd.copy()
+        self._last_ik_solver[side] = solver_name
+
+
+class R1ArmQPConstrainedIKTeleopController(R1ArmRealTeleopController):
+    """Active IK with optional velocity/acceleration/jerk QP bounds."""
+
+    def __init__(
+        self, config: R1ArmConfig, *, max_joint_speed: float = 1.0,
+        qp_jerk_limit: float | None = None, **kwargs,
+    ) -> None:
+        config.ik_qp_velocity_limit = float(max_joint_speed)
+        config.ik_qp_acceleration_limit = float(config.ik_max_acc_per_s2)
+        config.ik_qp_jerk_limit = (
+            float(qp_jerk_limit) if qp_jerk_limit is not None and qp_jerk_limit > 0.0 else None
+        )
+        super().__init__(config, max_joint_speed=max_joint_speed, **kwargs)
+        per_joint = config.ik_joint_velocity_limits or {}
+        self._qp_velocity_limits = np.array([
+            float(per_joint.get(name, max_joint_speed)) for name in ARM_JOINTS
+        ])
+        self._qp_velocity_limits = np.where(
+            self._qp_velocity_limits > 0.0,
+            self._qp_velocity_limits,
+            float(max_joint_speed),
+        )
+        self._qp_acceleration_limit = float(config.ik_max_acc_per_s2)
+        self._qp_jerk_limit = config.ik_qp_jerk_limit
+        self._qp_action_state: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._qp_last_motor_q: np.ndarray | None = None
+        self._qp_last_motor_v = np.zeros(7)
+
+    def _seed_model_from_feedback(self, state: R1ArmSdkState) -> None:
+        super()._seed_model_from_feedback(state)
+        self._qp_last_motor_q = sdk_to_model_q(state.q.copy())
+        self._qp_last_motor_v = np.zeros(7)
+
+    def _action_trajectory_state(
+        self, side: str, q: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._last_ik_solver.get(side) in {
+            "placo_va_qp", "dls_va_projected", "placo_vaj_qp", "dls_vaj_projected"
+        }:
+            state = self._qp_action_state.get(side)
+            if state is not None:
+                return tuple(value.copy() for value in state)
+        return super()._action_trajectory_state(side, q)
+
+    def _solve(self, side: str, target_pos: np.ndarray, target_quat: np.ndarray | None) -> None:
+        q = self._q_for_side(side)
+        solver_seed = self._solver_seeds.get(side, q).copy()
+        self._ensure_trajectory_state(side, q)
+        dt = float(np.clip(getattr(self, "_step_dt", 1.0 / self.rate_hz), 1e-4, 0.1))
+        previous_velocity = self._trajectory_v_cmd[side].copy()
+        solver = self._placo_for_side(side)
+        q_next = None
+        q_raw = None
+        suffix = "vaj" if self._qp_jerk_limit is not None else "va"
+        solver_name = f"dls_{suffix}_projected"
+        previous_acceleration = self._trajectory_a_cmd[side].copy()
+
+        if self.use_placo and solver is not None:
+            sol = solver.solve(
+                solver_seed, target_pos, target_quat,
+                dt=dt, previous_velocity=previous_velocity,
+                previous_acceleration=previous_acceleration,
+            )
+            if sol is not None:
+                q_next = solver_seed.copy()
+                for idx in self.arm_q_indices:
+                    q_next[idx] = sol[idx]
+                q_raw = q_next.copy()
+                solver_name = f"placo_{suffix}_qp"
+
+        if q_next is None:
+            lower, upper = joint_delta_bounds(
+                previous_velocity, self._qp_velocity_limits,
+                self._qp_acceleration_limit, dt,
+                previous_acceleration=previous_acceleration,
+                jerk_limit=self._qp_jerk_limit,
+            )
+            q_raw = self._solve_dls(solver_seed, target_pos, target_quat)
+            q_next = solver_seed.copy()
+            for i, idx in enumerate(self.arm_q_indices):
+                delta = float(q_raw[idx] - solver_seed[idx])
+                q_next[idx] = solver_seed[idx] + float(np.clip(delta, lower[i], upper[i]))
+
+        q_next = clamp_configuration(self.model, q_next)
+        q_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
+        q_prev = np.asarray([solver_seed[idx] for idx in self.arm_q_indices], dtype=float)
+        v_next = (q_cmd - q_prev) / dt
+        a_next = (v_next - previous_velocity) / dt
+        self._trajectory_q_cmd[side] = q_cmd.copy()
+        self._trajectory_v_cmd[side] = v_next.copy()
+        self._trajectory_a_cmd[side] = a_next.copy()
+        self._qp_action_state[side] = (q_cmd.copy(), v_next.copy(), a_next.copy())
+        self._set_q_for_side(side, q_next)
+        self._solver_seeds[side] = q_next.copy()
+        self._last_ik_raw[side] = np.asarray(
+            [q_raw[idx] for idx in self.arm_q_indices], dtype=float
+        )
+        self._last_ik_solver[side] = solver_name
+
+    def _reconcile_ik_seed(self, target_sdk: np.ndarray, command_sdk: np.ndarray) -> None:
+        command_q = sdk_to_model_q(command_sdk)
+        dt = float(np.clip(self._last_command_dt, 1e-4, 0.1))
+        if self._qp_last_motor_q is None:
+            command_v = np.zeros(7)
+        else:
+            command_v = (command_q - self._qp_last_motor_q) / dt
+        command_a = (command_v - self._qp_last_motor_v) / dt
+        self._qp_last_motor_q = command_q.copy()
+        self._qp_last_motor_v = command_v.copy()
+
+        seed = self.q.copy()
+        for idx, value in zip(self.arm_q_indices, command_q):
+            seed[idx] = value
+        self._solver_seeds[self.control_side] = seed
+        self._trajectory_q_cmd[self.control_side] = command_q.copy()
+        self._trajectory_v_cmd[self.control_side] = command_v.copy()
+        self._trajectory_a_cmd[self.control_side] = command_a.copy()
+
+    def _sdk_max_delta(self, dt: float) -> float:
+        return self.max_joint_speed * dt

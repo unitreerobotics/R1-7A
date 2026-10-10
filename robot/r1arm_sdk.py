@@ -38,6 +38,25 @@ def validate_calibration_file(path: str | Path) -> Path:
     calibration = Path(path).expanduser().resolve()
     if not calibration.is_file():
         raise FileNotFoundError(f"R1Arm calibration file not found: {calibration}")
+    seen: set[int] = set()
+    for line_no, raw in enumerate(calibration.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) not in (3, 4):
+            raise ValueError(f"Bad calibration line {line_no}: {raw!r}")
+        joint = int(fields[0])
+        direction = float(fields[1])
+        scale = float(fields[2]) if len(fields) == 4 else 1.0
+        if joint not in range(JOINT_COUNT) or joint in seen:
+            raise ValueError(f"Bad/duplicate joint index on calibration line {line_no}: {joint}")
+        if abs(direction) < 1e-6 or abs(scale) < 1e-6:
+            raise ValueError(f"Zero direction/scale on calibration line {line_no}")
+        float(fields[-1])
+        seen.add(joint)
+    if seen != set(range(JOINT_COUNT)):
+        raise ValueError(f"Calibration must contain joints 0..6; found {sorted(seen)}")
     return calibration
 
 
@@ -81,28 +100,6 @@ def as_gain_array(gain: "float | np.ndarray") -> np.ndarray:
     if values.size != JOINT_COUNT:
         raise ValueError(f"gain must be 1 scalar or {JOINT_COUNT} values; got {values.size}")
     return values
-
-    seen: set[int] = set()
-    for line_no, raw in enumerate(calibration.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split()
-        if len(fields) not in (3, 4):
-            raise ValueError(f"Bad calibration line {line_no}: {raw!r}")
-        joint = int(fields[0])
-        direction = float(fields[1])
-        scale = float(fields[2]) if len(fields) == 4 else 1.0
-        if joint not in range(JOINT_COUNT) or joint in seen:
-            raise ValueError(f"Bad/duplicate joint index on calibration line {line_no}: {joint}")
-        if abs(direction) < 1e-6 or abs(scale) < 1e-6:
-            raise ValueError(f"Zero direction/scale on calibration line {line_no}")
-        float(fields[-1])
-        seen.add(joint)
-    if seen != set(range(JOINT_COUNT)):
-        raise ValueError(f"Calibration must contain joints 0..6; found {sorted(seen)}")
-    return calibration
-
 
 @dataclass(frozen=True)
 class R1ArmSdkState:
@@ -178,6 +175,10 @@ class R1ArmSdkBus:
             *error_args,
         ]
         self._lib.r1arm_bridge_command_position_v2.restype = ctypes.c_int
+        self._lib.r1arm_bridge_command_position_v3.argtypes = [
+            void_p, float_p, float_p, float_p, float_p, float_p, *error_args,
+        ]
+        self._lib.r1arm_bridge_command_position_v3.restype = ctypes.c_int
         self._lib.r1arm_bridge_read_state.argtypes = [
             void_p,
             float_p,
@@ -229,11 +230,12 @@ class R1ArmSdkBus:
         kp: "float | np.ndarray",
         kd: "float | np.ndarray",
         tau: "np.ndarray | None" = None,
+        dq: "np.ndarray | None" = None,
     ) -> None:
         """Position command with scalar or per-joint gains (and optional tau ff).
 
-        Scalar kp/kd take the legacy broadcast ABI; arrays of 7 take the v2
-        ABI, which also forwards an optional per-joint torque feedforward.
+        Scalar kp/kd take the legacy broadcast ABI; arrays/tau use v2. Supplying
+        desired velocity selects v3 and forwards q/dq/kp/kd/tau together.
         """
         values = np.ascontiguousarray(q, dtype=np.float32).reshape(-1)
         if values.size != JOINT_COUNT or not np.all(np.isfinite(values)):
@@ -247,7 +249,7 @@ class R1ArmSdkBus:
                 raise ValueError(f"{name} must be a scalar or {JOINT_COUNT} finite values")
             return array
 
-        if np.isscalar(kp) and np.isscalar(kd) and tau is None:
+        if np.isscalar(kp) and np.isscalar(kd) and tau is None and dq is None:
             self._call(
                 self._lib.r1arm_bridge_command_position,
                 self._handle,
@@ -262,6 +264,19 @@ class R1ArmSdkBus:
         tau_array = None
         if tau is not None:
             tau_array = joint_array(tau, "tau")
+        if dq is not None:
+            dq_array = joint_array(dq, "dq")
+            self._call(
+                self._lib.r1arm_bridge_command_position_v3,
+                self._handle,
+                values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                dq_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                kp_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                kd_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                tau_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                if tau_array is not None else None,
+            )
+            return
         self._call(
             self._lib.r1arm_bridge_command_position_v2,
             self._handle,

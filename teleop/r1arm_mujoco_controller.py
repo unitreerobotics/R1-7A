@@ -28,6 +28,7 @@ class R1ArmMujocoTeleopController(R1ArmTeleopControllerBase):
         scale_factor: float | None = None,
         show_viewer: bool = True,
         sim_substeps: int = 10,
+        ik_dt: float = 0.0,
     ):
         super().__init__(
             config=config,
@@ -35,6 +36,13 @@ class R1ArmMujocoTeleopController(R1ArmTeleopControllerBase):
             debug=debug,
             scale_factor=scale_factor,
         )
+        if ik_dt > 0.0:
+            solver_dt = float(ik_dt)
+            for solver in (self.placo_solver, self.placo_solver_left):
+                if solver is not None:
+                    solver.control_rate_hz = 1.0 / solver_dt
+                    solver.solver_dt = solver_dt
+                    solver.solver.dt = solver_dt
         self.sim_substeps = max(1, int(sim_substeps))
         if self.dual_arm:
             joint_names = ARM_JOINTS + DEX1_JOINTS + LEFT_ARM_JOINTS + LEFT_DEX1_JOINTS

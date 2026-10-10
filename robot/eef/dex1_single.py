@@ -52,6 +52,13 @@ class Dex1Single:
         self._lock = threading.Lock()
         self._running = True
         self._state_received = False
+        self._state_received_monotonic = 0.0
+        self._state_received_time_ns = 0
+        self._command_sent_monotonic = 0.0
+        self._command_sent_time_ns = 0
+        self._command_count = 0
+        self._command_publish_ok: bool | None = None
+        self._command_publish_fail_count = 0
         self._q = DEX1_MAX_RANGE
         self._tau = 0.0
         self._tau_zero_samples: list[float] = []
@@ -87,6 +94,8 @@ class Dex1Single:
                     self._q = float(state.q)
                     self._tau = float(state.tau_est)
                     self._state_received = True
+                    self._state_received_monotonic = time.monotonic()
+                    self._state_received_time_ns = time.time_ns()
                     if len(self._tau_zero_samples) < 100:
                         self._tau_zero_samples.append(self._tau)
                         self._tau_zero = float(np.mean(self._tau_zero_samples))
@@ -121,8 +130,15 @@ class Dex1Single:
         target = (1.0 - ratio) * DEX1_MAX_RANGE
         target = float(np.clip(self._force_limited_target(target), 0.0, DEX1_MAX_RANGE))
         self.message.cmds[0].q = target
-        self.publisher.Write(self.message)
-        self.last_command = target
+        publish_ok = bool(self.publisher.Write(self.message))
+        with self._lock:
+            self.last_command = target
+            self._command_sent_monotonic = time.monotonic()
+            self._command_sent_time_ns = time.time_ns()
+            self._command_count += 1
+            self._command_publish_ok = publish_ok
+            if not publish_ok:
+                self._command_publish_fail_count += 1
 
     def set_gripper_ratios(self, left_ratio: float, right_ratio: float) -> None:
         ratio = left_ratio if self.side == "left" else right_ratio
@@ -132,10 +148,29 @@ class Dex1Single:
         with self._lock:
             q = self._q
             tau = self._tau
+            state_received_monotonic = self._state_received_monotonic
+            state_received_time_ns = self._state_received_time_ns
+            command_sent_monotonic = self._command_sent_monotonic
+            command_sent_time_ns = self._command_sent_time_ns
+            command_count = self._command_count
+            command_publish_ok = self._command_publish_ok
+            command_publish_fail_count = self._command_publish_fail_count
+            last_command = self.last_command
+        now = time.monotonic()
+        feedback_age = now - state_received_monotonic if state_received_monotonic else None
+        command_age = now - command_sent_monotonic if command_sent_monotonic else None
         return {
             "hand_state": [q / DEX1_MAX_RANGE],
-            "hand_cmd": [self.last_command / DEX1_MAX_RANGE],
+            "hand_cmd": [last_command / DEX1_MAX_RANGE],
             "hand_torque": [tau],
+            "feedback_age_s": feedback_age,
+            "feedback_time_ns": state_received_time_ns or None,
+            "feedback_valid": feedback_age is not None and feedback_age <= 0.5,
+            "command_age_s": command_age,
+            "command_time_ns": command_sent_time_ns or None,
+            "command_count": command_count,
+            "command_publish_ok": command_publish_ok,
+            "command_publish_fail_count": command_publish_fail_count,
         }
 
     def stop(self) -> None:

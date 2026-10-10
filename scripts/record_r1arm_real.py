@@ -67,7 +67,10 @@ from teleop.local_camera_client import (
 )
 from teleop.mcap_writer import FourCameraMcapRecorder
 from teleop.r1arm_dataset import R1ArmDatasetAdapter
-from teleop.r1arm_real_controller import R1ArmRealTeleopController
+from teleop.r1arm_real_controller import (
+    R1ArmQPConstrainedIKTeleopController,
+    R1ArmRealTeleopController,
+)
 
 
 PREVIEW_WINDOW = "R1Arm real record: head / wrist"
@@ -179,6 +182,20 @@ def _stale_camera_summary(camera: LocalCameraSubscriber, max_age: float) -> str:
     return "stale camera: " + "; ".join(parts) + " — samples are being skipped"
 
 
+_RECORD_SAMPLE_FIELDS = (
+    "control_seq", "control_time_ns", "q_purpose", "q_measured", "q_ik_raw",
+    "q_motor_target", "dq_purpose", "ddq_purpose", "dq_target",
+    "dq_measured", "tau_est",
+)
+
+
+def _record_sample_is_complete(sample: dict | None) -> bool:
+    """Ignore IK-only diagnostics until a full command/feedback sample exists."""
+    return isinstance(sample, dict) and all(
+        key in sample and sample[key] is not None for key in _RECORD_SAMPLE_FIELDS
+    )
+
+
 class R1ArmRealMcapRecord:
     """Run the real-arm hold/teleop loop and asynchronously write MCAP frames."""
 
@@ -192,6 +209,7 @@ class R1ArmRealMcapRecord:
         self.record_paused = False
         self.record_frame_count = 0
         self.record_start_monotonic = 0.0
+        self.record_start_control_seq = -1
         self.record_pause_started_monotonic = 0.0
         self.record_paused_duration = 0.0
         self.next_record_tick = 0.0
@@ -218,11 +236,23 @@ class R1ArmRealMcapRecord:
             control_side="right",
             scale_factor=args.scale_factor,
             reset_blend_frames=args.reset_blend_frames,
+            xr_filter_min_cutoff=args.xr_filter_min_cutoff,
+            xr_filter_beta=args.xr_filter_beta,
+            trajectory_position_gain=args.trajectory_position_gain,
+            trajectory_velocity_gain=args.trajectory_velocity_gain,
+            trajectory_max_speed_rad_s=(
+                args.trajectory_max_speed
+                if args.trajectory_max_speed is not None else args.max_joint_speed
+            ),
         )
         if args.urdf:
             config.urdf_path = str(Path(args.urdf).expanduser().resolve())
         self.config = config
-        self.controller = R1ArmRealTeleopController(
+        controller_cls = (
+            R1ArmQPConstrainedIKTeleopController
+            if args.qp_constrained_ik else R1ArmRealTeleopController
+        )
+        self.controller = controller_cls(
             config=config,
             port=args.port,
             baudrate=args.baud,
@@ -233,6 +263,7 @@ class R1ArmRealMcapRecord:
             dex1_interface=args.dex1_net,
             dex1_domain=args.dex1_domain,
             grip_torque_limit=args.grip_torque_limit,
+            **({"qp_jerk_limit": args.qp_jerk_limit} if args.qp_constrained_ik else {}),
             kp=args.kp,
             kd=args.kd,
             rate=args.rate,
@@ -296,7 +327,13 @@ class R1ArmRealMcapRecord:
             "eef": "dex1",
             "simulator": None,
             "motion_mode": bool(self.args.motion_mode),
-            "teleop_stack": "R1ArmRealTeleopController",
+            "teleop_stack": type(self.controller).__name__,
+            "ik_control_mode": (
+                ("placo_qp_velocity_acceleration_jerk_constraints"
+                 if self.args.qp_jerk_limit is not None else
+                 "placo_qp_velocity_acceleration_constraints")
+                if self.args.qp_constrained_ik else "shaped_ik_baseline"
+            ),
             "dual_arm": False,
             "control_side": "right",
             "urdf_path": str(self.config.urdf_path),
@@ -330,23 +367,73 @@ class R1ArmRealMcapRecord:
             # P2 整形器参数属于部署契约：整形后的 action 语义由它们定义，
             # 部署端要用同一组参数消费策略输出。
             "ik_max_acc_per_s2": float(self.controller.config.ik_max_acc_per_s2),
-            "ik_max_step_per_cycle": (
-                None if self.controller.config.ik_max_step_per_cycle is None
-                else float(self.controller.config.ik_max_step_per_cycle)
+            "ik_max_jerk_per_s3": float(self.controller.config.ik_max_jerk_per_s3),
+            "trajectory_position_gain": float(self.controller.config.trajectory_position_gain),
+            "trajectory_velocity_gain": float(self.controller.config.trajectory_velocity_gain),
+            "trajectory_max_speed_rad_s": self.controller.config.trajectory_max_speed_rad_s,
+            "xr_filter_min_cutoff": float(self.controller.config.xr_filter_min_cutoff),
+            "xr_filter_beta": float(self.controller.config.xr_filter_beta),
+            "trajectory_generator": (
+                ("Placo QP velocity+acceleration+jerk bounds; "
+                 "home/reset/release keep baseline trajectory"
+                 if self.args.qp_jerk_limit is not None else
+                 "Placo QP velocity+acceleration bounds; no active jerk limit; "
+                 "home/reset/release keep baseline trajectory")
+                if self.args.qp_constrained_ik else
+                "independent q_cmd/v_cmd/a_cmd; velocity+acceleration+jerk limited"
             ),
             "ik_qp_velocity_limit": self.controller.config.ik_qp_velocity_limit,
+            "ik_qp_acceleration_limit": self.controller.config.ik_qp_acceleration_limit,
+            "ik_qp_jerk_limit": self.controller.config.ik_qp_jerk_limit,
             # P3 字段契约（训练转换据此选字段，不必读代码）：
-            #   actions.action  = 训练主字段（ik_target 语义）：整形后的 IK
-            #                     关节目标，模型坐标系，J4 取负（URDF 符号），
+            #   actions.q_purpose = 训练主字段：整形后的 IK 关节意图；
+            #                     actions.action 是同值兼容别名。
+            #                     坐标为模型系，J4 取负（URDF 符号），
             #                     [J1..J7, gripper] 8 维；gripper 单位为 sim
             #                     值（+0.0245=开, -0.02=闭合），非 0/1。
-            #   states.joint_state = 电机实测（measured_q 语义），同坐标系。
-            #   actions.robot_q_desired / hand_cmd 等为同值冗余副本（兼容读）。
+            #   actions.q_ik_raw / q_motor_target 分别保留原始 IK 和最终电机目标。
+            #   states.joint_state = 同一 control_seq 读取的电机实测。
             #   每帧 camera_frame_times_ns = 各路图像到达时刻（对齐测量用）。
             "field_contract": {
-                "train_action": "actions.action",
+                "train_action": "actions.q_purpose",
+                "train_action_alias": "actions.action",
+                "q_purpose": (
+                    "Placo QP velocity/acceleration-constrained joint intent in model coordinates"
+                    if self.args.qp_constrained_ik else
+                    "shaped IK joint intent in model coordinates"
+                ),
+                "q_purpose_dim": 8,
+                "q_ik_raw": (
+                    "Placo IK result with velocity/acceleration constraints before SDK limiting"
+                    if self.args.qp_constrained_ik else
+                    "raw IK solution before trajectory shaping"
+                ),
+                "q_ik_raw_dim": 7,
+                "q_motor_target": "final SDK position target converted to model coordinates",
+                "q_motor_target_dim": 7,
+                "dq_purpose": "trajectory generator desired velocity, model coordinates (rad/s)",
+                "ddq_purpose": "trajectory generator acceleration, model coordinates (rad/s^2)",
+                "dq_target": "finite-difference velocity of final SDK position target, model coordinates (rad/s)",
+                "xr_raw": "raw XR controller pose [xyz,xyzw] before One-Euro filtering",
+                "xr_filtered": "filtered XR controller pose [xyz,xyzw] after jump rejection",
+                "trigger_value": "latest raw XR trigger value in [0,1]",
+                "trigger_valid": "whether this trigger sample was valid; invalid samples reuse previous input",
+                "trigger_age_s": "age of latest valid trigger sample at control output",
+                "dex1_command_open_ratio": "latest DDS gripper command ratio (1=open, 0=closed)",
+                "dex1_state_open_ratio": "latest DDS gripper feedback ratio (1=open, 0=closed)",
+                "dex1_tau_est": "latest DDS gripper estimated torque",
+                "dex1_feedback_valid": "whether DDS gripper feedback is fresh (age <= 0.5s)",
+                "dex1_feedback_age_s": "age of latest DDS gripper state sample",
+                "dex1_feedback_time_ns": "wall-clock receive time of latest DDS gripper state",
+                "dex1_command_age_s": "age of latest local DDS publish call",
+                "dex1_command_time_ns": "wall-clock time of latest local DDS publish call",
+                "dex1_command_count": "number of local DDS publish calls",
+                "dex1_publish_ok": "whether the latest local DDS writer call succeeded",
+                "dex1_publish_fail_count": "cumulative local DDS writer failures",
+                "ik_control_mode": "selected IK/control shaping mode from episode metadata",
+                "ee_intent": "target pose in robot_base; quaternion_xyzw",
                 "train_state": "states.joint_state",
-                "diagnostics": "frame.camera_frame_times_ns",
+                "diagnostics": ["control_seq", "camera_frame_times_ns", "states.dq", "states.tau_est"],
                 "frame": "model",
                 "j4_sign": "negative (URDF convention)",
                 "gripper_unit": "sim value +0.0245 open / -0.02 closed",
@@ -381,16 +468,23 @@ class R1ArmRealMcapRecord:
         with self.writer_lock:
             path = self.writer.start_episode(self._episode_metadata())
         self.active_episode_path = path
-        self.is_recording = True
+        sample = self.controller.control_sample()
+        self.record_start_control_seq = (
+            int(sample["control_seq"])
+            if isinstance(sample, dict) and sample.get("control_seq") is not None
+            else -1
+        )
         self.record_paused = False
         self.record_frame_count = 0
         self._action_samples: list[np.ndarray] = []
         self._gripper_samples: list[float] = []
+        self._action_time_samples: list[int] = []
         self._breakpoints: list[tuple[int, float]] = []  # P3: (帧数, 单调钟)
         self.record_start_monotonic = time.monotonic()
         self.record_pause_started_monotonic = 0.0
         self.record_paused_duration = 0.0
         self.next_record_tick = self.record_start_monotonic
+        self.is_recording = True
         print(f"[Record] START episode {self.writer.episode_id}: {path}")
 
     def _stop_episode(self) -> None:
@@ -411,8 +505,8 @@ class R1ArmRealMcapRecord:
         )
         if self.record_frame_count == 0:
             print(
-                "[Record] WARNING: this episode has NO frames at all — the "
-                "camera stream was dead the whole time; do not use it"
+                "[Record] WARNING: this episode has NO frames; no complete "
+                "control sample with a fresh camera frame was written"
             )
         elif fps < self.args.frequency * 0.9:
             slowest = self._slowest_camera()
@@ -522,16 +616,26 @@ class R1ArmRealMcapRecord:
         if not samples or len(samples) < 5:
             return
         q = np.asarray(samples, dtype=float)[:, :7]
-        hz = max(float(self.args.frequency), 1e-6)
+        t_ns = np.asarray(getattr(self, "_action_time_samples", []), dtype=np.int64)
+        if t_ns.size != len(q):
+            t = np.arange(len(q), dtype=float) / max(float(self.args.frequency), 1e-6)
+        else:
+            t = (t_ns - t_ns[0]).astype(float) * 1e-9
+        dt = np.maximum(np.diff(t), 1e-6)
         names = ARM_JOINTS
-        v = np.abs(np.diff(q, axis=0)) * hz
-        a = np.abs(np.diff(v, axis=0)) * hz
-        print(f"[Record] action smoothness (q→v→a, {len(q)} samples @ {hz:.0f} Hz):")
-        print(f"  {'joint':<6}{'|v|p95':>9}{'|a|p95':>10}{'|a|max':>9}")
+        v = np.diff(q, axis=0) / dt[:, None]
+        dt_mid = np.maximum((dt[1:] + dt[:-1]) * 0.5, 1e-6)
+        a = np.diff(v, axis=0) / dt_mid[:, None]
+        dt_jerk = np.maximum((dt_mid[1:] + dt_mid[:-1]) * 0.5, 1e-6)
+        jerk = np.diff(a, axis=0) / dt_jerk[:, None] if len(a) > 1 else np.zeros((0, 7))
+        print(f"[Record] action smoothness (signed q→v→a→jerk, {len(q)} timestamped samples):")
+        print(f"  {'joint':<6}{'|v|p95':>9}{'|a|p95':>10}{'|a|max':>9}{'|j|p95':>10}")
         for j in range(min(7, q.shape[1])):
-            print(f"  {names[j]:<6}{np.percentile(v[:, j], 95):>9.3f}"
-                  f"{np.percentile(a[:, j], 95):>10.2f}{a[:, j].max():>9.2f}")
-        worst = float(np.percentile(a, 95))
+            jp95 = np.percentile(np.abs(jerk[:, j]), 95) if len(jerk) else 0.0
+            print(f"  {names[j]:<6}{np.percentile(np.abs(v[:, j]), 95):>9.3f}"
+                  f"{np.percentile(np.abs(a[:, j]), 95):>10.2f}"
+                  f"{np.max(np.abs(a[:, j])):>9.2f}{jp95:>10.1f}")
+        worst = float(np.percentile(np.abs(a), 95))
         if worst > 25.0:
             print(
                 f"[Record] WARNING: action acceleration p95 = {worst:.1f} rad/s² "
@@ -612,13 +716,9 @@ class R1ArmRealMcapRecord:
                 print(f"[Record] Dex1 feedback fallback to command: {exc}")
             return desired, desired
 
-    def _state_action(self) -> tuple[dict, dict]:
-        commanded_arm = self.controller.arm_q("right").copy()
-        state = self.controller.last_state
-        if self.args.motion_mode and state is not None:
-            measured_arm = sdk_to_model_q(np.asarray(state.q, dtype=float).copy())
-        else:
-            measured_arm = commanded_arm.copy()
+    def _state_action(self, sample: dict) -> tuple[dict, dict]:
+        commanded_arm = np.asarray(sample["q_purpose"], dtype=float).copy()
+        measured_arm = np.asarray(sample["q_measured"], dtype=float).copy()
         measured_gripper, commanded_gripper = self._gripper_state_command()
         measured_sim_q = np.hstack(
             [measured_arm, measured_gripper, measured_gripper]
@@ -631,10 +731,42 @@ class R1ArmRealMcapRecord:
         # 第 8 维（夹爪）单独收：常数夹爪是无信息维度，保存时点名。
         self._action_samples.append(commanded_arm)
         self._gripper_samples.append(commanded_sim_q[7])
-        return self.adapter.frame_data(measured_sim_q, commanded_sim_q)
+        self._action_time_samples.append(int(sample["control_time_ns"]))
+        states, actions = self.adapter.frame_data(measured_sim_q, commanded_sim_q)
+        actions["q_purpose"] = actions["action"]
+        actions["q_ik_raw"] = np.asarray(sample["q_ik_raw"], dtype=float).tolist()
+        actions["q_motor_target"] = np.asarray(sample["q_motor_target"], dtype=float).tolist()
+        actions["dq_purpose"] = np.asarray(sample["dq_purpose"], dtype=float).tolist()
+        actions["ddq_purpose"] = np.asarray(sample["ddq_purpose"], dtype=float).tolist()
+        actions["dq_target"] = np.asarray(sample["dq_target"], dtype=float).tolist()
+        actions["xr_raw"] = None if sample.get("xr_raw") is None else np.asarray(sample["xr_raw"], dtype=float).tolist()
+        actions["xr_filtered"] = None if sample.get("xr_filtered") is None else np.asarray(sample["xr_filtered"], dtype=float).tolist()
+        for key in (
+            "trigger_value", "trigger_valid", "trigger_age_s",
+            "dex1_command_open_ratio", "dex1_state_open_ratio", "dex1_tau_est",
+            "dex1_feedback_valid", "dex1_feedback_age_s", "dex1_feedback_time_ns",
+            "dex1_command_age_s", "dex1_command_time_ns", "dex1_command_count",
+            "dex1_publish_ok", "dex1_publish_fail_count",
+        ):
+            actions[key] = sample.get(key)
+        ee = sample.get("ee_intent", {})
+        actions["ee_intent"] = {
+            "position": (None if ee.get("position") is None else np.asarray(ee["position"]).tolist()),
+            "quaternion_xyzw": (None if ee.get("quaternion_xyzw") is None
+                                else np.asarray(ee["quaternion_xyzw"]).tolist()),
+            "frame": ee.get("frame", "robot_base"),
+        }
+        actions["ik_solver"] = sample.get("ik_solver", "unknown")
+        states["dq"] = np.asarray(sample["dq_measured"], dtype=float).tolist()
+        states["tau_est"] = np.asarray(sample["tau_est"], dtype=float).tolist()
+        states["feedback_time_ns"] = int(sample.get("feedback_time_ns", sample["control_time_ns"]))
+        states["control_seq"] = int(sample["control_seq"])
+        actions["control_seq"] = int(sample["control_seq"])
+        return states, actions
 
     def _record_loop(self) -> None:
         interval = 1.0 / max(float(self.args.frequency), 1.0)
+        last_control_seq = -1
         while not self.record_stop_event.is_set():
             now = time.monotonic()
             if not self.is_recording or self.record_paused:
@@ -646,6 +778,16 @@ class R1ArmRealMcapRecord:
             while self.next_record_tick <= now:
                 self.next_record_tick += interval
 
+            sample = self.controller.control_sample()
+            if not _record_sample_is_complete(sample):
+                continue
+            control_seq = int(sample["control_seq"])
+            if (
+                control_seq <= self.record_start_control_seq
+                or control_seq == last_control_seq
+            ):
+                continue
+
             frames, frame_id, received_at_ns, _ = self._camera_snapshot()
             if frames is None or not self._camera_is_fresh(received_at_ns):
                 if now - self.last_stale_warning >= 1.0:
@@ -653,7 +795,7 @@ class R1ArmRealMcapRecord:
                     self.last_stale_warning = now
                 continue
             try:
-                states, actions = self._state_action()
+                states, actions = self._state_action(sample)
                 # P3 对齐：每路相机的帧到达时刻与样本时刻一起落盘，
                 # 图像-action 偏移从"假设"变为可测量（质检统计用）。
                 cam_times = self.camera.frame_times() if self.camera is not None else {}
@@ -664,10 +806,12 @@ class R1ArmRealMcapRecord:
                             states,
                             actions,
                             image_source_frame_id=frame_id,
-                            sample_time_ns=time.time_ns(),
+                            sample_time_ns=int(sample["control_time_ns"]),
                             camera_frame_times_ns=cam_times,
+                            control_seq=int(sample["control_seq"]),
                         )
                         self.record_frame_count += 1
+                        last_control_seq = control_seq
             except BaseException as exc:
                 self.record_error = exc
                 self.running = False
@@ -864,14 +1008,19 @@ class R1ArmRealMcapRecord:
             self._start_preview_thread()
 
             control_dt = 1.0 / max(float(self.args.rate), 1.0)
+            previous_tick = time.monotonic()
             while self.running:
                 tick = time.monotonic()
+                actual_control_dt = tick - previous_tick
+                previous_tick = tick
                 self._handle_buttons()
                 if (
                     (self.teleop_active and not self.record_paused)
                     or self.controller._reset_blending
                 ):
-                    self.controller.step(control_dt)
+                    self.controller.step(
+                        actual_control_dt if 0.001 <= actual_control_dt <= 0.1 else control_dt
+                    )
                 else:
                     # In real mode this keeps polling feedback and refreshing
                     # the position hold, including while collection is paused.
@@ -929,6 +1078,10 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
     print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
           f"gravity_ff={'on' if args.gravity_ff else 'off'}")
     print(f"  max speed:    {args.max_joint_speed} rad/s")
+    if not args.qp_constrained_ik:
+        print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
+              f"kd={args.trajectory_velocity_gain:g} s^-1; "
+              f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
     # FOC 三项合计（kp·lead + kd·|dq| + tau_clip）的保守上界 vs 电机峰值
     kp_arr = as_gain_array(args.kp)
     kd_arr = as_gain_array(args.kd)
@@ -938,6 +1091,12 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
     print(f"  max lead:     {args.max_command_lead} rad → 力矩上界 {torque_cap:.1f} Nm"
           f"（三项合计；电机峰值 34.4 Nm 的 {torque_cap / 34.4 * 100:.0f}%）")
     print("  controller:   right PICO controller")
+    if args.qp_constrained_ik:
+        if args.qp_jerk_limit is None:
+            print("  IK mode:      Placo QP velocity + acceleration bounds; jerk disabled")
+        else:
+            print("  IK mode:      Placo QP velocity + acceleration + "
+                  f"jerk ≤{args.qp_jerk_limit:g} rad/s³")
     print("Keep the emergency stop reachable and support the arm during startup probing.")
     if input("Type MOVE to continue: ").strip() != "MOVE":
         raise SystemExit("Cancelled; no real motor command was sent")
@@ -958,6 +1117,20 @@ def build_parser() -> argparse.ArgumentParser:
     teleop.add_argument("--scale-factor", type=float, default=1.0)
     teleop.add_argument("--rate", type=float, default=30.0,
                         help="控制环 Hz。默认 30（全链 30Hz 统一：每拍一条 action 一条 state）")
+    teleop.add_argument("--xr-filter-min-cutoff", type=float, default=2.0)
+    teleop.add_argument("--xr-filter-beta", type=float, default=0.15)
+    teleop.add_argument("--trajectory-position-gain", type=float, default=16.0,
+                        help="Baseline q_purpose position-error response (s^-2)")
+    teleop.add_argument("--trajectory-velocity-gain", type=float, default=8.0,
+                        help="Baseline q_purpose velocity damping (s^-1)")
+    teleop.add_argument(
+        "--trajectory-max-speed", type=float, default=None,
+        help="q_purpose shaper speed limit (rad/s; defaults to --max-joint-speed)",
+    )
+    teleop.add_argument("--qp-constrained-ik", action="store_true",
+                        help="Embed active IK velocity/acceleration limits in Placo QP")
+    teleop.add_argument("--qp-jerk-limit", type=float, default=None,
+                        help="Optional active IK jerk bound in Placo QP (rad/s^3; e.g. 80)")
     teleop.add_argument(
         "--ik-dt", type=float, default=0.0,
         help="IK 积分步长 s；0 = 跟随 1/--rate（对齐）",
@@ -965,7 +1138,7 @@ def build_parser() -> argparse.ArgumentParser:
     teleop.add_argument(
         "--gravity-ff", dest="gravity_ff", action="store_true", default=True,
         help="下发重力前馈力矩（指令姿态处计算，经 v2 tau 通道）；"
-             "默认开（P0 三重实测：J4 悬垂误差 −70%）。--no-gravity-ff 关闭",
+             "默认开（P0 三重实测：J4 悬垂误差 −70%%）。--no-gravity-ff 关闭",
     )
     teleop.add_argument(
         "--no-gravity-ff", dest="gravity_ff", action="store_false",
@@ -979,7 +1152,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="位置环增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
     teleop.add_argument("--kd", type=parse_gain, default=2,
                         help="阻尼增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
-    teleop.add_argument("--max-joint-speed", type=float, default=1.0)
+    teleop.add_argument("--max-joint-speed", type=float, default=1.0,
+                        help="SDK command speed limit (rad/s; default 1.0)")
     teleop.add_argument(
         "--max-command-lead", type=float, default=0.15,
         help="命令相对实测的最大超前量 rad（默认 0.15）：异常单拍位移 ≤8.6°，"
@@ -1092,6 +1266,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.motion_mode and args.mock_xr:
         parser.error("--mock-xr cannot be combined with --motion-mode")
+    if args.qp_jerk_limit is not None and args.qp_jerk_limit <= 0.0:
+        parser.error("--qp-jerk-limit must be positive")
+    if args.trajectory_position_gain <= 0.0 or args.trajectory_velocity_gain <= 0.0:
+        parser.error("trajectory follower gains must be positive")
+    if args.max_joint_speed <= 0.0:
+        parser.error("--max-joint-speed must be positive")
+    if args.trajectory_max_speed is not None and args.trajectory_max_speed <= 0.0:
+        parser.error("--trajectory-max-speed must be positive")
+    if args.qp_jerk_limit is not None and not args.qp_constrained_ik:
+        parser.error("--qp-jerk-limit requires --qp-constrained-ik")
     if args.rate <= 0 or args.frequency <= 0:
         parser.error("--rate and --frequency must be positive")
     if args.no_cameras and args.camera:

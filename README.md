@@ -15,6 +15,164 @@
 
 ---
 
+## 0. 真机三步走：遥操 / 录制 / 回放（复制即用）
+
+> **前置**：终端已 `conda activate r1_teleop`；机械臂上电、串口 `/dev/ttyUSB2` 在线；
+
+
+
+> Dex1 服务已启动（另开终端：`source scripts/real_env.sh && ./scripts/start_dex1_local.sh`，需 sudo）。
+> 每条命令都会在 `Type MOVE to continue:` 处等你输入 `MOVE` 才真的运动。
+
+cd /home/ycb410/nt/r1arm_teleop
+conda activate r1_teleop
+
+
+终端 A（Dex1 夹爪服务，需要 sudo，保持运行）：
+
+    source /home/ycb410/nt/r1arm_teleop/scripts/real_env.sh
+   ./scripts/start_dex1_local.sh
+
+### 0.1 遥操（手感基线）
+
+#### 当前手感测试基线
+
+当前恢复到本轮 XR 滤波调参前使用的 cutoff=2.0、beta=0.15；轨迹器 position/velocity gain 保持 16/8。此次只恢复 XR 滤波基线，其他速度、整形器及电机参数不变：
+
+```bash
+python scripts/teleop_r1arm_real.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --rate 30 \
+  --xr-filter-min-cutoff 2.0 --xr-filter-beta 0.15 \
+  --trajectory-position-gain 16 --trajectory-velocity-gain 8 \
+  --kp 80 --kd 2 --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start --enable-a-reset
+```
+
+启动真机前托住机械臂并确认急停可触及。若想判断增益效果，先固定 XR 参数，只改 position/velocity gain；若想判断滤波效果，则固定整形器和电机参数，只改 cutoff/beta。
+
+```bash
+python scripts/teleop_r1arm_real.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start \
+  --enable-a-reset
+```
+teleop_r1arm_real_qp_jerk.py
+| 参数 | 作用 |
+|------|------|
+| `--enable-dex1 --dex1-net enp4s0` | 夹爪 DDS 通道（不传则不控夹爪） |
+| `--home-on-start` | 启动 FOC 后软 blend 回 `ARM_INIT`（约 1.2 s） |
+| `--enable-a-reset` | 允许 **A 键**随时软回 home |
+
+**PICO 操作**：握 **grip** 开始跟踪 · 扣 **trigger** 闭合夹爪 · **A** 软回 home · `Ctrl+C` 停止。
+
+实验对照版（只绕过 active IK 后的 q/v/a 整形；Placo/DLS 内按 1 rad/s 限速，SDK 限幅仍保留。home/reset 与松 grip 刹停仍走安全轨迹；不做加速度/jerk 限制）：
+
+```bash
+python scripts/teleop_r1arm_real_unshaped.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --rate 30 \
+  --xr-filter-min-cutoff 2.0 --xr-filter-beta 0.15 \
+  --kp 80 --kd 2 --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start --enable-a-reset
+```
+
+这是用于 A/B 手感验证的实验入口，不保证与整形版同样平滑；先托住机械臂并短时低幅度测试。
+
+QP 约束对照版（主动跟踪时在 Placo QP 内约束速度 ≤1 rad/s、加速度 ≤6 rad/s²；不加 jerk，作为对照）：
+
+```bash
+python scripts/teleop_r1arm_real_qp.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --rate 30 \
+  --xr-filter-min-cutoff 2.0 --xr-filter-beta 0.15 \
+  --kp 80 --kd 2 --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start --enable-a-reset
+```
+
+录制同一实验版本时，用 `scripts/record_r1arm_real_qp.py` 替换 `record_r1arm_real.py`；episode metadata 会标记 `ik_control_mode`，并继续记录 `q_purpose`、`q_motor_target`、速度/加速度及实测 state。
+
+同一组参数下启用 jerk 约束（初始值 80 rad/s³），XR 滤波和其它参数保持不变。与上面的无 jerk 入口做 A/B；reset/home 和松 grip 刹停仍沿用基线轨迹。录制时用对应的 `record_r1arm_real_qp_jerk.py`，metadata 会标记 jerk 上限：
+
+```bash
+python scripts/teleop_r1arm_real_qp_jerk.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --rate 30 \
+  --xr-filter-min-cutoff 2.0 --xr-filter-beta 0.15 \
+  --kp 80 --kd 2 --max-joint-speed 1.0 --max-command-lead 0.15 \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start --enable-a-reset
+```
+
+### 0.2 录制（产出 MCAP 数据集）
+
+```bash
+python scripts/record_r1arm_real.py \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --enable-dex1 --dex1-net enp4s0 \
+  --home-on-start \
+  --enable-a-reset \
+  --task-description "pick and place demo" \
+  --task-dir /home/ycb410/nt/r1arm_teleop/dataset/try
+```
+
+**PICO 操作**：**X** 开始/停止并保存 episode · **B** 暂停/恢复（录制与 XR 跟踪一起停）· **A** 回 home（归位动作也录进 episode）。
+
+保存后终端打印**质检表**：action 平滑度（逐关节 a_p95）、夹爪通道是否有变化、相机是否丢失/冻结、实际 fps、暂停断点位置、图像对齐偏移。
+
+### 0.3 回放（同一条 episode 重演到真机）
+
+```bash
+python scripts/replay_r1arm_real.py \
+  --episode /home/ycb410/nt/r1arm_teleop/dataset/2026_10_09_robot_r1arm_right_dex1/episode_0011.mcap \
+  --section action \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --enable-dex1 --dex1-net enp4s0
+```
+
+| 参数 | 作用 |
+|------|------|
+| `--section action` | 默认重放已整形的 `actions.q_purpose`，不再经过回放轨迹整形器；SDK 安全限幅仍生效。`--section state` 重放实测位姿 |
+| `--episode` 给目录 | 自动取该目录下最新的 episode |
+
+重力前馈和 action 回放的 SDK 限速上限从 episode 元数据继承；回放不再对 `q_purpose` 做第二轮 v/a 整形。流程：接近段（当前姿态 → 第一帧，限速 1 rad/s）→ 按录制节奏播放 → 收敛到末帧 → 保持 2 s → 停机。每轮真机回放会在 episode 旁生成唯一 CSV，记录 q_purpose、最终安全命令、dq_target、实测 q/dq/力矩和跟踪误差；可用 `--telemetry-csv` 指定路径。
+
+### 已生效的默认值（无需再传）
+
+| 默认 | 值 | 说明 |
+|------|-----|------|
+| `--rate` | 30 Hz | XR 帧时钟 / IK / 执行 / 录制**全链同拍** |
+| `--frequency` | 30 Hz | 录制采样率 |
+| `--kp` `--kd` | 80 / 2 | 可逐关节：`--kp 80,80,80,60,80,80,80` |
+| `--gravity-ff` | **开** | 重力前馈（`--no-gravity-ff` 关闭） |
+| `--max-joint-speed` | 1.0 rad/s | 命令限速 |
+| `--max-command-lead` | 0.15 rad | 力矩三项合上界 22 Nm = 电机峰值 64 % |
+| `--trajectory-position-gain` / `--trajectory-velocity-gain` | 16 / 8 | `q_purpose` 轨迹器响应与阻尼 |
+| `--xr-filter-min-cutoff` / `--xr-filter-beta` | 2 / 0.15 | XR One-Euro 滤波；高速动作会自适应提高 cutoff |
+| `--reset-blend-frames` | 60 | A/home 归位时长 ≈ 1.2 s |
+| `--preview-hz` | 12 | 预览渲染（独立线程，不占控制环） |
+| 相机 | 头 SN0002 + 腕 D405 | 各 640×480@30；`--no-image-show` 关预览 |
+
+---
+
 ## 1. 一图看懂：我要做什么 → 跑哪个脚本
 
 | 想做什么 | 平台 | 入口 |
@@ -30,6 +188,7 @@
 | 真机数据采集（四相机 MCAP） | R1-A7 | `scripts/record_real.py --motion-mode ...` |
 | 查本机相机节点 / 测哪路能出图 | R1Arm | `scripts/probe_r1arm_cameras.py` |
 | 仿真回放 | R1Arm | `scripts/replay_r1arm_sim.py --episode <...>.mcap` |
+| 真机回放 | R1Arm | `scripts/replay_r1arm_real.py --episode <...>.mcap --section action --motion-mode ...` |
 | MCAP 回放 / 真机回放 | R1-A7 | `scripts/replay_mcap.py --episode <...>.mcap` |
 | 编译 SDK 桥接库 | R1Arm | `scripts/build_r1arm_sdk_bridge.py` |
 | 送真机到指定姿态（带预检） | R1Arm | `scripts/goto_r1arm_pose.py --move` |
@@ -74,9 +233,19 @@ r1arm_teleop/
 │   └── utils/                    # 几何 / mock 工具
 ├── scripts/                      # 可执行入口（见 §1 表格）
 │   ├── teleop_r1arm_sim.py       # R1Arm MuJoCo 仿真遥操
-│   ├── teleop_r1arm_real.py      # R1Arm 真机遥操
+│   ├── teleop_r1arm_real.py  python scripts/replay_r1arm_real.py \
+  --episode /home/ycb410/nt/r1arm_teleop/dataset/2026_10_09_robot_r1arm_right_dex1/episode_0011.mcap \
+  --section action \
+  --motion-mode \
+  --port /dev/ttyUSB2 \
+  --calib /home/ycb410/nt/R1_arm_SDK_x86/r1_arm/config/joint_calib_candidate.txt \
+  --enable-dex1 --dex1-net enp4s0    # R1Arm 真机遥操
 │   ├── record_r1arm_sim.py       # R1Arm 仿真 MCAP 采集
 │   ├── record_r1arm_real.py      # R1Arm 真机 MCAP 采集（本机双相机）
+│   ├── record_r1arm_real_qp.py        # Placo QP 速度/加速度对照录制
+│   ├── teleop_r1arm_real_qp.py        # Placo QP 速度/加速度对照遥操
+│   ├── record_r1arm_real_qp_jerk.py  # Placo QP 加 jerk 约束录制
+│   ├── teleop_r1arm_real_qp_jerk.py  # Placo QP 加 jerk 约束遥操
 │   ├── replay_r1arm_sim.py       # R1Arm MCAP 回放（仿真/真机通用）
 │   ├── probe_r1arm_cameras.py    # 本机相机节点探测
 │   ├── build_r1arm_sdk_bridge.py # 编译 R1Arm SDK C++ 桥接库
@@ -323,18 +492,18 @@ python scripts/teleop_r1arm_real.py --motion-mode --port "$PORT"
 4. 在实测启动姿态进入 FOC 位置保持。
 5. 按住对应手柄 grip 后才建立末端相对跟踪。
 
-IK 输出的两重平滑（影响录制 action 的质量）：
+IK 连续性处理（影响录制 action 的质量）：
 
 - **锚定时刷新姿态正则化参考**：Placo 的关节正则化任务参考若停留在
   启动悬垂位姿，grip 激活的第一帧求解会被它拖出一个单帧大跳（12+ rad/s
   的 IK 瞬态，遥操限速会滤掉、但会原样落进录制的 action）。现在每次锚定
   （握下 grip）时把参考刷成当前 q。
-- **IK 输出限幅**（`ik_max_step_per_cycle`，默认 0.02 rad ≈ 1 rad/s @50 Hz）：
-  求解器因任何原因（参考跳变、目标重捕获、DLS 回退）产生的单帧大步会被
-  裁到该值，保证录进 action 的轨迹始终物理可执行；触发时打印
-  `[IK] clamped solver jump (...)`。设 `None` 可关闭（不建议）。
+- **独立 q/v/a 轨迹状态机**：`trajectory_max_speed_rad_s` 速度上限和
+  `ik_max_acc_per_s2` 加速度上限统一作用于 Placo/DLS 的原始解；release、
+  regrip、home/reset 都复用当前状态，不重置速度。SDK lead/slew 限幅只是
+  最后的安全兜底，录制同时区分 `q_purpose` 与 `q_motor_target`。
 
-正常运行时：**按住 grip** 控制末端相对移动，**松开 grip** 保持最后目标；`Ctrl+C`
+正常运行时：**按住 grip** 控制末端相对移动；松开 grip 后轨迹状态机按当前速度连续减速至零，再保持停止姿态；`Ctrl+C`
 持续发 0.5 s mode 0 后关串口（机械臂失去位置保持，需托住）。A 键回 home 默认关闭。
 
 **启用单侧 Dex1**（机械臂仍走串口，Dex1 走 DDS）：
@@ -574,7 +743,8 @@ python scripts/replay_r1arm_sim.py --episode /home/ycb410/nt/dataset/p2_validati
 # 同时显示已存观测图像
 python scripts/replay_r1arm_sim.py --episode /home/ycb410/nt/dataset/p2_validation/2026_10_08_robot_r1arm_right_dex1/episode_0000.mcap \
   --mode action --show-observations
-
+python scripts/replay_r1arm_sim.py --episode /home/ycb410/nt/r1arm_teleop/dataset/2026_10_09_robot_r1arm_right_dex1/episode_0011.mcap \
+  --mode action --show-observations
 # 无窗口快速校验格式与动力学回放
 MUJOCO_GL=egl python scripts/replay_r1arm_sim.py \
   --episode <path>/episode_0000.mcap --no-viewer --speed 20
@@ -610,10 +780,10 @@ python scripts/replay_r1arm_real.py \
 state`** 默认按录制峰值速度 ×1.2 自适应并封顶在 `--auto-speed-cap`（默认
 5 rad/s）；**`--section action`** 默认直接采用**录制时遥操底层同款限速**
 （episode meta 里的 `teleop_max_joint_speed`）——因为录制的 action 是 IK
-原始目标，含跟踪激活瞬间的单帧大跳变（10+ rad/s），遥操时这些跳变被底层
-限速滤掉、机械臂从未物理执行过，回放若按峰值速度执行就会复现出录制时
-不存在的过冲，甚至引发瞬态欠压故障（0x8）。旧 episode 没有该元数据时回
-退到峰值封顶逻辑。`--max-joint-speed` 均可手动覆盖，低于峰值会警告。
+整形后的 `q_purpose`，因此不应再串第二个轨迹整形器。SDK slew、lead 和关节
+硬限位仍作为最终安全兜底；若触发，CSV 会显示 `q_purpose` 与最终电机目标的
+差异。旧 episode 没有速度元数据时回退到峰值封顶逻辑。`--max-joint-speed`
+均可手动覆盖，低于峰值会警告。
 **逼近段（悬垂→起始、末端收敛、循环重置）固定用保守的
 `--approach-speed`（默认 1 rad/s）**，不继承回放 slew 上限，避免多关节同
 时起动的电流冲击。播完先向**最后一条录制状态收敛**再保持（末端位姿与录
@@ -627,7 +797,9 @@ state`** 默认按录制峰值速度 ×1.2 自适应并封顶在 `--auto-speed-c
 后按录制的 `joint_state` 第 8 维回放闭合程度。`--section action` 回放录制
 的 action（遥操下发指令，无重力下垂分量）而不是 state——录制时 kp=80 顶
 不住重力、实测会比指令低约 0.05 rad，直接回 state 会把下垂量二次叠加
-（末端碰桌就是这么来的），回 action 则复现指令高度。
+（末端碰桌就是这么来的），回 action 则复现指令高度。action 默认选取
+`q_purpose`；每轮真机回放自动保存遥测 CSV，包含原始 action、SDK 安全层最终
+命令、期望速度和实测关节位置/速度/力矩，方便多组增益对比。
 
 R1-A7 MCAP 回放：
 
