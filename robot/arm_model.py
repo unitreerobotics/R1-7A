@@ -1,4 +1,4 @@
-"""Pinocchio model helpers and joint utilities for R1-A7."""
+"""Pinocchio model helpers and joint utilities for R1Arm."""
 
 from __future__ import annotations
 

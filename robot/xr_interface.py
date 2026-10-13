@@ -1,4 +1,4 @@
-"""XRoboToolkit/PICO XR interface for R1-A7 teleoperation.
+"""XRoboToolkit/PICO XR interface for R1Arm teleoperation.
 
 Uses ``teleop.xr_client.XrClient`` — a thin wrapper over the native
 ``xrobotoolkit_sdk`` pybind module.  Zero dependency on xrobotoolkit_teleop.
@@ -77,32 +77,3 @@ def button_edge(xr_client, name: str, last: dict[str, bool]) -> bool:
 def update_button_states(xr_client, names: list[str], last: dict[str, bool]) -> dict[str, bool]:
     """Update button states and return which ones just pressed."""
     return {name: button_edge(xr_client, name, last) for name in names}
-
-
-def read_upper_body_poses(xr_client) -> np.ndarray | None:
-    """Read PICO body tracking data."""
-    from robot.config import BODY, REQUIRED_UPPER_BODY
-    from teleop.retargeting import pose_is_valid
-
-    body = xr_client.get_body_tracking_data()
-    if body is None:
-        return None
-    poses = np.asarray(body["poses"], dtype=float)
-    if poses.ndim != 2 or poses.shape[1] < 7:
-        return None
-    max_required_index = max(BODY[name] for name in REQUIRED_UPPER_BODY)
-    if poses.shape[0] <= max_required_index:
-        return None
-    for name in REQUIRED_UPPER_BODY:
-        if not pose_is_valid(poses, name):
-            return None
-
-    poses = poses.copy()
-    if not pose_is_valid(poses, "head") and BODY["head"] < poses.shape[0]:
-        poses[BODY["head"]] = poses[BODY["neck"]]
-    for side in ["left", "right"]:
-        hand_key = f"{side}_hand"
-        wrist_key = f"{side}_wrist"
-        if BODY[hand_key] < poses.shape[0] and not pose_is_valid(poses, hand_key):
-            poses[BODY[hand_key]] = poses[BODY[wrist_key]]
-    return poses

@@ -1,4 +1,4 @@
-"""Damped least-squares IK solver for R1-A7 arms."""
+"""Damped least-squares fallback IK solver for R1Arm."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 import pinocchio as pin
 
 from robot.arm_model import clamp_configuration
-from robot.config import ARM_SAFE_LIMITS
+from robot.r1arm_config import ARM_SAFE_LIMITS
 
 
 def solve_upper_arm_ik(

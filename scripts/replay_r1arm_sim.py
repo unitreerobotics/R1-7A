@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay an R1-A7-compatible MCAP episode in R1Arm MuJoCo."""
+"""Replay an R1Arm MCAP episode in MuJoCo."""
 
 from __future__ import annotations
 

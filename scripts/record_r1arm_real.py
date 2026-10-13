@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Record one real right R1Arm (7 joints + optional Dex1) to compact MCAP.
 
-The MCAP topics and frame dictionaries remain compatible with the existing
-R1-A7/R1Arm recorder.  Only the controlled vector is compacted to the real
-right arm: J1..J7 plus one logical Dex1 position (8 values total).
+The MCAP topics and frame dictionaries retain the established episode schema.
+The controlled vector is compacted to the real right arm: J1..J7 plus one
+logical Dex1 position (8 values total).
 
-Cameras are read from the devices wired to this workstation instead of the
-R1-A7 ZMQ image server.  ``--camera`` selects them; the defaults are the UVC
-scene camera and the Intel RealSense D405 mounted on the arm.  Frames are
-stored under the R1-A7 ``color_*`` keys so episodes stay readable by
-``scripts/replay_r1arm_sim.py``.
+Cameras are read from the devices wired to this workstation. ``--camera``
+selects them; defaults are the UVC scene camera and the Intel RealSense D405 on
+the arm. Frames use stable ``color_*`` keys readable by the sim replay tool.
 
 A camera that never delivers a frame is dropped *before* the episode opens and
 recorded in the metadata, because one sample must carry one image per camera.
@@ -31,8 +29,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
-import os
 import signal
 import sys
 import threading
@@ -227,7 +225,10 @@ class R1ArmRealMcapRecord:
         self.record_start_monotonic = 0.0
         self.record_start_control_seq = -1
         self.record_segment = 0
-        self.high_rate_diagnostics = {"written": 0, "seq_gaps": 0, "last_seq": None, "period_ms": []}
+        self.high_rate_diagnostics = {
+            "written": 0, "seq_gaps": 0, "last_seq": None,
+            "period_ms": [], "capture_buffer_peak": 0,
+        }
         self.record_pause_started_monotonic = 0.0
         self.record_paused_duration = 0.0
         self.record_rate_diagnostics: dict = {}
@@ -240,6 +241,7 @@ class R1ArmRealMcapRecord:
         self.record_stop_event = threading.Event()
         self.record_thread: threading.Thread | None = None
         self.record_error: BaseException | None = None
+        self.record_generation = 0
         self.preview_created = False
         self.preview_broken = False
         self._preview_last_render = 0.0
@@ -326,20 +328,23 @@ class R1ArmRealMcapRecord:
 
     def _camera_snapshot(
         self,
-    ) -> tuple[tuple[np.ndarray, ...] | None, int, int, tuple[str, ...]]:
+    ) -> dict:
         if self.camera is None:
             # Empty tuple = "no cameras" (valid, state-only recording);
             # None means "cameras exist but no coherent frame yet".
-            return (), -1, 0, ()
-        return self.camera.get()
+            return {"frames": (), "frame_ids": {}, "received_at_ns": {},
+                    "received_monotonic_ns": {}, "device_timestamp_ms": {},
+                    "source_streams": ()}
+        return self.camera.get_atomic_snapshot()
 
     def _camera_is_fresh(self, received_at_ns: int) -> bool:
         if self.camera is None or self.args.max_image_age <= 0:
             return True
         return (time.time_ns() - received_at_ns) / 1e9 <= self.args.max_image_age
 
-    def _episode_metadata(self) -> dict:
-        _, _, _, source_streams = self._camera_snapshot()
+    def _episode_metadata(self, start_sample: dict | None = None) -> dict:
+        snapshot = self._camera_snapshot()
+        source_streams = snapshot["source_streams"]
         inactive = list(self.camera.inactive) if self.camera is not None else []
         return {
             "robot": "R1Arm",
@@ -362,6 +367,35 @@ class R1ArmRealMcapRecord:
             "camera_source_streams": list(source_streams),
             "camera_inactive": [key for key, _ in inactive],
             "camera_devices": self.camera.describe() if self.camera is not None else "",
+            "record_contract_version": 2,
+            "task_goal": self.args.task_goal or None,
+            "experiment_description": self.args.task_description,
+            "task_outcome": self.args.task_outcome,
+            "operator_notes": self.args.operator_notes,
+            "feedback_semantics": "SDK latest cached per-axis state; read bracket timestamps are host read times, not per-axis receive times",
+            "camera_timestamp_semantics": "host receive/decode time; device timestamp retained separately when exposed; neither is asserted to be exposure time",
+            "xr_timestamp_semantics": "XR server frame stamp plus host monotonic receive time; server clock mapping is not assumed",
+            "calibration_path": str(self.controller.calibration_path) if hasattr(self.controller, "calibration_path") else str(self.args.calib),
+            "calibration_sha256": hashlib.sha256(
+                Path(self.controller.calibration_path).read_bytes()
+            ).hexdigest() if hasattr(self.controller, "calibration_path") else None,
+            "urdf_sha256": hashlib.sha256(Path(self.config.urdf_path).read_bytes()).hexdigest(),
+            "bridge_library_path": str(Path(self.args.bridge_lib).expanduser().resolve()),
+            "bridge_library_sha256": (
+                hashlib.sha256(Path(self.args.bridge_lib).expanduser().resolve().read_bytes()).hexdigest()
+                if Path(self.args.bridge_lib).expanduser().is_file() else None
+            ),
+            "record_start_context": ({
+                key: (np.asarray(start_sample[key]).tolist()
+                      if isinstance(start_sample.get(key), np.ndarray) else start_sample.get(key))
+                for key in (
+                    "control_seq", "control_time_ns", "q_purpose", "dq_purpose",
+                    "ddq_purpose", "q_motor_target", "dq_target", "q_measured",
+                    "dq_measured", "tau_est", "feedback_time_ns", "feedback_ready",
+                    "motor_mode", "motor_error_code", "dex1_command_open_ratio",
+                    "dex1_state_open_ratio", "dex1_state_valid", "record_segment",
+                ) if start_sample is not None and key in start_sample
+            }),
             "mcap_color_keys": list(self.camera_keys),
             "joint_names": list(self.adapter.joint_names),
             "state_dim": self.adapter.vector_size,
@@ -452,7 +486,7 @@ class R1ArmRealMcapRecord:
                 "ik_control_mode": "selected IK/control shaping mode from episode metadata",
                 "ee_intent": "target pose in robot_base; quaternion_xyzw",
                 "train_state": "states.joint_state",
-                "diagnostics": ["control_seq", "camera_frame_times_ns", "states.dq", "states.tau_est"],
+                "diagnostics": ["control_seq", "record_segment", "camera_frame_ids", "camera_frame_times_ns", "feedback_read_start_ns", "feedback_read_end_ns", "feedback_ready", "feedback_timeout", "motor_mode", "motor_error_code", "states.dq", "states.tau_est"],
                 "frame": "model",
                 "j4_sign": "negative (URDF convention)",
                 "gripper_unit": "sim value +0.0245 open / -0.02 closed",
@@ -471,7 +505,9 @@ class R1ArmRealMcapRecord:
     def _start_episode(self) -> None:
         if self.is_recording or self.writer is None:
             return
-        frames, _, received_at_ns, _ = self._camera_snapshot()
+        camera_snapshot = self._camera_snapshot()
+        frames = camera_snapshot["frames"]
+        received_at_ns = min(camera_snapshot["received_at_ns"].values(), default=0)
         if frames is None:
             print(
                 "[Record] cannot start: "
@@ -484,16 +520,17 @@ class R1ArmRealMcapRecord:
                 f"{_stale_camera_summary(self.camera, self.args.max_image_age)}"
             )
             return
-        with self.writer_lock:
-            path = self.writer.start_episode(self._episode_metadata())
-        self.active_episode_path = path
         sample = self.controller.control_sample()
+        with self.writer_lock:
+            path = self.writer.start_episode(self._episode_metadata(sample))
+        self.active_episode_path = path
         self.record_start_control_seq = (
             int(sample["control_seq"])
             if isinstance(sample, dict) and sample.get("control_seq") is not None
             else -1
         )
         self.controller.start_control_sample_capture()
+        self.record_generation = getattr(self, "record_generation", 0) + 1
         self.record_segment = 0
         self.high_rate_diagnostics = {"written": 0, "seq_gaps": 0, "last_seq": None, "period_ms": []}
         self.record_paused = False
@@ -515,12 +552,19 @@ class R1ArmRealMcapRecord:
         self._action_samples: list[np.ndarray] = []
         self._gripper_samples: list[float] = []
         self._action_time_samples: list[int] = []
+        self._breakpoints = []
         self._breakpoints: list[tuple[int, float]] = []  # P3: (帧数, 单调钟)
         self.record_start_monotonic = time.monotonic()
         self.record_pause_started_monotonic = 0.0
         self.record_paused_duration = 0.0
         self.next_record_tick = self.record_start_monotonic
         self.is_recording = True
+        with self.writer_lock:
+            self.writer.add_event({
+                "event": "episode_start", "time_ns": time.time_ns(),
+                "episode_id": int(self.writer.episode_id), "record_segment": 0,
+                "control_seq": self.record_start_control_seq,
+            })
         print(f"[Record] START episode {self.writer.episode_id}: {path}")
 
     def _stop_episode(self) -> None:
@@ -529,11 +573,41 @@ class R1ArmRealMcapRecord:
         if not self.is_recording and self.writer.writer is None:
             return
         duration = max(self._active_duration(), 1e-9)
+        was_paused = bool(self.record_paused)
         self.is_recording = False
+        self.record_generation = getattr(self, "record_generation", 0) + 1
         self.record_paused = False
         self.record_pause_started_monotonic = 0.0
         with self.writer_lock:
             self._flush_control_samples_locked(stop=True)
+            self.writer.add_event({
+                "event": "episode_stop", "time_ns": time.time_ns(),
+                "episode_id": int(self.writer.episode_id),
+                "record_segment": int(self.record_segment),
+                "frame_idx": int(self.record_frame_count),
+                "paused": was_paused,
+            })
+            self.writer.add_event({
+                "event": "episode_quality", "time_ns": time.time_ns(),
+                "episode_id": int(self.writer.episode_id),
+                "frames_written": int(self.record_frame_count),
+                "control_samples_written": int(self.high_rate_diagnostics.get("written", 0)),
+                "control_seq_gaps": int(self.high_rate_diagnostics.get("seq_gaps", 0)),
+                "control_period_ms_p50": (
+                    _percentile(self.high_rate_diagnostics.get("period_ms", []), 50)
+                    if self.high_rate_diagnostics.get("period_ms") else None
+                ),
+                "control_period_ms_p95": (
+                    _percentile(self.high_rate_diagnostics.get("period_ms", []), 95)
+                    if self.high_rate_diagnostics.get("period_ms") else None
+                ),
+                "record_segments": int(self.record_segment + 1),
+                "task_outcome": self.args.task_outcome,
+                "operator_notes": self.args.operator_notes,
+                "camera_counters": self.camera.describe() if self.camera is not None else "none",
+                "record_error": None if self.record_error is None else repr(self.record_error),
+                "capture_buffer_peak": int(self.high_rate_diagnostics.get("capture_buffer_peak", 0)),
+            })
             self.writer.stop_episode()
         fps = self.record_frame_count / duration
         print(
@@ -617,7 +691,12 @@ class R1ArmRealMcapRecord:
             return
         pairs = [bps[i:i + 2] for i in range(0, len(bps), 2)]
         print(f"[Record] pause breakpoints ({len(pairs)} 处，切 chunk 边界):")
-        for i, (a, b) in enumerate(pairs):
+        for i, pair in enumerate(pairs):
+            a = pair[0]
+            if len(pair) == 1:
+                print(f"  #{i + 1}: 帧 {a[0]} 暂停后结束录制")
+                continue
+            b = pair[1]
             span = b[1] - a[1]
             print(f"  #{i + 1}: 帧 {a[0]} 暂停 {span:.1f}s 后继续（chunk 应在 "
                   f"{a[0]} 与 {b[0]} 处切开）")
@@ -741,6 +820,7 @@ class R1ArmRealMcapRecord:
         now = time.monotonic()
         self.record_paused = not self.record_paused
         if self.record_paused:
+            self.record_generation = getattr(self, "record_generation", 0) + 1
             self.record_pause_started_monotonic = now
             with self.writer_lock:
                 self._flush_control_samples_locked(stop=True)
@@ -748,8 +828,17 @@ class R1ArmRealMcapRecord:
             #（暂停两侧的 action chunk 跨越真实时间断点，直接拼接会产生
             # 隐式不连续）。恢复侧同样记（chunk 在恢复点开始新段）。
             self._breakpoints.append((self.record_frame_count, now))
+            with self.writer_lock:
+                self.writer.add_event({
+                    "event": "pause", "time_ns": time.time_ns(),
+                    "episode_id": int(self.writer.episode_id),
+                    "record_segment": int(self.record_segment),
+                    "control_seq": int((self.controller.control_sample() or {}).get("control_seq", -1)),
+                    "frame_idx": int(self.record_frame_count),
+                })
             print("[Record] PAUSED (recording and XR tracking paused; motor hold remains active)")
         else:
+            self.record_generation = getattr(self, "record_generation", 0) + 1
             self.record_paused_duration += now - self.record_pause_started_monotonic
             self.record_pause_started_monotonic = 0.0
             self.next_record_tick = now
@@ -759,6 +848,14 @@ class R1ArmRealMcapRecord:
             with self.writer_lock:
                 self.controller.start_control_sample_capture()
             self._breakpoints.append((self.record_frame_count, now))
+            with self.writer_lock:
+                self.writer.add_event({
+                    "event": "resume", "time_ns": time.time_ns(),
+                    "episode_id": int(self.writer.episode_id),
+                    "record_segment": int(self.record_segment),
+                    "control_seq": int((self.controller.control_sample() or {}).get("control_seq", -1)),
+                    "frame_idx": int(self.record_frame_count),
+                })
             for track in self.controller.track.values():
                 track.clear()
             print("[Record] RESUMED")
@@ -769,6 +866,10 @@ class R1ArmRealMcapRecord:
         if self.writer is None or self.writer.writer is None:
             return latest
         diag = self.high_rate_diagnostics
+        diag["capture_buffer_peak"] = max(
+            int(diag.get("capture_buffer_peak", 0)),
+            self.controller.control_sample_capture_high_watermark(),
+        )
         for sample in samples:
             if not _record_sample_is_complete(sample):
                 continue
@@ -782,7 +883,10 @@ class R1ArmRealMcapRecord:
                 prev_sample_time = diag.get("last_time_ns")
                 if prev_sample_time is not None:
                     diag["period_ms"].append((int(sample["control_time_ns"]) - prev_sample_time) / 1e6)
-            self.writer.add_control_sample(sample, record_segment=self.record_segment)
+            self.writer.add_control_sample(
+                sample, record_segment=self.record_segment,
+                episode_id=self.writer.episode_id,
+            )
             diag["last_seq"] = seq
             diag["last_time_ns"] = int(sample["control_time_ns"])
             diag["written"] += 1
@@ -806,25 +910,23 @@ class R1ArmRealMcapRecord:
         if self.args.pause_button != "none" and edges[self.args.pause_button]:
             self._toggle_pause()
 
-    def _gripper_state_command(self) -> tuple[float, float]:
-        desired = float(np.mean(self.controller.dex1_q("right")))
-        hand = self.controller.hand_ctrl
-        if hand is None:
-            return desired, desired
-        try:
-            record = hand.get_record_data()
-            measured = _dex1_open_ratio_to_sim(float(record["hand_state"][0]))
-            commanded = _dex1_open_ratio_to_sim(float(record["hand_cmd"][0]))
-            return measured, commanded
-        except Exception as exc:
-            if self.args.debug:
-                print(f"[Record] Dex1 feedback fallback to command: {exc}")
-            return desired, desired
-
     def _state_action(self, sample: dict) -> tuple[dict, dict]:
         commanded_arm = np.asarray(sample["q_purpose"], dtype=float).copy()
         measured_arm = np.asarray(sample["q_measured"], dtype=float).copy()
-        measured_gripper, commanded_gripper = self._gripper_state_command()
+        commanded_ratio = sample.get("dex1_command_open_ratio")
+        commanded_gripper = (
+            _dex1_open_ratio_to_sim(float(commanded_ratio))
+            if commanded_ratio is not None else float(np.mean(self.controller.dex1_q("right")))
+        )
+        measured_ratio = sample.get("dex1_state_open_ratio")
+        measured_gripper_valid = bool(sample.get("dex1_state_valid", False)) and measured_ratio is not None
+        # The fixed 8D legacy frame needs a numeric placeholder. Validity and
+        # source are explicit so this command-derived placeholder is never
+        # mistaken for a measured gripper position during training.
+        measured_gripper = (
+            _dex1_open_ratio_to_sim(float(measured_ratio))
+            if measured_gripper_valid else commanded_gripper
+        )
         measured_sim_q = np.hstack(
             [measured_arm, measured_gripper, measured_gripper]
         )
@@ -866,7 +968,43 @@ class R1ArmRealMcapRecord:
         states["tau_est"] = np.asarray(sample["tau_est"], dtype=float).tolist()
         states["feedback_time_ns"] = int(sample.get("feedback_time_ns", sample["control_time_ns"]))
         states["control_seq"] = int(sample["control_seq"])
+        states["gripper_state_valid"] = measured_gripper_valid
+        states["gripper_state_source"] = "dex1_feedback" if measured_gripper_valid else "command_placeholder_invalid"
+        states["motor_feedback_ready_all"] = bool(np.all(
+            sample.get("feedback_ready", np.zeros(7, dtype=bool))
+        ))
+        states["motor_feedback_freshness_available"] = bool(
+            sample.get("feedback_freshness_available", False)
+        )
+        states["motor_mode"] = np.asarray(sample.get("motor_mode", []), dtype=int).tolist()
+        states["motor_timeout"] = np.asarray(sample.get("feedback_timeout", []), dtype=int).tolist()
+        states["motor_error_code"] = np.asarray(sample.get("motor_error_code", []), dtype=int).tolist()
+        states["feedback_read_start_ns"] = sample.get("feedback_read_start_ns")
+        states["feedback_read_end_ns"] = sample.get("feedback_read_end_ns")
+        states["feedback_read_start_monotonic_ns"] = sample.get("feedback_read_start_monotonic_ns")
+        states["feedback_read_end_monotonic_ns"] = sample.get("feedback_read_end_monotonic_ns")
+        states["feedback_source"] = sample.get("feedback_source", "unknown")
+        for key in (
+            "feedback_seq", "feedback_updated_since_read",
+            "feedback_age_since_counter_change_s", "feedback_missed_response_count",
+            "feedback_last_step_fresh",
+        ):
+            value = sample.get(key)
+            states[key] = np.asarray(value).tolist() if value is not None else None
         actions["control_seq"] = int(sample["control_seq"])
+        for key in (
+            "control_mode", "grip_active", "xr_valid", "xr_seq", "xr_frame_stamp_ns",
+            "xr_received_monotonic_ns", "feedback_ready", "feedback_timeout",
+            "motor_mode", "motor_error_code", "feedback_source",
+            "feedback_seq", "feedback_updated_since_read",
+            "feedback_age_since_counter_change_s", "feedback_missed_response_count",
+            "feedback_last_step_fresh", "feedback_freshness_available",
+        ):
+            value = sample.get(key)
+            actions[key] = np.asarray(value).tolist() if isinstance(value, np.ndarray) else value
+        actions["dex1_state_valid"] = measured_gripper_valid
+        actions["dex1_command_open_ratio"] = commanded_ratio
+        actions["dex1_state_open_ratio"] = measured_ratio
         return states, actions
 
     def _record_loop(self) -> None:
@@ -890,6 +1028,9 @@ class R1ArmRealMcapRecord:
                     if not self.is_recording or self.record_paused or self.writer is None:
                         continue
                     sample = self._flush_control_samples_locked()
+                    capture_generation = self.record_generation
+                    capture_segment = self.record_segment
+                    capture_episode_id = self.writer.episode_id
             except BaseException as exc:
                 self.record_error = exc
                 self.running = False
@@ -919,7 +1060,9 @@ class R1ArmRealMcapRecord:
                 self.record_rate_diagnostics["duplicate_control_sample"] += 1
                 continue
 
-            frames, frame_id, received_at_ns, _ = self._camera_snapshot()
+            camera_snapshot = self._camera_snapshot()
+            frames = camera_snapshot["frames"]
+            received_at_ns = min(camera_snapshot["received_at_ns"].values(), default=0)
             if frames is None:
                 self.record_rate_diagnostics["camera_no_frame"] += 1
                 stale_keys = _stale_camera_keys(self.camera, self.args.max_image_age)
@@ -944,17 +1087,28 @@ class R1ArmRealMcapRecord:
                 states, actions = self._state_action(sample)
                 # P3 对齐：每路相机的帧到达时刻与样本时刻一起落盘，
                 # 图像-action 偏移从"假设"变为可测量（质检统计用）。
-                cam_times = self.camera.frame_times() if self.camera is not None else {}
                 with self.writer_lock:
-                    if self.is_recording and not self.record_paused and self.writer is not None:
+                    if (
+                        self.is_recording and not self.record_paused
+                        and self.writer is not None
+                        and capture_generation == self.record_generation
+                        and capture_segment == self.record_segment
+                        and capture_episode_id == self.writer.episode_id
+                    ):
+                        frame_ids = camera_snapshot["frame_ids"]
                         self.writer.add_frame(
                             frames,
                             states,
                             actions,
-                            image_source_frame_id=frame_id,
+                            image_source_frame_id=min(frame_ids.values(), default=-1),
                             sample_time_ns=int(sample["control_time_ns"]),
-                            camera_frame_times_ns=cam_times,
+                            camera_frame_times_ns=camera_snapshot["received_at_ns"],
+                            camera_frame_ids=frame_ids,
+                            camera_frame_times_monotonic_ns=camera_snapshot["received_monotonic_ns"],
+                            camera_device_timestamps_ms=camera_snapshot["device_timestamp_ms"],
                             control_seq=int(sample["control_seq"]),
+                            record_segment=capture_segment,
+                            episode_id=capture_episode_id,
                         )
                         self.record_frame_count += 1
                         last_control_seq = control_seq
@@ -1030,7 +1184,9 @@ class R1ArmRealMcapRecord:
         if now - self._preview_last_render < preview_period:
             return
         self._preview_last_render = now
-        frames, frame_id, _, _ = self._camera_snapshot()
+        camera_snapshot = self._camera_snapshot()
+        frames = camera_snapshot["frames"]
+        frame_id = min(camera_snapshot["frame_ids"].values(), default=-1)
         active = self.camera.active_keys or tuple(spec.key for spec in self.camera_specs)
         health = self.camera.health()
         status = "PAUSED" if self.record_paused else (
@@ -1070,7 +1226,7 @@ class R1ArmRealMcapRecord:
             # --no-cameras: record state/action only, no image frames.
             self.writer = FourCameraMcapRecorder(
                 task_dir=str(self.task_dir),
-                task_goal=self.args.task_description,
+                task_goal=self.args.task_goal,
                 frequency=self.args.frequency,
                 format_name="r1arm_real_multicamera_mcap_json_v1",
                 camera_order=(),
@@ -1107,7 +1263,7 @@ class R1ArmRealMcapRecord:
                 print(f"[Camera] {spec.label()}")
         self.writer = FourCameraMcapRecorder(
             task_dir=str(self.task_dir),
-            task_goal=self.args.task_description,
+            task_goal=self.args.task_goal,
             frequency=self.args.frequency,
             format_name="r1arm_real_multicamera_mcap_json_v1",
             camera_order=self.camera_keys,
@@ -1195,28 +1351,30 @@ class R1ArmRealMcapRecord:
     def shutdown(self) -> None:
         self.running = False
         self._preview_quit = True
-        self._stop_episode()
-        self.record_stop_event.set()
-        if self.record_thread is not None:
-            self.record_thread.join(timeout=3.0)
-            self.record_thread = None
-        if self.preview_thread is not None:
-            self.preview_thread.join(timeout=2.0)
-            self.preview_thread = None
-        if self.started:
+        try:
+            self._stop_episode()
+        except BaseException as exc:
+            self.record_error = self.record_error or exc
+            print(f"[Record] episode finalization failed: {exc}")
+        finally:
+            self.record_stop_event.set()
+            if self.record_thread is not None:
+                self.record_thread.join()
+                self.record_thread = None
+            if self.preview_thread is not None:
+                self.preview_thread.join(timeout=2.0)
+                self.preview_thread = None
+            # Always stop the arm even when writer/report finalization fails.
             self.controller._on_stop()
             self.started = False
-        else:
-            # Constructor may have opened XR even if arm startup failed.
-            self.controller._on_stop()
-        if self.camera is not None:
-            self.camera.close()
-        if self.preview_created:
-            try:
-                cv2.destroyWindow(PREVIEW_WINDOW)
-            except cv2.error:
-                pass
-        print("[R1Arm right-arm MCAP Record] stopped")
+            if self.camera is not None:
+                self.camera.close()
+            if self.preview_created:
+                try:
+                    cv2.destroyWindow(PREVIEW_WINDOW)
+                except cv2.error:
+                    pass
+            print("[R1Arm right-arm MCAP Record] stopped")
 
 
 def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
@@ -1256,20 +1414,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teleop = parser.add_argument_group("right R1Arm real teleoperation")
     teleop.add_argument("--motion-mode", action="store_true")
-    teleop.add_argument("--port", default="/dev/ttyUSB0")
+    teleop.add_argument("--port", default="/dev/ttyUSB2")
     teleop.add_argument("--baud", type=int, default=6_000_000)
     teleop.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK_ROOT)
     teleop.add_argument("--calib", type=Path)
     teleop.add_argument("--bridge-lib", type=Path, default=DEFAULT_BRIDGE_LIBRARY)
     teleop.add_argument("--urdf", type=Path)
     teleop.add_argument("--scale-factor", type=float, default=1.0)
-    teleop.add_argument("--rate", type=float, default=100.0,
-                        help="控制环 Hz（默认 100；MCAP 图像/观测采样仍由 --frequency 默认 30Hz）")
-    teleop.add_argument("--xr-filter-min-cutoff", type=float, default=2.0)
-    teleop.add_argument("--xr-filter-beta", type=float, default=0.15)
-    teleop.add_argument("--trajectory-position-gain", type=float, default=16.0,
+    teleop.add_argument("--rate", type=float, default=90.0,
+                        help="控制环 Hz（默认 90；MCAP 图像/观测采样仍由 --frequency 默认 30Hz）")
+    teleop.add_argument("--xr-filter-min-cutoff", type=float, default=8.0)
+    teleop.add_argument("--xr-filter-beta", type=float, default=1.0)
+    teleop.add_argument("--trajectory-position-gain", type=float, default=64.0,
                         help="Baseline q_purpose position-error response (s^-2)")
-    teleop.add_argument("--trajectory-velocity-gain", type=float, default=8.0,
+    teleop.add_argument("--trajectory-velocity-gain", type=float, default=16.0,
                         help="Baseline q_purpose velocity damping (s^-1)")
     teleop.add_argument(
         "--trajectory-max-speed", type=float, default=None,
@@ -1296,9 +1454,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--tau-clip", type=float, default=8.0,
         help="重力前馈单关节力矩限幅 Nm（默认 8）",
     )
-    teleop.add_argument("--kp", type=parse_gain, default=80.0,
+    teleop.add_argument("--kp", type=parse_gain, default=60.0,
                         help="位置环增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
-    teleop.add_argument("--kd", type=parse_gain, default=2,
+    teleop.add_argument("--kd", type=parse_gain, default=10.0,
                         help="阻尼增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
     teleop.add_argument("--max-joint-speed", type=float, default=1.0,
                         help="SDK command speed limit (rad/s; default 1.0)")
@@ -1309,14 +1467,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teleop.add_argument("--feedback-timeout", type=float, default=3.0)
     teleop.add_argument("--foc-timeout", type=float, default=1.0)
-    teleop.add_argument("--enable-dex1", action="store_true")
-    teleop.add_argument("--dex1-net", default="")
+    teleop.add_argument("--enable-dex1", action=argparse.BooleanOptionalAction, default=True)
+    teleop.add_argument("--dex1-net", default="enp4s0")
     teleop.add_argument("--dex1-domain", type=int, default=0)
     teleop.add_argument("--grip-torque-limit", type=float, default=-1.0)
-    teleop.add_argument("--enable-a-reset", action="store_true", help="Allow A to move toward ARM_INIT")
+    teleop.add_argument(
+        "--enable-a-reset", action=argparse.BooleanOptionalAction, default=True,
+        help="Allow A to move toward ARM_INIT",
+    )
     teleop.add_argument(
         "--home-on-start",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="After startup FOC hold, soft-blend to ARM_INIT before enabling tracking",
     )
     teleop.add_argument(
@@ -1364,8 +1526,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-show",
         dest="image_show",
         action="store_true",
-        default=None,
-        help="Show a live camera preview while recording (default: on when $DISPLAY is set)",
+        default=False,
+        help="Show a live camera preview while recording",
     )
     image.add_argument(
         "--no-image-show",
@@ -1398,10 +1560,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Controller button that pauses/resumes recording; 'none' disables pause",
     )
     record.add_argument("--frequency", type=float, default=30.0)
-    record.add_argument("--output-dir", default="")
+    record.add_argument(
+        "--output-dir", "--task-dir", dest="output_dir",
+        default="/home/ycb410/nt/r1arm_teleop/dataset/teleop_kp64_kd16_control90_baseline",
+        help="Episode output directory (default: control90 teleop baseline dataset)",
+    )
     record.add_argument("--data-root", default=str(PROJECT_ROOT / "data"))
     record.add_argument("--task-dir-name", default="r1arm_real_task")
-    record.add_argument("--task-description", default="R1Arm right-arm teleoperation")
+    record.add_argument(
+        "--task-description",
+        default="teleop control90 observation30 kp64 kd16 speed1 accel6 jerk80",
+        help="experiment/run description (not a semantic VLA instruction)",
+    )
+    record.add_argument("--task-goal", default="", help="natural-language demonstrated task goal")
+    record.add_argument(
+        "--task-outcome", choices=("unknown", "success", "failure"), default="unknown"
+    )
+    record.add_argument("--operator-notes", default="")
     record.add_argument("--robot-id", default="r1arm_right")
     record.add_argument("--auto-start", action="store_true")
     record.add_argument("--duration", type=float, default=0.0)
@@ -1435,10 +1610,6 @@ def main() -> None:
             "--enable-a-reset reserves A for soft-reset; A cannot also be "
             "--record-button or --pause-button"
         )
-    if args.image_show is None:
-        # Preview is on by default where a GUI exists: "the cameras recorded
-        # nothing" used to be invisible during collection.
-        args.image_show = bool(os.environ.get("DISPLAY"))
     if not args.no_cameras and not args.camera:
         args.camera = list(DEFAULT_CAMERAS)
     if not args.no_cameras:
@@ -1454,7 +1625,7 @@ def main() -> None:
     if args.motion_mode and not Path(args.port).exists():
         parser.error(f"serial port not found: {args.port}")
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

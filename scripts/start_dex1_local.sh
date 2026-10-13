@@ -9,7 +9,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEX1_SERVICE_ROOT="${DEX1_SERVICE_ROOT:-/home/ycb410/nt/dex1/dex1_1_service}"
 DEX1_SERVER="${DEX1_SERVER:-${DEX1_SERVICE_ROOT}/bin/dex1_1_gripper_server}"
 DEX1_NETWORK="${DEX1_NETWORK:-enp4s0}"
-DEX1_PORT="${DEX1_PORT:-/dev/ttyUSB0}"
+DEX1_PORT="${DEX1_PORT:-/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTANPO49-if00-port0}"
 DEX1_SDK_LIB="${DEX1_SDK_LIB:-/home/ycb410/nt/dex1/unitree_sdk2/thirdparty/lib/x86_64}"
 DEX1_SERVICE_LIB="${DEX1_SERVICE_LIB:-${DEX1_SERVICE_ROOT}/lib}"
 
@@ -25,6 +25,7 @@ if [[ ! -e "$DEX1_PORT" ]]; then
     ls -l /dev/ttyUSB* 2>/dev/null || true
     exit 1
 fi
+DEX1_PORT="$(readlink -f "$DEX1_PORT")"
 
 if ! ip link show "$DEX1_NETWORK" >/dev/null 2>&1; then
     echo "DDS network interface does not exist: $DEX1_NETWORK" >&2

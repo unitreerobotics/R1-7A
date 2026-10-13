@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Record R1Arm MuJoCo teleoperation to R1-A7-style MCAP episodes.
+"""Record R1Arm MuJoCo teleoperation to MCAP episodes.
 
-The container/observation structure follows R1-A7, while joint_state/action
-use the compact R1Arm simulation space (8 DoF single-arm, 16 DoF dual-arm).
+The established observation schema is retained, while joint_state/action use
+the R1Arm simulation space (8 DoF single-arm, 16 DoF dual-arm).
 
 Teleoperation starts immediately, just like ``teleop_r1arm_sim.py``:
   Y: start/stop and save an episode

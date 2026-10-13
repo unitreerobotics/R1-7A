@@ -136,6 +136,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self._last_command_monotonic_s: float | None = None
         self._last_command_dt = 1.0 / self.rate_hz
         self.last_state: R1ArmSdkState | None = None
+        self._feedback_last_counts: np.ndarray | None = None
+        self._feedback_last_seen_monotonic_ns: np.ndarray | None = None
         self.last_report_time = 0.0
 
     def _check_feedback_range(self, state: R1ArmSdkState) -> np.ndarray:
@@ -342,6 +344,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "dex1_command_count": 0,
             "dex1_publish_ok": None,
             "dex1_publish_fail_count": 0,
+            "dex1_state_valid": False,
+            "dex1_gripper_sample_time_ns": None,
         }
         if self.hand_ctrl is not None:
             try:
@@ -352,6 +356,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                 diagnostics["dex1_feedback_age_s"] = data.get("feedback_age_s")
                 diagnostics["dex1_feedback_time_ns"] = data.get("feedback_time_ns")
                 diagnostics["dex1_feedback_valid"] = bool(data.get("feedback_valid", False))
+                diagnostics["dex1_state_valid"] = bool(data.get("feedback_valid", False))
+                diagnostics["dex1_gripper_sample_time_ns"] = data.get("feedback_time_ns")
                 diagnostics["dex1_command_age_s"] = data.get("command_age_s")
                 diagnostics["dex1_command_time_ns"] = data.get("command_time_ns")
                 diagnostics["dex1_command_count"] = int(data.get("command_count", 0))
@@ -362,6 +368,37 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             except Exception:
                 pass
         return diagnostics
+
+    def _feedback_stream_diagnostics(self, state: R1ArmSdkState, observed_ns: int) -> dict:
+        counts = state.feedback_count
+        if counts is None:
+            return {
+                "feedback_seq": None,
+                "feedback_updated_since_read": None,
+                "feedback_age_since_counter_change_s": None,
+                "feedback_missed_response_count": None,
+                "feedback_last_step_fresh": None,
+                "feedback_freshness_available": False,
+            }
+        counts = np.asarray(counts, dtype=np.uint64).copy()
+        first_observation = self._feedback_last_counts is None
+        updated = None if first_observation else counts != self._feedback_last_counts
+        if first_observation:
+            self._feedback_last_seen_monotonic_ns = np.full(len(counts), observed_ns, dtype=np.int64)
+        else:
+            self._feedback_last_seen_monotonic_ns[updated] = observed_ns
+        ages = None if first_observation else np.maximum(
+            0, observed_ns - self._feedback_last_seen_monotonic_ns
+        ).astype(float) / 1e9
+        self._feedback_last_counts = counts
+        return {
+            "feedback_seq": counts,
+            "feedback_updated_since_read": updated,
+            "feedback_age_since_counter_change_s": ages,
+            "feedback_missed_response_count": state.missed_response_count,
+            "feedback_last_step_fresh": state.last_step_feedback,
+            "feedback_freshness_available": True,
+        }
 
     def _output_command(self) -> None:
         purpose_model = self.arm_q().copy()
@@ -390,10 +427,35 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                 "q_measured": purpose_model.copy(),
                 "dq_measured": np.zeros(7),
                 "tau_est": np.zeros(7),
+                "feedback_time_ns": command_time_ns,
+                "feedback_read_start_ns": command_time_ns,
+                "feedback_read_end_ns": command_time_ns,
+                "feedback_read_start_monotonic_ns": time.monotonic_ns(),
+                "feedback_read_end_monotonic_ns": time.monotonic_ns(),
+                "feedback_source": "dry_run_model",
+                "feedback_seq": None,
+                "feedback_updated_since_read": None,
+                "feedback_age_since_counter_change_s": None,
+                "feedback_missed_response_count": None,
+                "feedback_last_step_fresh": None,
+                "feedback_freshness_available": False,
+                "feedback_ready": np.zeros(7, dtype=bool),
+                "feedback_timeout": np.ones(7, dtype=np.uint8),
+                "motor_mode": np.zeros(7, dtype=np.uint8),
+                "motor_error_code": np.zeros(7, dtype=np.uint32),
                 "ee_intent": ee_intent,
                 "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
                 "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
                 "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+                "xr_frame_stamp_ns": int(getattr(self, "_xr_last_stamp", 0) or 0),
+                "xr_received_monotonic_ns": int(getattr(self, "_xr_received_monotonic_ns", 0)),
+                "xr_valid": bool(getattr(self, "_xr_valid_last", False)),
+                "xr_seq": int(getattr(self, "_xr_frame_seq", 0)),
+                "control_mode": (
+                    "home_reset" if self._reset_blending else
+                    "tracking" if self.active else "hold"
+                ),
+                "grip_active": bool(self.track[self.control_side].active),
                 **diagnostics,
             })
             if self.debug and time.monotonic() - self.last_report_time >= 1.0:
@@ -405,8 +467,15 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         if not Path(self.port).exists():
             raise RuntimeError(f"R1Arm serial device disappeared: {self.port}")
 
-        feedback_time_ns = time.time_ns()
+        feedback_read_start_ns = time.time_ns()
+        feedback_read_start_monotonic_ns = time.monotonic_ns()
         state = self.arm_bus.read_state()
+        feedback_read_end_ns = time.time_ns()
+        feedback_read_end_monotonic_ns = time.monotonic_ns()
+        feedback_time_ns = feedback_read_end_ns
+        feedback_stream = self._feedback_stream_diagnostics(
+            state, feedback_read_end_monotonic_ns
+        )
         self._check_feedback_range(state)
         self._check_faults(state, require_foc=True)
         target_sdk = model_to_sdk_q(self.arm_q())
@@ -425,10 +494,13 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             max_lead=self.max_command_lead,
         )
         dq_target_sdk = (command - self.command_sdk) / command_dt
+        command_send_start_ns = time.time_ns()
+        command_send_start_monotonic_ns = time.monotonic_ns()
         self.arm_bus.command_position(
             command, self.kp, self.kd, tau=self._tau_ff(command), dq=dq_target_sdk
         )
         command_time_ns = time.time_ns()
+        command_send_end_monotonic_ns = time.monotonic_ns()
         self._last_command_monotonic_s = now_mono_s
         self._last_command_dt = command_dt
         self.command_sdk = command
@@ -444,7 +516,21 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "control_seq": self._control_seq,
             "control_time_ns": command_time_ns,
             "command_time_ns": command_time_ns,
+            "control_time_monotonic_ns": command_send_end_monotonic_ns,
+            "command_send_start_ns": command_send_start_ns,
+            "command_send_start_monotonic_ns": command_send_start_monotonic_ns,
+            "command_send_end_monotonic_ns": command_send_end_monotonic_ns,
             "feedback_time_ns": feedback_time_ns,
+            "feedback_read_start_ns": feedback_read_start_ns,
+            "feedback_read_end_ns": feedback_read_end_ns,
+            "feedback_read_start_monotonic_ns": feedback_read_start_monotonic_ns,
+            "feedback_read_end_monotonic_ns": feedback_read_end_monotonic_ns,
+            "feedback_source": "sdk_latest_cache",
+            "feedback_ready": state.ready.copy(),
+            "feedback_timeout": state.timeout.copy(),
+            "motor_mode": state.mode.copy(),
+            "motor_error_code": state.error_code.copy(),
+            **feedback_stream,
             "q_purpose": purpose_model,
             "dq_purpose": purpose_velocity,
             "ddq_purpose": purpose_acceleration,
@@ -458,6 +544,15 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
             "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
             "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+            "xr_frame_stamp_ns": int(getattr(self, "_xr_last_stamp", 0) or 0),
+            "xr_received_monotonic_ns": int(getattr(self, "_xr_received_monotonic_ns", 0)),
+            "xr_valid": bool(getattr(self, "_xr_valid_last", False)),
+            "xr_seq": int(getattr(self, "_xr_frame_seq", 0)),
+            "control_mode": (
+                "home_reset" if self._reset_blending else
+                "tracking" if self.active else "hold"
+            ),
+            "grip_active": bool(self.track[self.control_side].active),
             **diagnostics,
         })
         if self.debug and time.monotonic() - self.last_report_time >= 1.0:

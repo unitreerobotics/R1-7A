@@ -1,8 +1,7 @@
 """Local camera capture for the real R1Arm recorder.
 
-The R1-A7 stack receives head/wrist images from a ZMQ image server running on
-the robot PC.  The real R1Arm workstation has its cameras plugged in directly,
-so this module replaces the ZMQ client with two local backends:
+The real R1Arm workstation has its cameras plugged in directly. This module
+supports two local backends:
 
 ``v4l2``
     Plain UVC cameras through ``cv2.VideoCapture`` (the "1080P USB Camera").
@@ -17,10 +16,8 @@ frame.  ``LocalCameraSubscriber.get`` returns a snapshot that is only valid when
 every active camera contributed a frame, which is what the MCAP writer needs:
 one sample must contain one image per ``camera_order`` entry.
 
-MCAP color keys follow the R1-A7 four-camera layout so episodes stay readable
-by the existing replay/validation tooling.  A single right arm only populates a
-subset of that layout; ``DEFAULT_CAMERAS`` uses the external view plus the wrist
-view.
+MCAP color keys retain the historical head/wrist names used by existing
+episodes. ``DEFAULT_CAMERAS`` uses the external view plus the wrist view.
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ import cv2
 import numpy as np
 
 
-#: Color keys accepted by ``--camera key=...``; same names as the R1-A7 layout.
+#: Stable color keys accepted by ``--camera key=...`` and stored in MCAP.
 CAMERA_KEY_CHOICES = (
     "color_0_head_left",
     "color_1_head_right",
@@ -174,6 +171,8 @@ class _CameraWorker(threading.Thread):
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
         self._received_at_ns = 0
+        self._received_monotonic_ns = 0
+        self._device_timestamp_ms: float | None = None
         self._stop_event = threading.Event()
         self._prev_bytes: bytes | None = None
         self._identical_streak = 0
@@ -182,12 +181,15 @@ class _CameraWorker(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def snapshot(self) -> tuple[np.ndarray | None, int, int]:
+    def snapshot(self) -> tuple[np.ndarray | None, int, int, int, float | None]:
         with self._lock:
             if self._frame is None:
-                return None, -1, 0
+                return None, -1, 0, 0, None
             # Copy so the writer cannot race with the capture thread.
-            return self._frame.copy(), self.frames_seen, self._received_at_ns
+            return (
+                self._frame.copy(), self.frames_seen, self._received_at_ns,
+                self._received_monotonic_ns, self._device_timestamp_ms,
+            )
 
     def has_frame(self) -> bool:
         with self._lock:
@@ -203,7 +205,7 @@ class _CameraWorker(threading.Thread):
             now_ns = time.time_ns()
         return (now_ns - stamp) / 1e9
 
-    def publish(self, frame: np.ndarray | None) -> None:
+    def publish(self, frame: np.ndarray | None, device_timestamp_ms: float | None = None) -> None:
         if frame is None or frame.size == 0:
             return
         # A stalled driver can keep handing out the *same* frame; sensor noise
@@ -227,6 +229,8 @@ class _CameraWorker(threading.Thread):
         with self._lock:
             self._frame = frame
             self._received_at_ns = time.time_ns()
+            self._received_monotonic_ns = time.monotonic_ns()
+            self._device_timestamp_ms = device_timestamp_ms
             self.frames_seen += 1
 
     def describe(self) -> str:
@@ -389,7 +393,7 @@ class RealSenseCamera(_CameraWorker):
                 continue
             color = frames.get_color_frame()
             if color:
-                self.publish(self._convert(color))
+                self.publish(self._convert(color), float(color.get_timestamp()))
                 return True
         return False
 
@@ -435,7 +439,7 @@ class RealSenseCamera(_CameraWorker):
                 continue
 
             misses = 0
-            self.publish(self._convert(color))
+            self.publish(self._convert(color), float(color.get_timestamp()))
         self._close()
 
 
@@ -525,8 +529,8 @@ class LocalCameraSubscriber:
         ``frames`` is ``None`` until every active camera has produced a frame.
         ``received_at_ns`` is the *oldest* contributing timestamp so a caller
         can treat it as "the whole sample is at most this stale".
-        Per-camera arrival times stay on the workers; use
-        :meth:`frame_times` for the per-key view (P3 alignment data).
+        This compatibility view uses aggregate minimum IDs/timestamps. Use
+        :meth:`get_atomic_snapshot` when frame identity must stay paired with pixels.
         """
         workers = self._active_workers()
         if not workers:
@@ -536,7 +540,7 @@ class LocalCameraSubscriber:
         counters: list[int] = []
         sources: list[str] = []
         for worker in workers:
-            frame, counter, received_at_ns = worker.snapshot()
+            frame, counter, received_at_ns, _, _ = worker.snapshot()
             if frame is None:
                 return None, -1, 0, ()
             frames.append(frame)
@@ -544,6 +548,30 @@ class LocalCameraSubscriber:
             counters.append(counter)
             sources.append(worker.describe())
         return tuple(frames), min(counters), min(stamps), tuple(sources)
+
+    def get_atomic_snapshot(self) -> dict:
+        """Return images and all per-camera identity/timing from one read per worker."""
+        workers = self._active_workers()
+        if not workers:
+            return {"frames": None, "frame_ids": {}, "received_at_ns": {},
+                    "received_monotonic_ns": {}, "device_timestamp_ms": {},
+                    "source_streams": ()}
+        frames, ids, wall, mono, device, sources = [], {}, {}, {}, {}, []
+        for worker in workers:
+            frame, frame_id, wall_ns, mono_ns, device_ms = worker.snapshot()
+            if frame is None:
+                return {"frames": None, "frame_ids": {}, "received_at_ns": {},
+                        "received_monotonic_ns": {}, "device_timestamp_ms": {},
+                        "source_streams": ()}
+            key = worker.spec.key
+            frames.append(frame)
+            ids[key], wall[key], mono[key], device[key] = frame_id, wall_ns, mono_ns, device_ms
+            sources.append(worker.describe())
+        return {
+            "frames": tuple(frames), "frame_ids": ids, "received_at_ns": wall,
+            "received_monotonic_ns": mono, "device_timestamp_ms": device,
+            "source_streams": tuple(sources),
+        }
 
     def frame_times(self) -> dict[str, int]:
         """Per-camera arrival time of the newest frame (ns, 0 = never).

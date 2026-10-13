@@ -8,6 +8,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -26,6 +28,33 @@ void setError(char* dst, int capacity, const std::string& message) {
 
 Bridge* asBridge(void* handle) {
     return static_cast<Bridge*>(handle);
+}
+
+template <typename T, typename = void>
+struct HasFeedbackDiagnostics : std::false_type {};
+
+template <typename T>
+struct HasFeedbackDiagnostics<T, std::void_t<
+    decltype(std::declval<const T&>().feedbackCounts()),
+    decltype(std::declval<const T&>().missedResponseCounts()),
+    decltype(std::declval<const T&>().lastStepFeedback())>> : std::true_type {};
+
+template <typename T>
+bool copyFeedbackDiagnostics(const T& bus, uint64_t* feedback_count,
+                             uint64_t* missed_response_count,
+                             uint8_t* last_step_feedback) {
+    if constexpr (HasFeedbackDiagnostics<T>::value) {
+        const auto counts = bus.feedbackCounts();
+        const auto missed = bus.missedResponseCounts();
+        const auto last_step = bus.lastStepFeedback();
+        for (int i = 0; i < kArmJointCount; ++i) {
+            feedback_count[i] = counts[i];
+            missed_response_count[i] = missed[i];
+            last_step_feedback[i] = last_step[i] ? 1 : 0;
+        }
+        return true;
+    }
+    return false;
 }
 
 template <typename Fn>
@@ -260,6 +289,29 @@ int r1arm_bridge_read_state(void* handle,
                 error_code[i] = states[i].error_code;
                 ready[i] = feedback_ready[i] ? 1 : 0;
             }
+        },
+        error,
+        error_capacity);
+}
+
+int r1arm_bridge_read_feedback_diagnostics(void* handle,
+                                           uint64_t* feedback_count,
+                                           uint64_t* missed_response_count,
+                                           uint8_t* last_step_feedback,
+                                           uint8_t* supported,
+                                           char* error,
+                                           int error_capacity) {
+    if (handle == nullptr || feedback_count == nullptr ||
+        missed_response_count == nullptr || last_step_feedback == nullptr ||
+        supported == nullptr) {
+        setError(error, error_capacity, "null bridge or feedback diagnostic output array");
+        return -1;
+    }
+    return guarded(
+        [&]() {
+            supported[0] = copyFeedbackDiagnostics(
+                asBridge(handle)->bus, feedback_count, missed_response_count,
+                last_step_feedback) ? 1 : 0;
         },
         error,
         error_capacity);

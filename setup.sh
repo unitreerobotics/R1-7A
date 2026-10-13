@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# R1-A7 teleop 环境安装脚本。
+# R1Arm teleoperation environment setup.
 # 默认使用清华 Conda / PyPI 镜像；不配置也不依赖 HTTP 代理。
 #
 # 用法:
@@ -11,7 +11,7 @@
 # 装好后:
 #   conda activate r1_teleop
 #   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-#   python scripts/teleop_sim.py --mock-xr --debug
+#   python scripts/teleop_r1arm_sim.py --mock-xr --debug
 #
 set -euo pipefail
 
@@ -229,9 +229,9 @@ cat <<EOF
   conda activate ${ENV_NAME}
   export LD_LIBRARY_PATH="\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH"
   cd ${PROJECT_ROOT}
-  python scripts/teleop_sim.py --mock-xr --debug
+  python scripts/teleop_r1arm_sim.py --mock-xr --debug
 
 说明:
   - 若 meshcat / sqlite3 报 CXXABI 错误，确认已把 \$CONDA_PREFIX/lib 放在 LD_LIBRARY_PATH 最前
-  - 代理与仿真测试见 start_env.md
+  - 真机使用前请先阅读 README.md 的设备检查和安全步骤。
 EOF

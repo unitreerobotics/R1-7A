@@ -1,10 +1,8 @@
-"""Four-camera MCAP episode writer for R1-A7 teleoperation recordings.
+"""MCAP episode writer used by the R1Arm recorders.
 
 Migrated from ``teleop/utils/mcap_writer.py`` in the original
-``xr_teleoperate_r1a7`` repository. The on-disk layout is deliberately kept
-byte-for-byte compatible with the existing datasets — episodes recorded here
-must stay readable by the original tooling, and vice versa. Do not "tidy up"
-the topic names, key names, or the JPEG/base64 encoding.
+``xr_teleoperate_r1a7`` repository. Stable topic names, keys, and JPEG/base64
+encoding are retained so existing MCAP episodes remain readable.
 
 Layout of one ``episode_XXXX.mcap``:
   ``/episode/meta``        one JSON message: {info, text, config}
@@ -13,9 +11,8 @@ Layout of one ``episode_XXXX.mcap``:
                             colors, states, actions}
   ``/r1arm/control_sample`` optional, one JSON message per control cycle
 
-``colors`` holds base64-encoded JPEG observations. The default remains the
-fixed four-camera R1-A7 order; simulation callers may explicitly select a
-subset through ``camera_order``.
+``colors`` holds base64-encoded JPEG observations. Simulation callers may
+select a subset through ``camera_order``.
 """
 
 from __future__ import annotations
@@ -30,7 +27,7 @@ import cv2
 
 
 class FourCameraMcapRecorder:
-    """Write R1-A7 teleoperation episodes as JSON messages in an MCAP file."""
+    """Write teleoperation episodes as JSON messages in an MCAP file."""
 
     CAMERA_ORDER = (
         "color_0_head_left",
@@ -56,8 +53,7 @@ class FourCameraMcapRecorder:
         self.frequency = float(frequency)
         self.format_name = str(format_name)
         self.control_frequency = None if control_frequency is None else float(control_frequency)
-        # ``None`` falls back to the R1-A7 four-camera default; an explicit empty
-        # tuple is allowed for state/action-only recordings.
+        # An explicit empty tuple is allowed for state/action-only recordings.
         self.camera_order = tuple(self.CAMERA_ORDER if camera_order is None else camera_order)
         if len(set(self.camera_order)) != len(self.camera_order):
             raise ValueError(f"camera_order contains duplicates: {self.camera_order}")
@@ -67,6 +63,7 @@ class FourCameraMcapRecorder:
         self.writer = None
         self.frame_channel_id = None
         self.control_channel_id = None
+        self.event_channel_id = None
         self.item_id = -1
         self.current_path = None
 
@@ -133,6 +130,14 @@ class FourCameraMcapRecorder:
             self.control_channel_id = self.writer.register_channel(
                 topic="/r1arm/control_sample", message_encoding="json", schema_id=control_schema_id
             )
+            event_schema_id = self.writer.register_schema(
+                name="r1arm.record_event",
+                encoding="jsonschema",
+                data=json.dumps({"type": "object"}, ensure_ascii=False).encode("utf-8"),
+            )
+            self.event_channel_id = self.writer.register_channel(
+                topic="/r1arm/record_event", message_encoding="json", schema_id=event_schema_id
+            )
 
         timestamp_ns = time.time_ns()
         meta = {
@@ -146,6 +151,12 @@ class FourCameraMcapRecorder:
                     "control_sample_semantics": "one complete controller snapshot per control_seq; record_segment separates pause/resume intervals",
                 } if self.control_frequency is not None else {}),
                 "camera_order": list(self.camera_order),
+                "clock_contract": {
+                    "sample_time_ns": "host wall clock ns",
+                    "monotonic_time_ns": "host monotonic ns; only comparable within this process boot",
+                    "camera_received_time_ns": "host wall clock at frame receive/decode; not exposure time",
+                    "camera_device_timestamp_ms": "device clock when backend exposes one; not mapped to host clock",
+                },
                 "camera_positions": [
                     name.removeprefix("color_").split("_", 1)[-1]
                     for name in self.camera_order
@@ -184,6 +195,11 @@ class FourCameraMcapRecorder:
         sample_time_ns: int | None = None,
         camera_frame_times_ns: dict[str, int] | None = None,
         control_seq: int | None = None,
+        camera_frame_ids: dict[str, int] | None = None,
+        camera_frame_times_monotonic_ns: dict[str, int] | None = None,
+        camera_device_timestamps_ms: dict[str, float | None] | None = None,
+        record_segment: int = 0,
+        episode_id: int | None = None,
     ) -> None:
         """Append one sample. ``frames`` must follow ``self.camera_order``.
 
@@ -209,9 +225,22 @@ class FourCameraMcapRecorder:
             "sample_time_ns": timestamp_ns,
             "image_source_frame_id": int(image_source_frame_id),
             "control_seq": None if control_seq is None else int(control_seq),
+            "record_segment": int(record_segment),
+            "episode_id": None if episode_id is None else int(episode_id),
+            "camera_frame_ids": ({str(k): int(v) for k, v in camera_frame_ids.items()}
+                                  if camera_frame_ids else {}),
             "camera_frame_times_ns": (
                 {str(k): int(v) for k, v in camera_frame_times_ns.items()}
                 if camera_frame_times_ns else {}
+            ),
+            "camera_frame_times_monotonic_ns": (
+                {str(k): int(v) for k, v in camera_frame_times_monotonic_ns.items()}
+                if camera_frame_times_monotonic_ns else {}
+            ),
+            "camera_device_timestamps_ms": (
+                {str(k): (None if v is None else float(v))
+                 for k, v in camera_device_timestamps_ms.items()}
+                if camera_device_timestamps_ms else {}
             ),
             "colors": colors,
             "states": states,
@@ -224,12 +253,33 @@ class FourCameraMcapRecorder:
             data=json.dumps(message, ensure_ascii=False).encode("utf-8"),
         )
 
-    def add_control_sample(self, sample: dict, record_segment: int = 0) -> None:
+    def add_event(self, event: dict) -> None:
+        """Persist recorder lifecycle events on their own MCAP topic."""
+        if self.writer is None or self.event_channel_id is None:
+            return
+        message = dict(event)
+        timestamp_ns = int(message.get("time_ns", time.time_ns()))
+        message.setdefault("time_ns", timestamp_ns)
+        self.writer.add_message(
+            channel_id=self.event_channel_id,
+            log_time=timestamp_ns,
+            publish_time=timestamp_ns,
+            data=json.dumps(message, ensure_ascii=False).encode("utf-8"),
+        )
+
+    def add_control_sample(
+        self, sample: dict, record_segment: int = 0, episode_id: int | None = None,
+        record_generation: int | None = None,
+    ) -> None:
         """Append one complete high-rate controller snapshot, without an image."""
         if self.writer is None or self.control_channel_id is None:
             return
         message = dict(sample)
         message["record_segment"] = int(record_segment)
+        if episode_id is not None:
+            message["episode_id"] = int(episode_id)
+        if record_generation is not None:
+            message["record_generation"] = int(record_generation)
         timestamp_ns = int(message["control_time_ns"])
         self.writer.add_message(
             channel_id=self.control_channel_id,
@@ -252,6 +302,7 @@ class FourCameraMcapRecorder:
             self.file_handle = None
         self.frame_channel_id = None
         self.control_channel_id = None
+        self.event_channel_id = None
 
     def delete_last_episode(self):
         """Delete the latest closed episode and return its ``(id, path)``.

@@ -45,12 +45,12 @@ ARM_SAFE_LIMITS = {
 # 伸展到前方、肘略弯的可用初值（落在各关节限位内）
 ARM_INIT = np.array([0.0, 1.2, 0.0, -1.2, 0.0, 0.0, 0.0], dtype=float)
 
-# Dex1 仿真关节（与 A7 / robot.config 一致）：upper=开，lower=关
+# Dex1 simulation joints: upper=open, lower=closed.
 DEX1_SIM_OPEN = 0.0245
 DEX1_SIM_CLOSE = -0.02
 DEX1_SIM_SPEED = 0.08
 DEX1_TRIGGER_DEADBAND = 0.05
-# 真机 Dex1 电机量程（与 robot.eef.dex1 / config 一致）
+# Real Dex1 motor range.
 DEX1_REAL_OPEN = 5.0
 DEX1_REAL_CLOSE = 0.0
 
@@ -93,21 +93,18 @@ class R1ArmConfig:
     # A 键回 home：最短名义持续帧数（实际到位时间由速度/加速度限制决定）
     reset_blend_frames: int = 8
     # 轨迹状态机速度上限，单位 rad/s；None = 不额外限速。
-    # 〔2026-10-09 30Hz 定居〕全链 30Hz（XR帧时钟1:1 + IK + 执行 + 录制），
-    # action 与 state 同拍统一。速度 1.0：1.5 曾激发停住瞬态振荡（能量×2.25
-    # 且 30Hz 阶梯更粗），先以 1.0 为 30Hz 基线，跟踪灵敏度经底层参数
-    # （kd/FF）调优后再评估提速。
+    # Real teleop baseline: 90 Hz control with separately sampled 30 Hz observations.
     trajectory_max_speed_rad_s: float | None = 1.0
     # 独立 q_cmd/v_cmd/a_cmd 状态机加速度上限，单位 rad/s²。
     ik_max_acc_per_s2: float = 6.0
     # 独立轨迹状态机 jerk 上限，单位 rad/s³。
     ik_max_jerk_per_s3: float = 80.0
     # a_desired = position_gain * position_error - velocity_gain * velocity.
-    trajectory_position_gain: float = 16.0
-    trajectory_velocity_gain: float = 8.0
+    trajectory_position_gain: float = 64.0
+    trajectory_velocity_gain: float = 16.0
     # One-Euro XR pose filter, updated only when XR frame stamp advances.
-    xr_filter_min_cutoff: float = 2.0
-    xr_filter_beta: float = 0.15
+    xr_filter_min_cutoff: float = 8.0
+    xr_filter_beta: float = 1.0
     # Placo 内附加速度限制关闭；动态速度/加速度只由轨迹状态机负责。
     # 逐关节覆盖：ik_joint_velocity_limits = {"J5": 0.8, ...}（未列关节用默认）。
     ik_qp_velocity_limit: float | None = None

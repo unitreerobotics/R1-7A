@@ -1,7 +1,7 @@
 """R1Arm MuJoCo dataset helpers using the simulator's compact action space.
 
-The MCAP container, camera observations and state/action semantics follow the
-R1-A7 recorder. The vector itself contains only joints controlled by R1Arm:
+The MCAP container and camera keys retain the established episode schema. The
+vector itself contains only joints controlled by R1Arm:
 
 * single arm: arm(7) + one logical Dex1 gripper DoF = 8
 * dual arm: right(7) + right gripper(1) + left(7) + left gripper(1) = 16
@@ -45,7 +45,7 @@ class _ViewSpec:
 
 
 class R1ArmObservationRenderer:
-    """Render four synchronized MuJoCo views in R1-A7 camera-key order."""
+    """Render synchronized MuJoCo views under the stable MCAP camera keys."""
 
     CAMERA_ORDER = FourCameraMcapRecorder.CAMERA_ORDER
 
@@ -206,10 +206,6 @@ class R1ArmDatasetAdapter:
         if not self.dual_arm:
             return self._expand_side(compact)
         return np.hstack([self._expand_side(compact[:8]), self._expand_side(compact[8:16])])
-
-
-# Backward-compatible import name for code written against the first draft.
-R1ArmR1A7Adapter = R1ArmDatasetAdapter
 
 
 def validate_r1arm_frame(

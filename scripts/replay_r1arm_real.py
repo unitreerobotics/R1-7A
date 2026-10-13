@@ -40,7 +40,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from mcap.reader import make_reader
 
 from robot.eef.dex1_single import Dex1Single
-from robot.r1arm_config import ARM_JOINTS, DEFAULT_URDF_PATH, sim_to_closed_ratio
+from robot.r1arm_config import (
+    ARM_JOINTS, DEFAULT_URDF_PATH, DEX1_SIM_CLOSE, DEX1_SIM_OPEN, sim_to_closed_ratio,
+)
 from robot.arm_model import load_robot_model
 from robot.r1arm_sdk import (
     DEFAULT_BRIDGE_LIBRARY,
@@ -81,7 +83,7 @@ def resolve_episode(target: Path) -> Path:
 
 
 def load_episode_states(
-    path: Path, section_mode: str = "state"
+    path: Path, section_mode: str = "state", data_source: str = "auto"
 ) -> tuple[list[np.ndarray], list[dict], dict, dict]:
     """Return ordered 8-DoF vectors (arm 7 + gripper 1), raw frames, metadata.
 
@@ -89,18 +91,70 @@ def load_episode_states(
     ``"action"`` prefers the shaped ``actions.q_purpose`` trajectory.
     """
     frames: list[dict] = []
+    control_samples: list[dict] = []
     info: dict = {}
     config: dict = {}
     with path.open("rb") as stream:
         for _, channel, message in make_reader(stream).iter_messages():
-            if channel.topic not in ("/episode/meta", "/whole_body/frame"):
+            if channel.topic not in (
+                "/episode/meta", "/whole_body/frame", "/r1arm/control_sample"
+            ):
                 continue
             payload = json.loads(message.data.decode("utf-8"))
             if channel.topic == "/episode/meta":
                 info = payload.get("info", {})
                 config = payload.get("config", {})
-            else:
+            elif channel.topic == "/whole_body/frame":
                 frames.append(payload)
+            else:
+                control_samples.append(payload)
+    if data_source not in {"auto", "frame", "control"}:
+        raise SystemExit(f"Unknown replay data source: {data_source}")
+    selected_source = (
+        "control" if data_source == "auto" and control_samples else
+        "frame" if data_source == "auto" else data_source
+    )
+    if selected_source == "control":
+        if not control_samples:
+            raise SystemExit("MCAP has no /r1arm/control_sample trajectory")
+        frames = []
+        for payload in sorted(control_samples, key=lambda item: int(item.get("control_seq", 0))):
+            q_action = np.asarray(payload.get("q_purpose", []), dtype=float).reshape(-1)
+            q_state = np.asarray(payload.get("q_measured", []), dtype=float).reshape(-1)
+            if q_action.size < JOINT_COUNT or q_state.size < JOINT_COUNT:
+                continue
+            command_ratio = payload.get("dex1_command_open_ratio")
+            state_ratio = payload.get("dex1_state_open_ratio")
+            if command_ratio is None:
+                command_ratio = 1.0
+            if state_ratio is None or not payload.get("dex1_state_valid", False):
+                state_ratio = command_ratio
+            to_sim = lambda ratio: DEX1_SIM_CLOSE + float(np.clip(ratio, 0.0, 1.0)) * (
+                DEX1_SIM_OPEN - DEX1_SIM_CLOSE
+            )
+            actions = dict(payload)
+            actions["q_purpose"] = np.r_[q_action[:JOINT_COUNT], to_sim(command_ratio)].tolist()
+            states = {
+                "joint_state": np.r_[q_state[:JOINT_COUNT], to_sim(state_ratio)].tolist(),
+                "dq": payload.get("dq_measured", []),
+                "tau_est": payload.get("tau_est", []),
+                "control_seq": payload.get("control_seq"),
+                "feedback_time_ns": payload.get("feedback_time_ns"),
+            }
+            frames.append({
+                "idx": int(payload.get("control_seq", len(frames))),
+                "sample_time_ns": int(payload.get("control_time_ns", 0)),
+                "record_segment": int(payload.get("record_segment", 0)),
+                "episode_id": payload.get("episode_id"),
+                "states": states,
+                "actions": actions,
+            })
+        if not frames:
+            raise SystemExit("MCAP control topic contains no complete 7-joint samples")
+        info = dict(info)
+        info["frequency_hz"] = info.get("control_frequency_hz", info.get("frequency_hz", 30.0))
+    info = dict(info)
+    info["replay_data_source"] = selected_source
     if not frames:
         raise SystemExit("MCAP contains no /whole_body/frame messages")
     frames.sort(key=lambda item: int(item.get("idx", 0)))
@@ -167,6 +221,7 @@ def reshape_raw_ik_trajectory(
     frames: list[dict], start_q: np.ndarray, intervals: np.ndarray, *,
     speed_limit: float, acceleration_limit: float, jerk_limit: float,
     position_gain: float, velocity_gain: float, rate_hz: float,
+    segment_ids: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run recorded raw IK targets through the production q/v/a shaper."""
     raw_targets = []
@@ -206,7 +261,11 @@ def reshape_raw_ik_trajectory(
             q_desired = controller.q.copy()
             for idx, value in zip(controller.arm_q_indices, raw_targets[i]):
                 q_desired[idx] = value
-            dt = float(intervals[i]) if intervals[i] > 0 else 1.0 / max(rate_hz, 1.0)
+            segment_boundary = segment_ids is not None and segment_ids[i] != segment_ids[i - 1]
+            dt = (
+                1.0 / max(rate_hz, 1.0) if segment_boundary else
+                float(intervals[i]) if intervals[i] > 0 else 1.0 / max(rate_hz, 1.0)
+            )
             controller.q = controller._trajectory_step(side, controller.q, q_desired, dt)
             q_cmd, v_cmd, _ = controller._trajectory_state(side, controller.q)
             shaped[i] = q_cmd
@@ -218,7 +277,9 @@ def reshape_raw_ik_trajectory(
 
 def interp_trajectory(arm_traj: np.ndarray, gripper_traj: np.ndarray,
                        intervals: np.ndarray, control_hz: float,
-                       speed: float = 1.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                       speed: float = 1.0,
+                       segment_ids: np.ndarray | None = None
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Resample a paced trajectory onto a control-rate grid with interpolation.
 
     Within each recorded segment the trajectory is linear in time, so commands
@@ -250,6 +311,14 @@ def interp_trajectory(arm_traj: np.ndarray, gripper_traj: np.ndarray,
         g_a, g_b = float(gripper_traj[i]), float(gripper_traj[i + 1])
         seg_start = t_cursor
         seg_end = seg_start + seg_t
+        if segment_ids is not None and segment_ids[i] != segment_ids[i + 1]:
+            # Pause/resume is a discontinuity: wait while refreshing the hold,
+            # then command the next recorded point without synthetic blending.
+            out_arm.append(q_b.copy())
+            out_grip.append(g_b)
+            out_gaps.append(seg_t)
+            t_cursor = seg_end
+            continue
         # interior commands at the uniform control tick; stop when within half
         # a tick of the segment end (the exact endpoint follows immediately —
         # a duplicate micro-step buys nothing)
@@ -327,9 +396,10 @@ def enable_foc_hold(
     tau_fn=None,
 ):
     deadline = time.monotonic() + timeout
+    zero_dq = np.zeros(JOINT_COUNT, dtype=float)
     while time.monotonic() < deadline:
         tau = tau_fn(command_sdk) if tau_fn is not None else None
-        bus.command_position(command_sdk, kp, kd, tau=tau)
+        _command_position_v3(bus, command_sdk, zero_dq, kp, kd, tau)
         time.sleep(1.0 / rate)
         state = bus.read_state()
         check_feedback_range(state)
@@ -339,6 +409,11 @@ def enable_foc_hold(
     state = bus.read_state()
     stopped = np.flatnonzero(state.mode != 1).tolist()
     raise TimeoutError(f"Joints did not enter FOC within {timeout:.1f}s: {stopped}")
+
+
+def _command_position_v3(bus, q, dq, kp, kd, tau=None) -> None:
+    """Keep every replay position command on the same q/dq SDK path."""
+    bus.command_position(q, kp, kd, tau=tau, dq=dq)
 
 
 def gravity_feedforward(model_pin, data_pin, q_arm: np.ndarray, clip: float) -> np.ndarray:
@@ -398,7 +473,9 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
 
 def run(args: argparse.Namespace, calibration: Path) -> None:
     episode = resolve_episode(Path(args.episode))
-    states, frames, info, config = load_episode_states(episode, args.section)
+    states, frames, info, config = load_episode_states(
+        episode, args.section, data_source=args.data_source
+    )
 
     state_dim = int(config.get("state_dim", 8))
     if state_dim != 8:
@@ -412,6 +489,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         raise SystemExit("Selected frame range is empty")
     states = states[start:end]
     frames = frames[start:end]
+    segment_ids = np.asarray([int(frame.get("record_segment", 0)) for frame in frames])
     arm_traj = np.array([s[:JOINT_COUNT] for s in states], dtype=float)
     gripper_traj = np.array([s[JOINT_COUNT] for s in states], dtype=float)
 
@@ -423,12 +501,12 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     shaper_position_gain = float(
         args.trajectory_position_gain
         if args.trajectory_position_gain is not None
-        else config.get("trajectory_position_gain", 16.0)
+        else config.get("trajectory_position_gain", 64.0)
     )
     shaper_velocity_gain = float(
         args.trajectory_velocity_gain
         if args.trajectory_velocity_gain is not None
-        else config.get("trajectory_velocity_gain", 8.0)
+        else config.get("trajectory_velocity_gain", 16.0)
     )
     if args.reshape_raw_ik:
         if args.section != "action":
@@ -449,6 +527,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
             position_gain=shaper_position_gain,
             velocity_gain=shaper_velocity_gain,
             rate_hz=freq,
+            segment_ids=segment_ids,
         )
         print(
             f"[Replay] re-shaped fixed q_ik_raw trace: kp={shaper_position_gain:g}, "
@@ -469,7 +548,8 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         control_hz = float(args.control_hz)
         n_before = len(arm_traj)
         arm_traj, gripper_traj, intervals = interp_trajectory(
-            arm_traj, gripper_traj, intervals, control_hz, speed=float(args.speed)
+            arm_traj, gripper_traj, intervals, control_hz,
+            speed=float(args.speed), segment_ids=segment_ids,
         )
         # play_delta is per control cycle now
         freq = control_hz * float(args.speed)
@@ -530,6 +610,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     use_ff = args.gravity_ff if args.gravity_ff is not None else bool(
         config.get("teleop_gravity_ff", True))
     print(f"[Replay] episode    = {episode}")
+    print(f"[Replay] data source= {info.get('replay_data_source', args.data_source)}")
     print(f"[Replay] section    = {args.section} "
           f"({'measured poses (gravity sag included)' if args.section == 'state' else 'teleop commands (sag-free)'})")
     print(f"[Replay] frames     = {len(arm_traj)} (recorded range {start}..{end - 1})")
@@ -546,6 +627,8 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
           f"; replay shaping = {shaping_summary}")
     print(f"[Replay] pacing     = {'recorded sample_time_ns' if paced else 'uniform frame interval'}"
           f" (gap cap {args.max_frame_gap:g}s)")
+    print(f"[Replay] command path= SDK v3 q+dq for all position phases; absolute deadlines, "
+          f"intersample refresh ≤{freq:.1f} Hz")
     print(f"[Replay] start state= {np.array2string(arm_traj[0], precision=4)}")
     print(f"[Replay] end   state= {np.array2string(arm_traj[-1], precision=4)}")
     print(f"[Replay] gripper   = start {gripper_traj[0]:+.4f} -> end {gripper_traj[-1]:+.4f} "
@@ -590,12 +673,14 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     telemetry_path.parent.mkdir(parents=True, exist_ok=True)
     telemetry_stream = telemetry_path.open("x", newline="", encoding="utf-8")
     telemetry_fields = [
-        "frame_index", "source_frame_idx", "sample_time_ns", "feedback_time_ns",
+        "phase", "frame_index", "source_frame_idx", "sample_time_ns", "feedback_time_ns",
+        "feedback_read_start_ns", "feedback_read_end_ns",
+        "feedback_read_start_monotonic_ns", "feedback_read_end_monotonic_ns",
         "command_time_ns", "command_dt_s", "kp", "kd", "gravity_ff",
         "trajectory_position_gain", "trajectory_velocity_gain",
         "trajectory_max_speed_rad_s", "q_ik_raw_rad",
         "max_joint_speed_rad_s", "max_command_lead_rad", "replay_speed",
-        "control_seq", "q_purpose_rad", "dq_purpose_rad_s", "q_motor_target_rad",
+        "control_seq", "record_segment", "q_purpose_rad", "dq_purpose_rad_s", "q_motor_target_rad",
         "dq_target_rad_s", "sdk_limiter_delta_rad", "q_measured_rad",
         "dq_measured_rad_s", "tau_est_nm", "purpose_tracking_error_rad",
         "motor_tracking_error_rad",
@@ -637,8 +722,6 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         # inherited the play slew cap. It gets its own conservative speed, and
         # never inherits an aggressive play cap.
         approach_speed = min(args.approach_speed, max_joint_speed)
-        approach_delta = approach_speed / args.rate
-        play_delta = max_joint_speed / freq
         if approach_speed < args.approach_speed:
             print(
                 f"  approach speed {approach_speed:.2f} rad/s (clamped to the "
@@ -651,20 +734,53 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
             target_sdk = model_to_sdk_q(target_model)
             deadline = time.monotonic() + args.approach_timeout
             last_model = None
+            last_tick = time.monotonic()
             while time.monotonic() < deadline:
+                tick_now = time.monotonic()
+                approach_dt = float(np.clip(tick_now - last_tick, 1e-4, 0.1))
+                last_tick = tick_now
                 st = bus.read_state()
                 last_model = check_feedback_range(st)
                 check_faults(st, require_foc=True)
                 cmd = limit_sdk_position_command(
                     target_sdk, command_sdk, st.q,
-                    max_delta=approach_delta, max_lead=args.max_command_lead,
+                    max_delta=approach_speed * approach_dt,
+                    max_lead=args.max_command_lead,
                 )
-                bus.command_position(cmd, args.kp, args.kd, tau=tau_ff(cmd))
+                command_mono = time.monotonic()
+                command_dt = approach_dt
+                dq_target_sdk = (cmd - command_sdk) / command_dt
+                _command_position_v3(bus, cmd, dq_target_sdk, args.kp, args.kd, tau_ff(cmd))
+                command_time_ns = time.time_ns()
+                measured = sdk_to_model_q(st.q)
+                target = np.asarray(target_model, dtype=float)
+                telemetry.writerow({
+                    "phase": f"approach_{label}", "frame_index": "",
+                    "source_frame_idx": "", "sample_time_ns": "",
+                    "feedback_time_ns": command_time_ns,
+                    "command_time_ns": command_time_ns, "command_dt_s": command_dt,
+                    "kp": format_gain(args.kp), "kd": format_gain(args.kd),
+                    "gravity_ff": int(use_ff), "max_joint_speed_rad_s": max_joint_speed,
+                    "max_command_lead_rad": args.max_command_lead,
+                    "replay_speed": args.speed,
+                    "q_purpose_rad": json.dumps(target.tolist()),
+                    "q_motor_target_rad": json.dumps(sdk_to_model_q(cmd).tolist()),
+                    "dq_target_rad_s": json.dumps(sdk_to_model_q(dq_target_sdk).tolist()),
+                    "q_measured_rad": json.dumps(measured.tolist()),
+                    "purpose_tracking_error_rad": json.dumps((target - measured).tolist()),
+                    "motor_tracking_error_rad": json.dumps((sdk_to_model_q(cmd) - measured).tolist()),
+                })
+                telemetry_stream.flush()
                 command_sdk = cmd
+                last_tick = command_mono
                 if np.max(np.abs(last_model - target_model)) < args.approach_tol:
-                    break
+                    return last_model
                 time.sleep(1.0 / args.rate)
-            return last_model
+            err = float(np.max(np.abs(last_model - target_model))) if last_model is not None else float("inf")
+            raise TimeoutError(
+                f"Replay approach to {label} failed after {args.approach_timeout:.1f}s; "
+                f"max joint error={err:.3f} rad (tolerance {args.approach_tol:.3f})"
+            )
 
         print(f"Approaching first recorded state ({np.array2string(arm_traj[0], precision=3)})...")
         model_q = approach(arm_traj[0], "start")
@@ -678,18 +794,23 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
             tick_origin = time.monotonic()
             for i, model_target in enumerate(arm_traj):
                 target_sdk = model_to_sdk_q(model_target)
+                feedback_read_start_ns = time.time_ns()
+                feedback_read_start_mono = time.monotonic_ns()
                 st = bus.read_state()
-                feedback_time_ns = time.time_ns()
+                feedback_read_end_ns = time.time_ns()
+                feedback_read_end_mono = time.monotonic_ns()
+                feedback_time_ns = feedback_read_end_ns
                 model_q = check_feedback_range(st)
                 check_faults(st, require_foc=True)
-                cmd = limit_sdk_position_command(
-                    target_sdk, command_sdk, st.q,
-                    max_delta=play_delta, max_lead=args.max_command_lead,
-                )
                 command_mono = time.monotonic()
                 command_dt = float(np.clip(command_mono - last_command_mono, 1e-4, 0.1))
+                cmd = limit_sdk_position_command(
+                    target_sdk, command_sdk, st.q,
+                    max_delta=max_joint_speed * command_dt,
+                    max_lead=args.max_command_lead,
+                )
                 dq_target_sdk = (cmd - command_sdk) / command_dt
-                bus.command_position(cmd, args.kp, args.kd, tau=tau_ff(cmd), dq=dq_target_sdk)
+                _command_position_v3(bus, cmd, dq_target_sdk, args.kp, args.kd, tau_ff(cmd))
                 command_time_ns = time.time_ns()
                 measured_model_q = sdk_to_model_q(st.q)
                 measured_model_dq = sdk_to_model_q(st.dq)
@@ -697,10 +818,15 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 dq_target_model = sdk_to_model_q(dq_target_sdk)
                 source_frame = frames[i] if control_hz <= 0.0 and i < len(frames) else {}
                 telemetry.writerow({
+                    "phase": "playback",
                     "frame_index": i,
                     "source_frame_idx": source_frame.get("idx", ""),
                     "sample_time_ns": source_frame.get("sample_time_ns", ""),
                     "feedback_time_ns": feedback_time_ns,
+                    "feedback_read_start_ns": feedback_read_start_ns,
+                    "feedback_read_end_ns": feedback_read_end_ns,
+                    "feedback_read_start_monotonic_ns": feedback_read_start_mono,
+                    "feedback_read_end_monotonic_ns": feedback_read_end_mono,
                     "command_time_ns": command_time_ns,
                     "command_dt_s": command_dt,
                     "kp": format_gain(args.kp), "kd": format_gain(args.kd),
@@ -714,6 +840,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                     "max_command_lead_rad": args.max_command_lead,
                     "replay_speed": args.speed,
                     "control_seq": source_frame.get("actions", {}).get("control_seq", ""),
+                    "record_segment": source_frame.get("record_segment", ""),
                     "q_purpose_rad": json.dumps(model_target.tolist()),
                     "dq_purpose_rad_s": json.dumps(
                         reshaped_velocity[i].tolist() if reshaped_velocity is not None
@@ -748,7 +875,26 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 else:
                     remaining = 0.0
                 if remaining > 0:
-                    time.sleep(remaining)
+                    hold_tick = 1.0 / max(freq, 1.0)
+                    hold_deadline = target_time
+                    next_hold_time = time.monotonic() + hold_tick
+                    while time.monotonic() < hold_deadline:
+                        sleep_s = next_hold_time - time.monotonic()
+                        if sleep_s > 0:
+                            time.sleep(min(sleep_s, max(0.0, hold_deadline - time.monotonic())))
+                        if time.monotonic() >= hold_deadline:
+                            break
+                        hold_state = bus.read_state()
+                        check_feedback_range(hold_state)
+                        check_faults(hold_state, require_foc=True)
+                        _command_position_v3(
+                            bus, command_sdk, np.zeros(JOINT_COUNT), args.kp, args.kd,
+                            tau_ff(command_sdk),
+                        )
+                        next_hold_time += hold_tick
+                        # Do not send catch-up bursts if feedback/serial work overran a tick.
+                        if next_hold_time <= time.monotonic():
+                            next_hold_time = time.monotonic() + hold_tick
             # ② Converge onto the final recorded state (the play loop's last
             # command may lag it after fast segments) before holding it.
             print("Converging onto the final recorded state...")
@@ -763,10 +909,40 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         print(f"Holding last pose for {args.hold_time:.1f}s...")
         hold_until = time.monotonic() + args.hold_time
         while time.monotonic() < hold_until:
+            feedback_read_start_ns = time.time_ns()
+            feedback_read_start_mono = time.monotonic_ns()
             st = bus.read_state()
+            feedback_read_end_ns = time.time_ns()
+            feedback_read_end_mono = time.monotonic_ns()
             check_feedback_range(st)
             check_faults(st, require_foc=True)
-            bus.command_position(command_sdk, args.kp, args.kd, tau=tau_ff(command_sdk))
+            _command_position_v3(
+                bus, command_sdk, np.zeros(JOINT_COUNT), args.kp, args.kd,
+                tau_ff(command_sdk),
+            )
+            measured = sdk_to_model_q(st.q)
+            target = np.asarray(arm_traj[-1], dtype=float)
+            motor_target = sdk_to_model_q(command_sdk)
+            telemetry.writerow({
+                "phase": "hold", "frame_index": "", "source_frame_idx": "",
+                "sample_time_ns": "", "feedback_time_ns": feedback_read_end_ns,
+                "feedback_read_start_ns": feedback_read_start_ns,
+                "feedback_read_end_ns": feedback_read_end_ns,
+                "feedback_read_start_monotonic_ns": feedback_read_start_mono,
+                "feedback_read_end_monotonic_ns": feedback_read_end_mono,
+                "command_time_ns": time.time_ns(), "kp": format_gain(args.kp),
+                "kd": format_gain(args.kd), "gravity_ff": int(use_ff),
+                "max_joint_speed_rad_s": max_joint_speed,
+                "max_command_lead_rad": args.max_command_lead,
+                "replay_speed": args.speed,
+                "record_segment": "",
+                "q_purpose_rad": json.dumps(target.tolist()),
+                "q_motor_target_rad": json.dumps(motor_target.tolist()),
+                "q_measured_rad": json.dumps(measured.tolist()),
+                "purpose_tracking_error_rad": json.dumps((target - measured).tolist()),
+                "motor_tracking_error_rad": json.dumps((motor_target - measured).tolist()),
+            })
+            telemetry_stream.flush()
             time.sleep(1.0 / args.rate)
         print("[Replay] finished; releasing arm")
     except KeyboardInterrupt:
@@ -792,6 +968,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--episode",
         required=True,
         help="Path to an episode_XXXX.mcap file, or a directory (uses the latest episode)",
+    )
+    parser.add_argument(
+        "--data-source", choices=("auto", "control", "frame"), default="auto",
+        help="trajectory topic: auto prefers full-rate /r1arm/control_sample, then low-rate frames",
     )
     parser.add_argument(
         "--section",
@@ -823,18 +1003,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--motion-mode", action="store_true", help="Actually open and command the arm"
     )
-    parser.add_argument("--port", default="/dev/ttyUSB0")
+    parser.add_argument("--port", default="/dev/ttyUSB2")
     parser.add_argument("--baud", type=int, default=6_000_000)
     parser.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK_ROOT)
-    parser.add_argument("--calib", type=Path, help="joint_calib.txt path")
+    parser.add_argument("--calib", type=Path, help="joint calibration file")
     parser.add_argument("--bridge-lib", type=Path, default=DEFAULT_BRIDGE_LIBRARY)
-    parser.add_argument("--kp", type=parse_gain, default=80.0,
+    parser.add_argument("--kp", type=parse_gain, default=60.0,
                         help="位置环增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
-    parser.add_argument("--kd", type=parse_gain, default=2,
+    parser.add_argument("--kd", type=parse_gain, default=10.0,
                         help="阻尼增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
     parser.add_argument("--rate", type=float, default=30.0,
-                        help="control/approach loop Hz（30Hz episode 1:1 同拍回放；"
-                             "50Hz 录的旧 episode 建议显式传 50）")
+                        help="approach/final-hold refresh Hz; playback timing follows recorded "
+                             "timestamps unless --control-hz is set")
     parser.add_argument(
         "--control-hz", type=float, default=0.0,
         help="command rate for the play loop; 0 = replay at the recorded frame rate. "
@@ -849,10 +1029,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-joint-speed",
         type=float,
-        default=None,
-        help="rad/s command slew cap for playback; default for --section action is "
-        "the recorded teleop slew limit (teleop_max_joint_speed in episode meta), "
-        "for state it is recorded peak x 1.2 capped at --auto-speed-cap",
+        default=1.0,
+        help="rad/s command slew cap for playback (default 1.0)",
     )
     parser.add_argument(
         "--auto-speed-cap",
@@ -901,10 +1079,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--foc-timeout", type=float, default=1.0)
     parser.add_argument(
         "--enable-dex1",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Replay the Dex1 gripper (state index 7) through DDS as a closed ratio",
     )
-    parser.add_argument("--dex1-net", default="", help="DDS interface for the single Dex1")
+    parser.add_argument("--dex1-net", default="enp4s0", help="DDS interface for the single Dex1")
     parser.add_argument("--dex1-domain", type=int, default=0)
     parser.add_argument("--grip-torque-limit", type=float, default=-1.0)
     parser.add_argument("--approach-timeout", type=float, default=10.0)
@@ -945,7 +1124,7 @@ def main() -> None:
     if args.motion_mode and not Path(args.port).exists():
         raise SystemExit(f"serial port not found: {args.port}")
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

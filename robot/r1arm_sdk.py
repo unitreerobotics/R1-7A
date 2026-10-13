@@ -110,6 +110,9 @@ class R1ArmSdkState:
     timeout: np.ndarray
     error_code: np.ndarray
     ready: np.ndarray
+    feedback_count: np.ndarray | None = None
+    missed_response_count: np.ndarray | None = None
+    last_step_feedback: np.ndarray | None = None
 
 
 class R1ArmSdkBus:
@@ -191,6 +194,15 @@ class R1ArmSdkBus:
             *error_args,
         ]
         self._lib.r1arm_bridge_read_state.restype = ctypes.c_int
+        self._read_feedback_diagnostics = getattr(
+            self._lib, "r1arm_bridge_read_feedback_diagnostics", None
+        )
+        if self._read_feedback_diagnostics is not None:
+            self._read_feedback_diagnostics.argtypes = [
+                void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                u8_p, u8_p, *error_args,
+            ]
+            self._read_feedback_diagnostics.restype = ctypes.c_int
         self._lib.r1arm_bridge_stop.argtypes = [void_p, *error_args]
         self._lib.r1arm_bridge_stop.restype = ctypes.c_int
         self._lib.r1arm_bridge_close.argtypes = [void_p, *error_args]
@@ -307,6 +319,22 @@ class R1ArmSdkBus:
             error_code.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
             ready.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         )
+        feedback_count = missed_count = last_step_feedback = None
+        if self._read_feedback_diagnostics is not None:
+            feedback_count = np.empty(JOINT_COUNT, dtype=np.uint64)
+            missed_count = np.empty(JOINT_COUNT, dtype=np.uint64)
+            last_step_feedback = np.empty(JOINT_COUNT, dtype=np.uint8)
+            supported = np.zeros(1, dtype=np.uint8)
+            self._call(
+                self._read_feedback_diagnostics,
+                self._handle,
+                feedback_count.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                missed_count.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                last_step_feedback.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                supported.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            )
+            if not supported[0]:
+                feedback_count = missed_count = last_step_feedback = None
         return R1ArmSdkState(
             q=q.astype(float),
             dq=dq.astype(float),
@@ -315,6 +343,11 @@ class R1ArmSdkBus:
             timeout=timeout,
             error_code=error_code,
             ready=ready.astype(bool),
+            feedback_count=feedback_count,
+            missed_response_count=missed_count,
+            last_step_feedback=(
+                last_step_feedback.astype(bool) if last_step_feedback is not None else None
+            ),
         )
 
     def stop(self) -> None:

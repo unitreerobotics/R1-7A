@@ -1,10 +1,10 @@
 """R1 单臂 / 双臂 PICO 遥操核心（相对位姿跟踪 + IK + Dex1），输出无关。
 
-复用 A7 同款手柄相对跟踪语义：
+手柄相对跟踪语义：
 - 按住 grip 激活跟踪
 - 手柄 Δpos/Δrot → EE 目标（dex1_base_link）
 - Placo QP（失败则 DLS）求 7 关节角
-- trigger 驱动 Dex1（松开=开，按下=关），与 A7 GripperController 一致
+- trigger 驱动 Dex1（松开=开，按下=关）
 - A 键复位
 
 单臂：``control_side`` 指定左/右手柄。
@@ -203,6 +203,7 @@ class R1ArmTeleopControllerBase:
         self._control_sample_lock = threading.Lock()
         self._capture_control_samples = False
         self._captured_control_samples: deque[dict] = deque()
+        self._control_capture_high_watermark = 0
         self._last_ee_intent: dict[str, dict] = {}
         self._last_ik_raw: dict[str, np.ndarray] = {}
         self._last_ik_solver: dict[str, str] = {}
@@ -210,6 +211,9 @@ class R1ArmTeleopControllerBase:
         self._xr_last_stamp: int | None = None
         self._xr_pose_cache: dict | None = None
         self._xr_pose_raw: dict | None = None
+        self._xr_frame_seq = 0
+        self._xr_received_monotonic_ns = 0
+        self._xr_valid_last = False
         self._xr_filter_state: dict[str, dict] = {}
         self._xr_filter_last_stamp_ns: int | None = None
         self._xr_filter_dt: float = 1.0 / 30.0
@@ -422,11 +426,19 @@ class R1ArmTeleopControllerBase:
             self._control_sample = snapshot
             if self._capture_control_samples:
                 self._captured_control_samples.append(snapshot)
+                self._control_capture_high_watermark = max(
+                    self._control_capture_high_watermark, len(self._captured_control_samples)
+                )
 
     def start_control_sample_capture(self) -> None:
         with self._control_sample_lock:
             self._captured_control_samples.clear()
+            self._control_capture_high_watermark = 0
             self._capture_control_samples = True
+
+    def control_sample_capture_high_watermark(self) -> int:
+        with self._control_sample_lock:
+            return int(self._control_capture_high_watermark)
 
     def drain_control_sample_capture(self, *, stop: bool = False) -> tuple[list[dict], dict | None]:
         """Atomically drain captured cycles and return the matching latest snapshot."""
@@ -668,6 +680,9 @@ class R1ArmTeleopControllerBase:
         if self.mock_xr or self.xr_client is None:
             raw = make_mock_controller_poses(self.t)
             self._xr_pose_raw = {k: v.copy() for k, v in raw.items()}
+            self._xr_frame_seq += 1
+            self._xr_received_monotonic_ns = time.monotonic_ns()
+            self._xr_valid_last = True
             return self._filter_xr_poses(raw, time.monotonic_ns()), True
         # P2 修复：帧时钟感知。XR 服务端按自己的帧率（~30Hz）推送位姿，
         # 而控制环 50Hz 每拍都读——同一个位姿被重复消费 1~2 次且交替不
@@ -678,6 +693,7 @@ class R1ArmTeleopControllerBase:
         stamp = self.xr_client.get_frame_stamp_ns()
         if stamp is not None and stamp == self._xr_last_stamp:
             if self._xr_pose_cache is not None:
+                self._xr_valid_last = True
                 return self._xr_pose_cache, True
         try:
             controller_poses = {}
@@ -687,11 +703,15 @@ class R1ArmTeleopControllerBase:
                     controller_poses[name] = np.asarray(pose, dtype=float)[:7]
                 else:
                     if not self.allow_xr_fallback:
+                        self._xr_valid_last = False
                         if self.debug:
                             print(f"XR pose invalid: {name}; holding current command")
                         return {}, False
                     return make_mock_controller_poses(self.t), True
             self._xr_pose_raw = {k: v.copy() for k, v in controller_poses.items()}
+            self._xr_frame_seq += 1
+            self._xr_received_monotonic_ns = time.monotonic_ns()
+            self._xr_valid_last = True
             out = self._reject_xr_jumps(controller_poses)
             stamp_ns = int(stamp) if stamp is not None else time.monotonic_ns()
             out = self._filter_xr_poses(out, stamp_ns)
@@ -699,6 +719,7 @@ class R1ArmTeleopControllerBase:
             self._xr_last_stamp = stamp
             return out, True
         except Exception as e:
+            self._xr_valid_last = False
             if self.debug:
                 print(f"XR read error: {e}")
             if not self.allow_xr_fallback:

@@ -72,9 +72,7 @@ def main() -> None:
     parser.add_argument("--motion-mode", action="store_true", help="Actually open and command the arm")
     parser.add_argument(
         "--port",
-        default=os.environ.get(
-            "PORT", "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTANPO49-if02-port0"
-        ),
+        default=os.environ.get("PORT", "/dev/ttyUSB2"),
         help="R1Arm RS485 serial device",
     )
     parser.add_argument("--baud", type=int, default=6_000_000)
@@ -84,20 +82,20 @@ def main() -> None:
         default=DEFAULT_SDK_ROOT,
         help="Used to derive the default calibration path",
     )
-    parser.add_argument("--calib", type=Path, help="joint_calib.txt path")
+    parser.add_argument("--calib", type=Path, help="joint calibration file")
     parser.add_argument("--bridge-lib", type=Path, default=DEFAULT_BRIDGE_LIBRARY)
     parser.add_argument("--urdf", type=Path, help="Simulation/IK URDF (same model as the working sim)")
     parser.add_argument("--side", choices=["left", "right"], default="right")
     parser.add_argument("--scale-factor", type=float, default=1.0)
-    parser.add_argument("--rate", type=float, default=100.0,
-                        help="控制环 Hz。默认 100；XR 输入约 30Hz，录制图像频率单独配置")
-    parser.add_argument("--xr-filter-min-cutoff", type=float, default=2.0,
+    parser.add_argument("--rate", type=float, default=90.0,
+                        help="控制环 Hz。默认 90；XR 输入约 30Hz，图像采样频率单独配置")
+    parser.add_argument("--xr-filter-min-cutoff", type=float, default=8.0,
                         help="XR One-Euro pose filter minimum cutoff Hz")
-    parser.add_argument("--xr-filter-beta", type=float, default=0.15,
+    parser.add_argument("--xr-filter-beta", type=float, default=1.0,
                         help="XR One-Euro speed response; higher follows fast hand motion more")
-    parser.add_argument("--trajectory-position-gain", type=float, default=16.0,
+    parser.add_argument("--trajectory-position-gain", type=float, default=64.0,
                         help="Baseline q_purpose position-error response (s^-2)")
-    parser.add_argument("--trajectory-velocity-gain", type=float, default=8.0,
+    parser.add_argument("--trajectory-velocity-gain", type=float, default=16.0,
                         help="Baseline q_purpose velocity damping (s^-1)")
     parser.add_argument(
         "--ik-dt", type=float, default=0.0,
@@ -117,9 +115,9 @@ def main() -> None:
         "--tau-clip", type=float, default=8.0,
         help="重力前馈单关节力矩限幅 Nm（默认 8）",
     )
-    parser.add_argument("--kp", type=parse_gain, default=80.0,
+    parser.add_argument("--kp", type=parse_gain, default=60.0,
                         help="位置环增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
-    parser.add_argument("--kd", type=parse_gain, default=2,
+    parser.add_argument("--kd", type=parse_gain, default=10.0,
                         help="阻尼增益；单个数=全关节广播，或 7 个逗号分隔值=逐关节")
     parser.add_argument("--max-joint-speed", type=float, default=1.0,
                         help="SDK command speed limit (rad/s; default 1.0)")
@@ -135,14 +133,18 @@ def main() -> None:
     )
     parser.add_argument("--feedback-timeout", type=float, default=3.0)
     parser.add_argument("--foc-timeout", type=float, default=1.0)
-    parser.add_argument("--enable-dex1", action="store_true")
-    parser.add_argument("--dex1-net", default="", help="DDS interface for the one real Dex1")
+    parser.add_argument("--enable-dex1", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dex1-net", default="enp4s0", help="DDS interface for the one real Dex1")
     parser.add_argument("--dex1-domain", type=int, default=0)
     parser.add_argument("--grip-torque-limit", type=float, default=-1.0)
-    parser.add_argument("--enable-a-reset", action="store_true", help="Allow A to move toward ARM_INIT")
+    parser.add_argument(
+        "--enable-a-reset", action=argparse.BooleanOptionalAction, default=True,
+        help="Allow A to move toward ARM_INIT",
+    )
     parser.add_argument(
         "--home-on-start",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="After startup FOC hold, soft-blend to ARM_INIT before enabling tracking",
     )
     parser.add_argument(
@@ -195,7 +197,7 @@ def main() -> None:
             f"serial port not found: {args.port}; check /dev/serial/by-id and /dev/ttyUSB*"
         )
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

@@ -15,7 +15,7 @@ DEX1_MAX_RANGE = 5.0
 
 
 class Dex1Single:
-    """Publish only one Dex1 side instead of the R1-A7 dual-gripper pair."""
+    """Publish commands for the single Dex1 attached to an R1Arm."""
 
     def __init__(
         self,
