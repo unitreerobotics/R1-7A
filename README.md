@@ -21,6 +21,30 @@ python scripts/build_r1arm_sdk_bridge.py \
 
 成功时会生成 `build/r1arm_sdk_bridge/libr1arm_sdk_bridge.so`；脚本也可不带参数运行，默认使用上述 SDK 路径。若 CMake 或编译器报错，先检查 SDK 的 `include/`、`lib/` 文件以及本机 CMake/C++ 构建工具是否齐全。
 
+### R1Arm SDK 准备、编译与标定
+
+`r1arm_teleop` 和 `R1_arm_SDK_x86/r1_arm` ：前者包含遥操作程序，后者包含电机总线 SDK、低层诊断工具和关节标定文件。确认 SDK 路径后，可从项目 shell 编译 SDK 工具及其 vendored 电机库，再编译上面的 Python/C++ bridge：
+
+```bash
+export ARM=/home/ycb410/nt/R1_arm_SDK_x86/r1_arm
+cmake -S "$ARM" -B "$ARM/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$ARM/build" -j"$(nproc)"
+```
+
+构建产物应包括 `$ARM/bin/test_arm_lowlevel`、`$ARM/bin/calibrate_joints` 和 `$ARM/thirdparty/motor_controller/lib/libmotor_controller.so`。`source scripts/real_env.sh` 会设置 `ARM`、`PORT`、`CALIB`、`CANDIDATE`、`BIN` 及运行时库路径，并检查串口权限/SDK 工具是否存在；它不会替你编译，也不会打开串口。
+
+当前遥操作、录制和回放的程序默认使用 `$ARM/config/joint_calib_candidate.txt`；环境脚本中的 `$CALIB` 则指向 `$ARM/config/joint_calib.txt`，它们不是同一文件。实验时显式指定本次确认过的文件，避免不同终端或工具误用另一份：
+
+```bash
+printf 'ARM=%s\nPORT=%s\nCALIB=%s\nCANDIDATE=%s\n' "$ARM" "$PORT" "$CALIB" "$CANDIDATE"
+nl -ba "$CANDIDATE"                 # 应有 joint 0..6 的 dir / scale / offset
+"$BIN/calibrate_joints" --help      # 只查看选项，不连接硬件
+```
+
+标定文件描述 `q_urdf = dir × scale × q_motor + offset`。它与具体机械臂、编码器零位和装配方向相关；不要把另一台机器的文件、`joint_calib.txt` 或 factory backup 当作可互换配置，也不要仅为“检查”而重新 capture/覆盖标定。只有确认参考姿态、七轴方向和零位都正确且确需重标定时，才使用 `calibrate_joints`；该工具会连接电机并以零力矩 FOC 采样，操作时必须托住机械臂，并将结果先写入候选路径、复核后再决定是否替换。启动真机前仍应检查 7 轴反馈与模型姿态一致；`goto_r1arm_pose.py` 的启动探测会短暂发送零力矩命令，同样需要支撑机械臂。
+
+串口、SDK、bridge 和标定路径应指向同一套本机安装：当前已确认 R1Arm 是 FTDI `if02`（此机器 `/dev/ttyUSB2`），Dex1 是 `if00`（此机器 `/dev/ttyUSB0`）。端口号重排后优先用 `/dev/serial/by-id/`，并将实际设备传给 `--port`；`--calib` 则传给上述明确的候选标定文件。SDK 独立构建和标定说明见 [`R1_arm_SDK_x86/r1_arm/README.md`](../R1_arm_SDK_x86/r1_arm/README.md)。
+
 确认 R1Arm 和 Dex1 串口，避免两者选到同一个设备：
 
 ```bash
