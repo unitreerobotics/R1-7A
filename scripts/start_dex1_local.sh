@@ -1,63 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start the locally connected Unitree Dex1 serial-to-DDS service.
-# This script only starts Dex1; it does not open or command the R1Arm.
-
+# Start only the Dex1 serial-to-DDS service, never the R1Arm bus.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-DEX1_SERVICE_ROOT="${DEX1_SERVICE_ROOT:-/home/ycb410/nt/dex1/dex1_1_service}"
+DEX1_SERVICE_ROOT="${DEX1_SERVICE_ROOT:-${PROJECT_ROOT}/third_party/dex1_1_service}"
 DEX1_SERVER="${DEX1_SERVER:-${DEX1_SERVICE_ROOT}/bin/dex1_1_gripper_server}"
-DEX1_NETWORK="${DEX1_NETWORK:-enp4s0}"
-DEX1_PORT="${DEX1_PORT:-/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTANPO49-if00-port0}"
-DEX1_SDK_LIB="${DEX1_SDK_LIB:-/home/ycb410/nt/dex1/unitree_sdk2/thirdparty/lib/x86_64}"
+SDK2_ROOT="${UNITREE_SDK2_ROOT:-${DEX1_DEP_ROOT:-${PROJECT_ROOT}/third_party}/unitree_sdk2}"
+DEX1_SDK_LIB="${DEX1_SDK_LIB:-${SDK2_ROOT}/thirdparty/lib/$(uname -m)}"
 DEX1_SERVICE_LIB="${DEX1_SERVICE_LIB:-${DEX1_SERVICE_ROOT}/lib}"
 
 if [[ ! -x "$DEX1_SERVER" ]]; then
-    echo "Dex1 server not found or not executable: $DEX1_SERVER" >&2
-    echo "Build it first in: ${DEX1_SERVICE_ROOT}/build" >&2
+    echo "Dex1 server not built: $DEX1_SERVER" >&2
+    echo "Build third_party/dex1_1_service as described in README.md." >&2
     exit 1
 fi
-
-if [[ ! -e "$DEX1_PORT" ]]; then
-    echo "Dex1 serial port does not exist: $DEX1_PORT" >&2
-    echo "Available ports:" >&2
-    ls -l /dev/ttyUSB* 2>/dev/null || true
-    exit 1
-fi
-DEX1_PORT="$(readlink -f "$DEX1_PORT")"
-
-if ! ip link show "$DEX1_NETWORK" >/dev/null 2>&1; then
-    echo "DDS network interface does not exist: $DEX1_NETWORK" >&2
-    echo "Use 'ip -br addr' to check the interface name." >&2
-    exit 1
-fi
-
 if ! command -v conda >/dev/null 2>&1; then
-    echo "conda was not found in PATH." >&2
+    echo "conda was not found in PATH; initialize the Conda shell first." >&2
     exit 1
 fi
-
 CONDA_BASE="$(conda info --base)"
-# Load conda's shell functions, then use the environment containing the newer
-# libstdc++ required by libUnitreeMotorSDK_Linux64.so.
-# shellcheck disable=SC1091
 set +u
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate "${DEX1_CONDA_ENV:-r1_teleop}"
 set -u
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${DEX1_SERVICE_LIB}:${DEX1_SDK_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${DEX1_SDK_LIB}:${DEX1_SERVICE_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-
-echo "Starting local Dex1 service"
-echo "  server  : $DEX1_SERVER"
-echo "  network : $DEX1_NETWORK"
-echo "  port    : $DEX1_PORT"
-echo "  project : $PROJECT_ROOT"
-echo "Press Ctrl+C to stop Dex1 service."
-
-exec sudo env "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" \
-    "$DEX1_SERVER" \
-    --network "$DEX1_NETWORK" \
-    --port "$DEX1_PORT" \
-    "$@"
+# Help must not require a connected gripper or initialize DDS.
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    exec "$DEX1_SERVER" --help
+fi
+: "${DEX1_NETWORK:?Set DEX1_NETWORK to the DDS interface shown by ip -br addr}"
+: "${DEX1_PORT:?Set DEX1_PORT to the gripper serial device shown in /dev/serial/by-id}"
+if [[ ! -e "$DEX1_PORT" || ! -r "$DEX1_PORT" || ! -w "$DEX1_PORT" ]]; then
+    echo "Dex1 serial port is missing or inaccessible: $DEX1_PORT" >&2
+    echo 'Check the device and dialout membership; log in again after adding the group.' >&2
+    exit 1
+fi
+if ! ip link show "$DEX1_NETWORK" >/dev/null 2>&1; then
+    echo "DDS interface does not exist: $DEX1_NETWORK; check ip -br addr." >&2
+    exit 1
+fi
+DEX1_PORT="$(readlink -f "$DEX1_PORT")"
+echo "Starting Dex1: server=$DEX1_SERVER network=$DEX1_NETWORK port=$DEX1_PORT"
+echo "Press Ctrl+C to stop."
+exec "$DEX1_SERVER" --network "$DEX1_NETWORK" --port "$DEX1_PORT" "$@"

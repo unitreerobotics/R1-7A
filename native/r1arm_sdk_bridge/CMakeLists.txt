@@ -5,7 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(R1ARM_SDK_ROOT_DEFAULT "/home/ycb410/nt/R1_arm_SDK_x86/r1_arm")
+get_filename_component(R1ARM_SDK_ROOT_DEFAULT
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/r1_arm_sdk" ABSOLUTE)
 if(DEFINED ENV{R1ARM_SDK_ROOT} AND NOT "$ENV{R1ARM_SDK_ROOT}" STREQUAL "")
   set(R1ARM_SDK_ROOT_DEFAULT "$ENV{R1ARM_SDK_ROOT}")
 endif()
@@ -32,6 +33,7 @@ foreach(required_path
 endforeach()
 
 find_package(Threads REQUIRED)
+unset(R1ARM_MOTOR_CONTROLLER CACHE)
 find_library(
   R1ARM_MOTOR_CONTROLLER
   NAMES motor_controller

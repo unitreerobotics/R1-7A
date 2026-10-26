@@ -1,0 +1,18 @@
+[submodule "third_party/unitree_sdk2_python"]
+	path = third_party/unitree_sdk2_python
+	url = https://github.com/unitreerobotics/unitree_sdk2_python.git
+[submodule "third_party/unitree_sdk2"]
+	path = third_party/unitree_sdk2
+	url = https://github.com/unitreerobotics/unitree_sdk2.git
+[submodule "third_party/r1_arm_sdk"]
+	path = third_party/r1_arm_sdk
+	url = https://github.com/unitreerobotics/r1-7a_sdk.git
+[submodule "third_party/XRoboToolkit-PC-Service-Pybind"]
+	path = third_party/XRoboToolkit-PC-Service-Pybind
+	url = https://github.com/YanjieZe/XRoboToolkit-PC-Service-Pybind.git
+[submodule "third_party/XRoboToolkit-PC-Service"]
+	path = third_party/XRoboToolkit-PC-Service
+	url = https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git
+[submodule "third_party/dex1_1_service"]
+	path = third_party/dex1_1_service
+	url = https://github.com/unitreerobotics/dex1_1_service.git

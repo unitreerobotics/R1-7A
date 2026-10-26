@@ -1,0 +1,108 @@
+--- a/thirdparty/motor_controller/include/SerialPort.h
++++ b/thirdparty/motor_controller/include/SerialPort.h
+@@ -40,6 +40,8 @@
+     HANDLE m_handle;
+ #else
+     int m_fd;
++    int m_wakeRead = -1;
++    int m_wakeWrite = -1;
+ #endif
+     std::atomic<bool> m_isOpen;
+     std::atomic<bool> m_running;
+--- a/thirdparty/motor_controller/src/SerialPort.cpp
++++ b/thirdparty/motor_controller/src/SerialPort.cpp
+@@ -10,6 +10,7 @@
+ #include <errno.h>
+ #include <sys/ioctl.h>
+ #include <sys/select.h>
++#include <poll.h>
+ #ifdef __linux__
+ #include <linux/serial.h>
+ #if defined(TCGETS2) && !defined(BOTHER)
+@@ -388,24 +389,53 @@
+         throw std::runtime_error("Port not open");
+     }
+ 
+-    if (m_running) {
++    if (m_readThread.joinable()) {
+         stopAsyncRead();
+     }
+ 
++#ifndef _WIN32
++    int wake[2];
++    if (pipe2(wake, O_NONBLOCK | O_CLOEXEC) != 0) {
++        throw std::runtime_error(std::string("Receive wake pipe failed: ") + strerror(errno));
++    }
++    m_wakeRead = wake[0];
++    m_wakeWrite = wake[1];
++#endif
+     m_callback = callback;
+     m_running = true;
+     {
+         std::lock_guard<std::mutex> lock(m_bufferMutex);
+         m_buffer.clear();
+     }
+-    m_readThread = std::thread(&SerialPort::readThreadFunc, this);
++    try {
++        m_readThread = std::thread(&SerialPort::readThreadFunc, this);
++    } catch (...) {
++        m_running = false;
++#ifndef _WIN32
++        ::close(m_wakeRead); ::close(m_wakeWrite);
++        m_wakeRead = m_wakeWrite = -1;
++#endif
++        throw;
++    }
+ }
+ 
+ void SerialPort::stopAsyncRead() {
+     m_running = false;
++#ifndef _WIN32
++    if (m_wakeWrite >= 0) {
++        const char wake = 1;
++        const auto ignored = ::write(m_wakeWrite, &wake, 1);
++        (void)ignored;
++    }
++#endif
+     if (m_readThread.joinable()) {
+         m_readThread.join();
+     }
++#ifndef _WIN32
++    if (m_wakeRead >= 0) ::close(m_wakeRead);
++    if (m_wakeWrite >= 0) ::close(m_wakeWrite);
++    m_wakeRead = m_wakeWrite = -1;
++#endif
+     m_callback = nullptr;
+     {
+         std::lock_guard<std::mutex> lock(m_bufferMutex);
+@@ -414,12 +444,27 @@
+ }
+ 
+ void SerialPort::readThreadFunc() {
++#ifdef _WIN32
+     while (m_running) {
+-        if (readAvailableData()) {
+-            processBuffer();
+-        }
++        if (readAvailableData()) processBuffer();
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
++#else
++    while (m_running) {
++        pollfd fds[2] = {{m_fd, POLLIN, 0}, {m_wakeRead, POLLIN, 0}};
++        const int result = ::poll(fds, 2, -1);
++        if (result < 0) {
++            if (errno == EINTR) continue;
++            break;
++        }
++        if (fds[1].revents || !m_running) break;
++        if (fds[0].revents & POLLIN) {
++            while (m_running && readAvailableData()) processBuffer();
++        }
++        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
++    }
++#endif
++    m_running = false;
+ }
+ 
+ bool SerialPort::readAvailableData() {

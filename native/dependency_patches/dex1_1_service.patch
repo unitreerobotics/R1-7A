@@ -1,0 +1,365 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index abd6bf3..dc3d99c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,49 +1,47 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(Dex1_1)
+-
++cmake_minimum_required(VERSION 3.18)
++project(Dex1_1 LANGUAGES CXX)
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+-
+ if(NOT CMAKE_BUILD_TYPE)
+-  set(CMAKE_BUILD_TYPE Release)
++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+ endif()
+ 
+-if (CMAKE_BUILD_TYPE MATCHES "Debug")
+-  message("-- BUILD_TYPE: Debug")
+-  add_compile_options(-g -O0 -fPIC)
++set(UNITREE_SDK2_ROOT "$ENV{UNITREE_SDK2_ROOT}" CACHE PATH "Unitree C++ SDK2 source checkout")
++if(UNITREE_SDK2_ROOT)
++  set(BUILD_EXAMPLES OFF CACHE BOOL "Build Unitree examples" FORCE)
++  # The upstream find_library cache otherwise keeps a previously selected SDK path.
++  unset(UNITREE_SDK_LIB CACHE)
++  add_subdirectory("${UNITREE_SDK2_ROOT}" "${CMAKE_BINARY_DIR}/unitree_sdk2" EXCLUDE_FROM_ALL)
+ else()
+-  message("-- BUILD_TYPE: Release")
+-  add_compile_options(-O3 -DNDEBUG -fPIC)
++  find_package(unitree_sdk2 CONFIG REQUIRED)
+ endif()
+-
+-if(POLICY CMP0167)
+-  cmake_policy(SET CMP0167 NEW)
+-endif()
+-
+ find_package(Boost REQUIRED COMPONENTS program_options)
+ find_package(yaml-cpp REQUIRED)
+-
+-include_directories(
+-  /usr/local/include/ddscxx
+-  ${CMAKE_SOURCE_DIR}/include
+-)
+-
+-link_directories(
+-  ${CMAKE_SOURCE_DIR}/lib
+-)
+-link_libraries(
+-  unitree_sdk2 ddsc ddscxx rt pthread
+-  libboost_program_options.a yaml-cpp fmt
+-)
+-
+-if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64") 
+-    link_libraries( libUnitreeMotorSDK_Arm64.so)
++find_package(fmt REQUIRED)
++find_package(spdlog REQUIRED)
++find_path(SERIALPORT_INCLUDE_DIR libserialport.h REQUIRED)
++find_library(SERIALPORT_LIBRARY serialport REQUIRED)
++
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
++  set(MOTOR_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/lib/libUnitreeMotorSDK_Linux64.so")
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
++  set(MOTOR_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/lib/libUnitreeMotorSDK_Arm64.so")
+ else()
+-    link_libraries( libUnitreeMotorSDK_Linux64.so)
++  message(FATAL_ERROR "Unsupported motor SDK architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
+-
+-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
+ add_executable(dex1_1_gripper_server main.cpp)
+ add_executable(test_dex1_1_gripper_server test/test_gripper.cpp)
+-add_executable(test_dex1_1_gripper_server2 test/test_gripper2.cpp)
+\ No newline at end of file
++add_executable(test_dex1_1_gripper_server2 test/test_gripper2.cpp)
++foreach(target dex1_1_gripper_server test_dex1_1_gripper_server test_dex1_1_gripper_server2)
++  target_include_directories(${target} PRIVATE include "${SERIALPORT_INCLUDE_DIR}")
++  target_link_libraries(${target} PRIVATE unitree_sdk2 Boost::program_options
++    yaml-cpp fmt::fmt spdlog::spdlog "${MOTOR_LIBRARY}" "${SERIALPORT_LIBRARY}" rt pthread)
++  set_target_properties(${target} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
++  if(DEFINED ENV{CONDA_PREFIX})
++    # The vendor motor library requires a newer libstdc++ than Ubuntu 22.04 ships.
++    target_link_directories(${target} BEFORE PRIVATE "$ENV{CONDA_PREFIX}/lib")
++    set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "$ENV{CONDA_PREFIX}/lib")
++  endif()
++endforeach()
+diff --git a/include/dds/Subscription.h b/include/dds/Subscription.h
+index 26f70ff..5ab3da4 100644
+--- a/include/dds/Subscription.h
++++ b/include/dds/Subscription.h
+@@ -3,6 +3,9 @@
+ 
+ #include <unitree/robot/channel/channel_subscriber.hpp>
+ #include <mutex>
++#include <chrono>
++#include <cstdint>
++#include <thread>
+ 
+ namespace unitree
+ {
+@@ -21,8 +24,9 @@ public:
+     last_update_time_ = std::chrono::steady_clock::now() - std::chrono::milliseconds(timeout_ms_);
+     sub_ = std::make_shared<unitree::robot::ChannelSubscriber<MessageType>>(topic);
+     sub_->InitChannel([this](const void *msg){
+-      last_update_time_ = std::chrono::steady_clock::now();
+       std::lock_guard<std::mutex> lock(mutex_);
++      last_update_time_ = std::chrono::steady_clock::now();
++      ++received_count_;
+       msg_ = *(const MessageType*)msg;
+       post_communication();
+     });
+@@ -31,11 +35,21 @@ public:
+   void set_timeout_ms(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
+ 
+   bool isTimeout() {
++    std::lock_guard<std::mutex> lock(mutex_);
+     auto now = std::chrono::steady_clock::now();
+     auto elasped_time = now - last_update_time_;
+     return elasped_time > std::chrono::milliseconds(timeout_ms_);
+   }
+ 
++  bool snapshot(MessageType& message, uint64_t& received_count) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    received_count = received_count_;
++    if (!received_count_ || std::chrono::steady_clock::now() - last_update_time_
++        > std::chrono::milliseconds(timeout_ms_)) return false;
++    message = msg_;
++    return true;
++  }
++
+   void wait_for_connection() {
+     while (isTimeout()) {
+       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+@@ -48,6 +62,7 @@ public:
+ protected:
+   virtual void post_communication() {} // something after receiving message
+ 
++  uint64_t received_count_{0};
+   uint32_t timeout_ms_{1000};
+   unitree::robot::ChannelSubscriberPtr<MessageType> sub_;
+   std::chrono::steady_clock::time_point last_update_time_;
+diff --git a/include/param.h b/include/param.h
+index 66d2a32..5e81d67 100644
+--- a/include/param.h
++++ b/include/param.h
+@@ -30,6 +30,10 @@ inline po::variables_map helper(int argc, char** argv)
+         ("help,h", "produce help message")
+         ("version,v", "show version")
+         ("network,n", po::value<std::string>()->default_value("eth0"), "dds networkInterface")
++        ("port,p", po::value<std::string>()->default_value(""), "only scan this serial port, e.g. /dev/ttyUSB0")
++        ("motor-id", po::value<int>()->default_value(-1), "only probe motor ID 0..14; -1 scans legacy 0/1")
++        ("side", po::value<std::string>()->default_value(""), "DDS side independent of motor ID: left or right")
++        ("probe-only", "zero-gain feedback probe only; do not start DDS control")
+         ("calibration,c", "calibrate the gripper motor");
+ 
+     po::variables_map vm;
+@@ -91,4 +95,4 @@ inline po::variables_map helper_test(int argc, char** argv)
+     return vm;
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/main.cpp b/main.cpp
+index 149f395..1f17903 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -11,6 +11,7 @@
+ #include <map>
+ #include <memory>
+ #include <spdlog/spdlog.h>
++#include <fmt/ranges.h>
+ #include <unistd.h>
+ #include <iostream>
+ #include <vector>
+@@ -46,6 +47,9 @@ public:
+     MotorUnit(int id, std::shared_ptr<SerialPort> serial, const std::string& cmdTopic, const std::string& stateTopic)
+         : id_(id), serial_(serial), cmdTopic_(cmdTopic), stateTopic_(stateTopic) {
+ 
++        cmd_.kp = cmd_.kd = cmd_.q = cmd_.dq = cmd_.tau = 0.0f;
++        cmd_.res = 0;
++        cmd_.timeout = 1;
+         cmd_.id = id_;
+         cmd_.motorType = MotorType::M4010;
+         cmd_.mode = queryMotorMode(cmd_.motorType, MotorMode::BRAKE);
+@@ -62,13 +66,16 @@ public:
+ 
+ private:
+     void loop_() {
+-        if (sub_->isTimeout()) {
++        unitree_go::msg::dds_::MotorCmds_ incoming;
++        uint64_t received_count = 0;
++        const bool command_ready = sub_->snapshot(incoming, received_count) && !incoming.cmds().empty();
++        if (!command_ready) {
+             cmd_.mode = queryMotorMode(cmd_.motorType, MotorMode::BRAKE);
+             cmd_.kp = cmd_.kd = cmd_.q = cmd_.dq = cmd_.tau = 0.0f;
+             cmd_.timeout = 1;
+         } 
+         else {
+-            auto& msg = sub_->msg_.cmds()[0];
++            const auto& msg = incoming.cmds()[0];
+             cmd_.mode = queryMotorMode(cmd_.motorType, MotorMode::FOC);
+             cmd_.kp = msg.kp() / (gear_ratio_ * gear_ratio_);
+             cmd_.kd = msg.kd() / (gear_ratio_ * gear_ratio_);
+@@ -78,7 +85,18 @@ private:
+             cmd_.timeout = 0;
+         }
+ 
+-        serial_->sendRecv(&cmd_, &state_);
++        const bool serial_ok = serial_->sendRecv(&cmd_, &state_);
++        const auto now = std::chrono::steady_clock::now();
++        if (received_count && now - last_diagnostic_ >= std::chrono::seconds(1)) {
++            last_diagnostic_ = now;
++            spdlog::info("[dex1] topic={} received={} active={} mode={} target_rad={} kp={} measured_rad={} serial_ok={} feedback_id={} feedback_mode={} feedback_timeout={} motor_error={} tau_est={} command_timeout={} reserved={}",
++                         cmdTopic_, received_count, command_ready, cmd_.mode,
++                         cmd_.q / gear_ratio_, cmd_.kp * gear_ratio_ * gear_ratio_,
++                         state_.q / gear_ratio_, serial_ok,
++                         static_cast<unsigned>(state_.motor_id), static_cast<unsigned>(state_.mode),
++                         state_.timeout, state_.merror, state_.tau * gear_ratio_, cmd_.timeout,
++                         static_cast<unsigned>(cmd_.res));
++        }
+         if (pub_->trylock()) {
+             pub_->msg_.states()[0].q() = state_.q / gear_ratio_;
+             pub_->msg_.states()[0].dq() = state_.dq / gear_ratio_;
+@@ -88,6 +106,7 @@ private:
+     }
+ 
+     int id_;
++    std::chrono::steady_clock::time_point last_diagnostic_{};
+     float gear_ratio_;
+     std::string cmdTopic_, stateTopic_;
+     std::shared_ptr<SerialPort> serial_;
+@@ -102,10 +121,10 @@ private:
+ class Dex1GripperServer {
+ public:
+     // Constructor attempts to detect motors on provided serial ports
+-    Dex1GripperServer(const std::vector<std::string>& ports) {
++    Dex1GripperServer(const std::vector<std::string>& ports, int motor_id = -1, std::string side = "") : side_(std::move(side)) {
+         bool found = false;
+         for (int attempt = 0; attempt < 3 && !found; ++attempt) {
+-            detectMotors_(ports);
++            detectMotors_(ports, motor_id);
+             found = !motors_.empty();
+             if (!found) {
+                 usleep(50000);
+@@ -120,7 +139,7 @@ public:
+     void runDDS() {
+         // Initialize DDS for each detected motor
+         for (auto& [id, motor_info] : motors_) {
+-            std::string side = (id == 0) ? "right" : "left";
++            std::string side = side_.empty() ? ((id == 0) ? "right" : "left") : side_;
+             std::string cmdTopic = "rt/dex1/" + side + "/cmd";
+             std::string stateTopic = "rt/dex1/" + side + "/state";
+             motor_info.unit = std::make_unique<MotorUnit>(id, motor_info.serial, cmdTopic, stateTopic);
+@@ -132,7 +151,7 @@ public:
+         int total = motors_.size();
+         int index = 1;
+         for (auto& [id, motor_info] : motors_) {
+-            std::string side = (id == 0) ? "right" : "left";
++            std::string side = side_.empty() ? ((id == 0) ? "right" : "left") : side_;
+             spdlog::info("========== Motor Calibration (Motor {} (index) of {} (total)) ==========", index, total);
+             spdlog::info("  - Motor ID: {}, \t Side: {}, \t Port: {}", id, side, motor_info.port_name);
+             spdlog::info("Please manually close the gripper tightly. \n \t\t\t\t Then press 's' + Enter to calibrate, or any other key to skip.");
+@@ -161,10 +180,11 @@ private:
+         std::unique_ptr<MotorUnit> unit;
+     };
+ 
++    std::string side_;
+     std::map<int, MotorInfo> motors_; // key: motor id, value: MotorInfo(serial, port name, MotorUnit)
+ 
+     // Attempt to detect motors on the given serial ports
+-    void detectMotors_(const std::vector<std::string>& ports) {
++    void detectMotors_(const std::vector<std::string>& ports, int motor_id) {
+         // ===================== Silence begin =====================
+         // Temporarily redirect stdout to /dev/null
+         // This is only to suppress unwanted console output from serial->sendRecv()
+@@ -177,10 +197,17 @@ private:
+         // ===================== Silence begin =====================
+ 
+         for (const auto& port : ports) {
+-            auto serial = std::make_shared<SerialPort>(port.c_str());
+-            for (int id = 0; id <= 1; ++id) {
++            // Match M4010 initialization to the vendor sendRecv reset (26 bytes, 6 Mbps).
++            spdlog::info("Probing {} at 6000000 baud, requested motor ID {}", port, motor_id);
++            auto serial = std::make_shared<SerialPort>(port.c_str(), 26, 6000000);
++            for (int id = (motor_id < 0 ? 0 : motor_id); id <= (motor_id < 0 ? 1 : motor_id); ++id) {
++                if (motor_id != -1 && id != motor_id) continue;
+                 MotorCmd cmd;
+                 MotorData data;
++                // MotorCmd has an empty user constructor: zero every drive field explicitly.
++                cmd.kp = cmd.kd = cmd.q = cmd.dq = cmd.tau = 0.0f;
++                cmd.res = 0;
++                cmd.timeout = 0;
+                 cmd.motorType = MotorType::M4010;
+                 cmd.id = id;
+                 cmd.mode = queryMotorMode(cmd.motorType, MotorMode::FOC);
+@@ -207,7 +234,7 @@ private:
+         if (!motors_.empty()) {
+             spdlog::info("Detected motors:");
+             for (const auto& [id, motor_info] : motors_) {
+-                std::string side = (id == 0) ? "right" : "left";
++                std::string side = side_.empty() ? ((id == 0) ? "right" : "left") : side_;
+                 std::string cmdTopic = "rt/dex1/" + side + "/cmd";
+                 std::string stateTopic = "rt/dex1/" + side + "/state";
+                 spdlog::info("  - Motor ID: {} \t Side: {} \t Port: {} \t cmdTopic: {} \t stateTopic: {}", id, side, motor_info.port_name, cmdTopic, stateTopic);
+@@ -218,15 +245,47 @@ private:
+ 
+ int main(int argc, char** argv) {
+     auto vm = param::helper(argc, argv);
+-    unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
++    if (vm.count("probe-only") && vm.count("calibration")) {
++        spdlog::error("probe-only cannot be combined with calibration");
++        return 1;
++    }
++    if (!vm.count("probe-only")) {
++        unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
++    }
+ 
+-    std::vector<std::string> ports = getAvailableSerialPorts();
++    std::vector<std::string> ports;
++    const std::string selected_port = vm["port"].as<std::string>();
++    if (selected_port.empty()) {
++        ports = getAvailableSerialPorts();
++    } else {
++        if (!std::filesystem::exists(selected_port)) {
++            spdlog::error("Selected serial port does not exist: {}", selected_port);
++            return 1;
++        }
++        ports.push_back(selected_port);
++        spdlog::info("Using selected serial port: {}", selected_port);
++    }
+     if (ports.empty()) {
+         spdlog::warn("No ttyUSB serial ports found.");
+         return 0;
+     }
+ 
+-    Dex1GripperServer server(ports);
++    const int motor_id = vm["motor-id"].as<int>();
++    if (motor_id < -1 || motor_id > 14) {
++        spdlog::error("motor-id must be -1 or 0..14; 15 is broadcast and has no reply");
++        return 1;
++    }
++    const std::string side = vm["side"].as<std::string>();
++    if ((!side.empty() && side != "left" && side != "right") ||
++        (motor_id > 1 && side.empty() && !vm.count("probe-only"))) {
++        spdlog::error("Specify --side left or --side right for non-legacy motor IDs");
++        return 1;
++    }
++    Dex1GripperServer server(ports, motor_id, side);
++    if (vm.count("probe-only")) {
++        spdlog::info("Probe completed; DDS control was not started");
++        return 0;
++    }
+ 
+     if (vm.count("calibration")) {
+         server.calibrate();
+@@ -238,4 +297,4 @@ int main(int argc, char** argv) {
+ 
+     while (true) sleep(1);
+     return 0;
+-}
+\ No newline at end of file
++}

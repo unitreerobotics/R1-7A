@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R, Slerp
+from scipy.spatial.transform import Rotation as R
 
 from robot.arm_model import clamp_configuration, joint_indices_by_name, link_pose, load_robot_model
 from robot.gripper import Dex1SimGripper
@@ -37,9 +37,12 @@ from robot.r1arm_config import (
 )
 from robot.xr_interface import get_key_value, make_xr_client
 from teleop.ik_solver import solve_upper_arm_ik
+from teleop.joint_trajectory import command_interval
+from teleop.xr_snapshot import XrSnapshot, sample_xr
+from teleop.xr_input import XrInputProcessor, XrInputWorker
 from teleop.r1arm_placo_solver import PlacoArmIKSolver
 from teleop.utils.geometry import R_HEADSET_TO_WORLD, quaternion_to_euler, quaternion_to_world
-from teleop.utils.mock import make_mock_controller_poses, make_mock_grip_values, xr_pose_is_valid
+from teleop.utils.mock import make_mock_controller_poses, make_mock_grip_values
 
 
 @dataclass
@@ -117,13 +120,6 @@ class R1ArmTeleopControllerBase:
                 arm_joints=ARM_JOINTS,
                 hold_joints=DEX1_JOINTS,
                 arm_task_weight=config.arm_task_weight,
-                joint_velocity_limits=config.ik_joint_velocity_limits,
-                default_velocity_limit=(
-                    config.ik_qp_velocity_limit
-                    if config.ik_qp_velocity_limit is not None else 0.0
-                ),
-                default_acceleration_limit=config.ik_qp_acceleration_limit,
-                default_jerk_limit=config.ik_qp_jerk_limit,
             )
             if self.dual_arm:
                 self.placo_solver_left = PlacoArmIKSolver(
@@ -134,19 +130,10 @@ class R1ArmTeleopControllerBase:
                     arm_joints=ARM_JOINTS,
                     hold_joints=DEX1_JOINTS,
                     arm_task_weight=config.arm_task_weight,
-                    joint_velocity_limits=config.ik_joint_velocity_limits,
-                    default_velocity_limit=(
-                        config.ik_qp_velocity_limit
-                        if config.ik_qp_velocity_limit is not None else 0.0
-                    ),
-                    default_acceleration_limit=config.ik_qp_acceleration_limit,
-                    default_jerk_limit=config.ik_qp_jerk_limit,
                 )
             self.use_placo = True
             mode = "dual-arm" if self.dual_arm else "single-arm"
-            qp_vlim = config.ik_qp_velocity_limit
-            vlim_note = f", QP v≤{qp_vlim:g} rad/s" if qp_vlim else ""
-            print(f"Using Placo QP IK solver ({mode}{vlim_note})")
+            print(f"Using Placo QP IK solver ({mode})")
         except Exception as exc:
             if self.debug:
                 import traceback
@@ -175,7 +162,7 @@ class R1ArmTeleopControllerBase:
             print("Using mock XR input")
         else:
             try:
-                self.xr_client = make_xr_client()
+                self.xr_client = XrInputWorker(make_xr_client(), config)
                 print("Connected to XRoboToolkit")
             except Exception as e:
                 if not self.allow_xr_fallback:
@@ -194,10 +181,10 @@ class R1ArmTeleopControllerBase:
         self._trajectory_q_cmd: dict[str, np.ndarray] = {}
         self._trajectory_v_cmd: dict[str, np.ndarray] = {}
         self._trajectory_a_cmd: dict[str, np.ndarray] = {}
-        self.velocity_only_shaper = False
         self._trigger_samples: dict[str, tuple[float, bool, float]] = {
             side: (0.0, False, 0.0) for side in self.control_sides
         }
+        self._gripper_wait_release = set()
         self._control_seq = 0
         self._control_sample: dict | None = None
         self._control_sample_lock = threading.Lock()
@@ -214,9 +201,9 @@ class R1ArmTeleopControllerBase:
         self._xr_frame_seq = 0
         self._xr_received_monotonic_ns = 0
         self._xr_valid_last = False
-        self._xr_filter_state: dict[str, dict] = {}
-        self._xr_filter_last_stamp_ns: int | None = None
-        self._xr_filter_dt: float = 1.0 / 30.0
+        self._xr_input_processor = XrInputProcessor(config, self.control_sides)
+        self._xr_applied_generation = {side: 0 for side in self.control_sides}
+        self._xr_input_status = {}
         # 兼容单臂调试字段
         self.active = False
 
@@ -241,7 +228,7 @@ class R1ArmTeleopControllerBase:
         q = np.zeros(self.model.nq, dtype=float)
         for i, name in enumerate(ARM_JOINTS):
             if name in self.joint_indices:
-                q[self.joint_indices[name]] = ARM_INIT[i]
+                q[self.joint_indices[name]] = (self.config.home_q or tuple(ARM_INIT))[i]
         open_q = float(self.config.dex1_open)
         for name in DEX1_JOINTS:
             q[self.joint_indices[name]] = open_q
@@ -363,7 +350,12 @@ class R1ArmTeleopControllerBase:
             v_cmd[k] = v_new
             q_next[idx] = q_new
 
-        q_next = clamp_configuration(self.model, q_next)
+        bounds = getattr(self, '_trajectory_position_bounds', None)
+        if bounds is None:
+            q_next = clamp_configuration(self.model, q_next)
+        else:
+            # Startup recovery must not snap an accepted offset to a URDF boundary.
+            q_next[self.arm_q_indices] = np.clip(q_next[self.arm_q_indices], *bounds)
         for k, idx in enumerate(self.arm_q_indices):
             if abs(q_next[idx] - q_cmd[k]) > 1e-8:
                 # Joint-limit projection is a safety event; synchronize the
@@ -376,32 +368,6 @@ class R1ArmTeleopControllerBase:
         self._trajectory_a_cmd[side] = a_cmd
         return q_next
 
-    def _velocity_only_step(
-        self, side: str, q_reference: np.ndarray, q_desired: np.ndarray
-    ) -> np.ndarray:
-        """Track the IK target with only a per-cycle joint-speed bound."""
-        rate_hz = getattr(self, "rate_hz", 50.0) or 50.0
-        dt = min(max(float(getattr(self, "_step_dt", 1.0 / rate_hz)), 1e-4), 0.1)
-        self._ensure_trajectory_state(side, q_reference)
-        q_cmd = self._trajectory_q_cmd[side].copy()
-        v_prev = self._trajectory_v_cmd[side].copy()
-        v_limit = self.config.trajectory_max_speed_rad_s
-        v_max = float(v_limit) if v_limit is not None and v_limit > 0 else float("inf")
-        q_next = q_reference.copy()
-        for k, idx in enumerate(self.arm_q_indices):
-            q_target = float(q_desired[idx])
-            q_cmd[k] += float(np.clip(q_target - q_cmd[k], -v_max * dt, v_max * dt))
-            q_next[idx] = q_cmd[k]
-        q_next = clamp_configuration(self.model, q_next)
-        v_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
-        v_cmd = (v_cmd - self._trajectory_q_cmd[side]) / dt
-        a_cmd = (v_cmd - v_prev) / dt
-        self._trajectory_q_cmd[side] = np.asarray(
-            [q_next[idx] for idx in self.arm_q_indices], dtype=float
-        )
-        self._trajectory_v_cmd[side] = v_cmd
-        self._trajectory_a_cmd[side] = a_cmd
-        return q_next
 
     def _trajectory_state(self, side: str, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         self._ensure_trajectory_state(side, q)
@@ -476,8 +442,7 @@ class R1ArmTeleopControllerBase:
                     q_next[idx] = sol[idx]
                 self._last_ik_raw[side] = np.array([q_next[i] for i in self.arm_q_indices])
                 self._last_ik_solver[side] = "placo"
-                q_shaped = (self._velocity_only_step(side, q, q_next)
-                            if self.velocity_only_shaper else self._trajectory_step(side, q, q_next))
+                q_shaped = self._trajectory_step(side, q, q_next)
                 self._set_q_for_side(side, q_shaped)
                 self._solver_seeds[side] = q_shaped.copy()
                 return
@@ -488,13 +453,18 @@ class R1ArmTeleopControllerBase:
         q_raw = self._solve_dls(solver_seed, target_pos, target_quat)
         self._last_ik_raw[side] = np.array([q_raw[i] for i in self.arm_q_indices])
         self._last_ik_solver[side] = "dls"
-        q_shaped = (self._velocity_only_step(side, q, q_raw)
-                    if self.velocity_only_shaper else self._trajectory_step(side, q, q_raw))
+        q_shaped = self._trajectory_step(side, q, q_raw)
         self._set_q_for_side(side, q_shaped)
         self._solver_seeds[side] = q_shaped.copy()
 
+    def _reset_clock(self):
+        return time.monotonic()
+
     def reset(self):
         """Send the home target through the shared velocity/acceleration state."""
+        self._last_ee_intent.clear()
+        self._xr_last_stamp = None
+        self._xr_pose_cache = None
         self._q_blend_start = self.q.copy()
         self._q_blend_goal = self._create_initial_q()
         if self.dual_arm:
@@ -503,10 +473,11 @@ class R1ArmTeleopControllerBase:
         # Deadline follows configured command rate; actual movement remains
         # governed by the shared q/v/a trajectory state below.
         rate_hz = getattr(self, "rate_hz", 50.0) or 50.0
-        self._reset_blend_deadline = time.monotonic() + self.reset_blend_frames / rate_hz
+        self._reset_blend_deadline = self._reset_clock() + self.reset_blend_frames / rate_hz
         self._reset_settle_count = 0
         self._reset_last_diag_time = 0.0
         self._reset_blending = True
+        self._gripper_wait_release.update(self.control_sides)
 
         for st in self.track.values():
             st.clear()
@@ -524,12 +495,13 @@ class R1ArmTeleopControllerBase:
     def _step_reset_blend(self) -> bool:
         if not self._reset_blending or self._q_blend_start is None or self._q_blend_goal is None:
             return False
-        self.q = self._trajectory_step("right", self.q, self._q_blend_goal)
-        self._solver_seeds["right"] = self.q.copy()
-        self._last_ik_raw["right"] = np.array(
+        primary_side = "right" if self.dual_arm else self.control_side
+        self.q = self._trajectory_step(primary_side, self.q, self._q_blend_goal)
+        self._solver_seeds[primary_side] = self.q.copy()
+        self._last_ik_raw[primary_side] = np.array(
             [self._q_blend_goal[i] for i in self.arm_q_indices]
         )
-        self._last_ik_solver["right"] = "reset_blend"
+        self._last_ik_solver[primary_side] = "reset_blend"
         if self.dual_arm and self._q_left_blend_start is not None and self._q_left_blend_goal is not None:
             self.q_left = self._trajectory_step("left", self.q_left, self._q_left_blend_goal)
             self._solver_seeds["left"] = self.q_left.copy()
@@ -538,9 +510,10 @@ class R1ArmTeleopControllerBase:
         stopped = True
         feedback_settled = True
         diagnostics = []
-        for side, goal in (("right", self._q_blend_goal), ("left", self._q_left_blend_goal)):
-            if side == "left" and not self.dual_arm:
-                continue
+        goals = [(primary_side, self._q_blend_goal)]
+        if self.dual_arm:
+            goals.append(("left", self._q_left_blend_goal))
+        for side, goal in goals:
             q_cmd, v_cmd, a_cmd = self._trajectory_state(side, self._q_for_side(side))
             q_cmd_error = float(np.max(np.abs(q_cmd - goal[self.arm_q_indices])))
             v_cmd_max = float(np.max(np.abs(v_cmd)))
@@ -571,7 +544,7 @@ class R1ArmTeleopControllerBase:
         else:
             self._reset_settle_count = 0
         settle_cycles = max(1, int(math.ceil(0.1 * (getattr(self, "rate_hz", 50.0) or 50.0))))
-        now = time.monotonic()
+        now = self._reset_clock()
         if now - self._reset_last_diag_time >= 1.0:
             self._reset_last_diag_time = now
             print(
@@ -584,7 +557,7 @@ class R1ArmTeleopControllerBase:
             and at_goal and stopped and feedback_settled
             and self._reset_settle_count >= settle_cycles
         ):
-            self._solver_seeds["right"] = self.q.copy()
+            self._solver_seeds[primary_side] = self.q.copy()
             if self.dual_arm and self._q_left_blend_goal is not None:
                 self._solver_seeds["left"] = self.q_left.copy()
             for side, gripper in self.grippers.items():
@@ -615,7 +588,7 @@ class R1ArmTeleopControllerBase:
             return
         self._control_seq += 1
         control_time_ns = time.monotonic_ns()
-        xr_frame_stamp_ns = self._xr_last_stamp or self._xr_filter_last_stamp_ns
+        xr_frame_stamp_ns = self._xr_last_stamp
         raw_poses = {
             name: np.asarray(pose, dtype=float).tolist()
             for name, pose in (self._xr_pose_raw or {}).items()
@@ -624,18 +597,9 @@ class R1ArmTeleopControllerBase:
             name: np.asarray(pose, dtype=float).tolist()
             for name, pose in controller_poses.items()
         }
-        filter_state = {
-            name: {
-                "pose": state["pose"].tolist(),
-                "derivative": state["derivative"].tolist(),
-                "dt": float(state["dt"]),
-                "stamp_ns": int(state["stamp_ns"]),
-            }
-            for name, state in self._xr_filter_state.items()
-        }
         jump_rejected_poses = {
             name: np.asarray(pose, dtype=float).tolist()
-            for name, pose in getattr(self, "_xr_prev_poses", {}).items()
+            for name, pose in controller_poses.items()
         }
         for side in self.control_sides:
             q = self._q_for_side(side)
@@ -672,194 +636,69 @@ class R1ArmTeleopControllerBase:
                 "xr_poses_raw": raw_poses,
                 "xr_poses_filtered": filtered_poses,
                 "xr_poses_jump_rejected": jump_rejected_poses,
-                "xr_filter_state": filter_state,
-                "xr_jump_reject_count": int(getattr(self, "_xr_jump_rejects", 0)),
+                "xr_filter_state": {},
+                "xr_filter_enabled": False,
+                "xr_input_status": self._xr_input_status,
+                "xr_jump_reject_count": int(self._xr_input_status.get(side, {}).get("rejects", 0)),
             })
 
+    def _xr_clock_ns(self):
+        return time.monotonic_ns()
+
     def read_controller_poses(self) -> tuple:
+        if self.xr_client is None and getattr(self, "motion_mode", False):
+            self._xr_valid_last = False
+            return {}, False
         if self.mock_xr or self.xr_client is None:
             raw = make_mock_controller_poses(self.t)
             self._xr_pose_raw = {k: v.copy() for k, v in raw.items()}
             self._xr_frame_seq += 1
             self._xr_received_monotonic_ns = time.monotonic_ns()
             self._xr_valid_last = True
-            return self._filter_xr_poses(raw, time.monotonic_ns()), True
-        # P2 修复：帧时钟感知。XR 服务端按自己的帧率（~30Hz）推送位姿，
-        # 而控制环 50Hz 每拍都读——同一个位姿被重复消费 1~2 次且交替不
-        # 均匀（33ms 与 20ms 不成整数比），IK 目标流成为"30Hz 阶梯 ×
-        # 50Hz 采样"的拍频调制信号。只在服务器帧时间戳更新时读新位姿，
-        # 其余拍沿用上一次的快照——目标更新节拍与 XR 服务端一致，拍频
-        # 调制从源头消失（读取代价：一次 int 调用 vs 三次 pose 拷贝）。
-        stamp = self.xr_client.get_frame_stamp_ns()
-        if stamp is not None and stamp == self._xr_last_stamp:
-            if self._xr_pose_cache is not None:
-                self._xr_valid_last = True
-                return self._xr_pose_cache, True
-        try:
-            controller_poses = {}
-            for name in ["headset", "left_controller", "right_controller"]:
-                pose = self.xr_client.get_pose_by_name(name)
-                if xr_pose_is_valid(pose):
-                    controller_poses[name] = np.asarray(pose, dtype=float)[:7]
-                else:
-                    if not self.allow_xr_fallback:
-                        self._xr_valid_last = False
-                        if self.debug:
-                            print(f"XR pose invalid: {name}; holding current command")
-                        return {}, False
-                    return make_mock_controller_poses(self.t), True
-            self._xr_pose_raw = {k: v.copy() for k, v in controller_poses.items()}
-            self._xr_frame_seq += 1
-            self._xr_received_monotonic_ns = time.monotonic_ns()
-            self._xr_valid_last = True
-            out = self._reject_xr_jumps(controller_poses)
-            stamp_ns = int(stamp) if stamp is not None else time.monotonic_ns()
-            out = self._filter_xr_poses(out, stamp_ns)
-            self._xr_pose_cache = out
-            self._xr_last_stamp = stamp
-            return out, True
-        except Exception as e:
-            self._xr_valid_last = False
-            if self.debug:
-                print(f"XR read error: {e}")
-            if not self.allow_xr_fallback:
-                return {}, False
-            return make_mock_controller_poses(self.t), True
-
-    def _filter_xr_poses(self, poses: dict, stamp_ns: int) -> dict:
-        """One-Euro filter valid XR poses once per new XR frame."""
-        if stamp_ns == self._xr_filter_last_stamp_ns:
-            return {k: v.copy() for k, v in self._xr_pose_cache.items()} if self._xr_pose_cache else poses
-        cutoff = max(float(getattr(self.config, "xr_filter_min_cutoff", 8.0)), 1e-3)
-        beta = max(float(getattr(self.config, "xr_filter_beta", 1.0)), 0.0)
-        if self._xr_filter_last_stamp_ns is None:
-            dt = 1.0 / 30.0
-        else:
-            dt = (int(stamp_ns) - self._xr_filter_last_stamp_ns) * 1e-9
-            if not 1e-4 <= dt <= 0.2:
-                dt = 1.0 / 30.0
-        self._xr_filter_last_stamp_ns = int(stamp_ns)
-        self._xr_filter_dt = dt
-        out = {}
-        for name, pose in poses.items():
-            pose = np.asarray(pose, dtype=float)[:7].copy()
-            state = self._xr_filter_state.get(name)
-            if state is None:
-                self._xr_filter_state[name] = {
-                    "pose": pose.copy(), "derivative": np.zeros(3), "stamp_ns": int(stamp_ns),
-                    "dt": dt,
-                }
-                out[name] = pose
-                continue
-            prev = state["pose"]
-            if (np.linalg.norm(pose[:3] - prev[:3]) > self._XR_JUMP_POS_M
-                    or np.linalg.norm((R.from_quat(prev[3:7]).inv() * R.from_quat(pose[3:7])).as_rotvec())
-                    > self._XR_JUMP_ROT_RAD):
-                # Jump detector accepted a persistent relocation after its
-                # reject window; restart filter state instead of easing across
-                # the whole discontinuity.
-                self._xr_filter_state[name] = {
-                    "pose": pose.copy(), "derivative": np.zeros(3), "stamp_ns": int(stamp_ns),
-                    "dt": dt,
-                }
-                out[name] = pose
-                continue
-            filter_dt = max(float(state.get("dt", dt)), 1e-4)
-            raw_velocity = (pose[:3] - prev[:3]) / filter_dt
-            alpha_d = self._one_euro_alpha(filter_dt, 1.0)
-            derivative = alpha_d * raw_velocity + (1.0 - alpha_d) * state["derivative"]
-            derivative_norm = float(np.linalg.norm(derivative))
-            if derivative_norm > 20.0:
-                derivative *= 20.0 / derivative_norm
-            speed = float(np.linalg.norm(derivative))
-            alpha = self._one_euro_alpha(filter_dt, cutoff + beta * speed)
-            filtered = pose.copy()
-            filtered[:3] = alpha * pose[:3] + (1.0 - alpha) * prev[:3]
-            rotations = R.from_quat(np.vstack((prev[3:7], pose[3:7])))
-            filtered[3:7] = Slerp([0.0, 1.0], rotations)([alpha]).as_quat()[0]
-            self._xr_filter_state[name] = {
-                "pose": filtered.copy(), "derivative": derivative, "stamp_ns": int(stamp_ns),
-                "dt": dt,
-            }
-            out[name] = filtered
-        return out
-
-    @staticmethod
-    def _one_euro_alpha(dt: float, cutoff: float) -> float:
-        tau = 1.0 / (2.0 * math.pi * max(float(cutoff), 1e-3))
-        return 1.0 / (1.0 + tau / max(float(dt), 1e-6))
-
-    # P1: XR 位姿跳变检测。跟踪丢失/重捕获的瞬间，XR 会上报一个跟上一帧
-    # 完全无关的位姿（几厘米甚至几米的单帧跳变）。这种跳变直接进 IK 会产
-    # 生一帧大步目标——被 clamp 后录进 action 的轨迹仍然是"从未执行过的
-    # 意图跳变"。逐帧位置/姿态差超过阈值时判定为跳变：保留上一帧位姿，
-    # 并清空跟踪参考（下一拍 grip 仍按住时会重新锚定相对位姿，而不是把
-    # 跳变后的 delta 累加进去）。
-    #
-    # 毛刺 vs 搬位：单帧尖峰（回到原位）hold 是对的；但手柄被真实放到新
-    # 位置（放下/交接/换手）时，新位姿会持续稳定存在——连续 N 帧都在同一
-    # 个"新位置"附近，说明这不是噪声而是真实搬位。持续拒绝会让参考永久
-    # 冻结、目标卡死、日志每帧刷屏（真机日志实测：连刷 50+ 行 0.4m 拒绝）。
-    # 连续拒绝 ≥ N 帧后接受新位置为现实，清锚重捕获。
-    _XR_JUMP_POS_M = 0.30  # 单帧 30cm 位移 = 跳变（人手 50Hz 下限 ~0.5m/s）
-    _XR_JUMP_ROT_RAD = 1.0  # 单帧 57° 转动 = 跳变
-    _XR_JUMP_MAX_REJECTS = 10  # 连续拒绝上限：超过 = 真实搬位，接受新位置
-
-    def _reject_xr_jumps(self, poses: dict) -> dict:
-        prev = getattr(self, "_xr_prev_poses", None)
-        if prev is None:
-            self._xr_prev_poses = {k: v.copy() for k, v in poses.items()}
-            self._xr_jump_rejects = 0
-            return poses
-        rejects = getattr(self, "_xr_jump_rejects", 0)
-        jumped = []
-        out = {}
-        for name, pose in poses.items():
-            ref = prev.get(name)
-            if ref is None:
-                out[name] = pose
-                continue
-            dpos = float(np.linalg.norm(pose[:3] - ref[:3]))
-            drot = R.from_quat(pose[3:7]).inv() * R.from_quat(ref[3:7])
-            drot = float(np.linalg.norm(drot.as_rotvec()))
-            if dpos > self._XR_JUMP_POS_M or drot > self._XR_JUMP_ROT_RAD:
-                if rejects + 1 >= self._XR_JUMP_MAX_REJECTS:
-                    # 持续偏离 = 真实搬位（手柄放下/挪动），不是单帧毛刺：
-                    # 接受新位置，参考随后重建。
-                    out[name] = pose
-                    continue
-                jumped.append(f"{name}({dpos:.2f}m/{np.degrees(drot):.0f}deg)")
-                out[name] = ref  # hold last valid pose
+            self._xr_pose_cache = {k: v.copy() for k, v in raw.items()}
+            return self._xr_pose_cache, True
+        snapshot = getattr(self, '_xr_cycle_snapshot', None) if getattr(self, '_xr_snapshot_pending', False) else None
+        self._xr_snapshot_pending = False
+        if snapshot is None:
+            shared = getattr(self, 'xr_snapshot', None)
+            if shared is not None:
+                poses, stamp = shared
+                keys = {side+'_grip': self.xr_client.get_key_value_by_name(side+'_grip')
+                        for side in self.control_sides}
+                snapshot = XrSnapshot(poses, stamp, keys, {})
             else:
-                out[name] = pose
-        self._xr_prev_poses = {k: v.copy() for k, v in out.items()}
-        if jumped:
-            self._xr_jump_rejects = rejects + 1
-            print(f"[XR] rejected jump: {', '.join(jumped)}; holding previous pose")
-            # 跳变后旧参考已不可信：清锚，grip 重锚逻辑（_track_side 的
-            # ref_ee_pos is None 分支）会在下一拍用当前位姿重建参考。
-            for st in self.track.values():
-                st.clear()
-        elif rejects > 0 or any(
-            np.linalg.norm(out[n][:3] - prev.get(n, out[n])[:3]) > self._XR_JUMP_POS_M
-            for n in out
-        ):
-            # 没有拒绝但上一轮处于拒绝状态 / 帧刚被接受为搬位：计数清零、
-            # 清锚让 grip 用新位置重建参考（不打印——正常搬位不是事件）。
-            if rejects > 0:
-                self._xr_jump_rejects = 0
-                for st in self.track.values():
-                    st.clear()
-        else:
-            self._xr_jump_rejects = 0
-        return out
+                snapshot = sample_xr(self.xr_client)
+        if 'xr_input' not in snapshot.metadata:
+            snapshot = self._xr_input_processor.process(snapshot, self._xr_clock_ns())
+        self._xr_cycle_snapshot = snapshot
+        self._xr_input_status = snapshot.metadata.get('xr_input', {})
+        status = self._xr_input_status.get(self.control_side, {})
+        self._xr_cache_age_s = status.get('age_s')
+        self._xr_cache_stale = status.get('phase') == 'stale'
+        self._xr_expired = self._xr_cache_stale
+        self._xr_pose_raw = {name: pose.copy() for name, pose in
+                            getattr(snapshot, 'raw_poses', snapshot.poses).items()}
+        self._xr_pose_cache = snapshot.poses
+        self._xr_last_stamp = snapshot.stamp
+        self._xr_received_monotonic_ns = int(snapshot.metadata.get('received_monotonic_ns', 0))
+        self._xr_frame_seq = int(snapshot.metadata.get('sequence', self._xr_frame_seq))
+        for side in self.control_sides:
+            status = self._xr_input_status.get(side, {})
+            generation = status.get('generation', 0)
+            if generation != self._xr_applied_generation[side]:
+                if self.track[side].ref_ee_pos is not None or self.track[side].active:
+                    self.track[side].clear()
+                self._xr_applied_generation[side] = generation
+        self._xr_valid_last = any(side+'_controller' in snapshot.poses for side in self.control_sides)
+        return snapshot.poses, self._xr_valid_last
 
     def get_grip_state(self, side: str | None = None) -> float:
         side = side or self.control_side
         if self.mock_xr or self.xr_client is None:
             left_grip, right_grip, _, _ = make_mock_grip_values(self.t)
             return left_grip if side == "left" else right_grip
-        return get_key_value(self.xr_client, f"{side}_grip")
+        client = getattr(self, '_xr_cycle_snapshot', None) or self.xr_client
+        return get_key_value(client, f"{side}_grip")
 
     def get_trigger_sample(self, side: str | None = None) -> tuple[float, bool]:
         side = side or self.control_side
@@ -869,7 +708,14 @@ class R1ArmTeleopControllerBase:
             self._trigger_samples[side] = (float(value), True, time.monotonic())
             return float(value), True
         try:
-            value = float(self.xr_client.get_key_value_by_name(f"{side}_trigger"))
+            client = getattr(self, '_xr_cycle_snapshot', None) or self.xr_client
+            if isinstance(client, XrSnapshot):
+                status = client.metadata.get('xr_input', {}).get(side, {})
+                if (f"{side}_trigger" not in client.keys or
+                        status.get('age_s', 0.) > self.config.xr_stale_timeout_s or
+                        client.metadata.get('xr_input_error')):
+                    raise ValueError('XR trigger data missing or stale')
+            value = float(client.get_key_value_by_name(f"{side}_trigger"))
             valid = np.isfinite(value) and 0.0 <= value <= 1.0
         except Exception:
             value, valid = self._trigger_samples.get(side, (0.0, False, 0.0))[0], False
@@ -886,7 +732,8 @@ class R1ArmTeleopControllerBase:
         if self.mock_xr or self.xr_client is None:
             return False
         try:
-            return bool(self.xr_client.get_button_state_by_name(name))
+            client = getattr(self, '_xr_cycle_snapshot', None) or self.xr_client
+            return bool(client.get_button_state_by_name(name))
         except Exception:
             return False
 
@@ -896,7 +743,19 @@ class R1ArmTeleopControllerBase:
         return self.get_button_state("A")
 
     def _update_dex1_side(self, side: str, dt: float) -> None:
-        trigger, _ = self.get_trigger_sample(side)
+        trigger, valid = self.get_trigger_sample(side)
+        if side in self._gripper_wait_release:
+            gripper = self.grippers[side]
+            gripper.reset()
+            opened = not getattr(self, "motion_mode", False) or self.hand_ctrl is None
+            if not opened:
+                data = self.hand_ctrl.get_record_data()
+                measured = data.get("motor_q")
+                opened = (data.get("feedback_valid", False) and measured is not None
+                          and abs(measured - self.hand_ctrl.open_q) <= 0.1)
+            if opened and valid and trigger <= self.config.trigger_deadband:
+                self._gripper_wait_release.remove(side)
+            trigger = 0.0
         if trigger < self.config.trigger_deadband:
             trigger = 0.0
         value = self.grippers[side].update(trigger, dt)
@@ -919,7 +778,8 @@ class R1ArmTeleopControllerBase:
         ratio = sim_to_closed_ratio(
             self.grippers[side].current, self.config.dex1_open, self.config.dex1_close
         )
-        if side == "left":
+        dex1_side = getattr(self.hand_ctrl, "side", side)
+        if dex1_side == "left":
             self.hand_ctrl.set_gripper_ratios(ratio, 0.0)
         else:
             self.hand_ctrl.set_gripper_ratios(0.0, ratio)
@@ -928,13 +788,18 @@ class R1ArmTeleopControllerBase:
         now = time.monotonic()
         dt = max(0.0, now - self.last_gripper_update)
         self.last_gripper_update = now
+        if self._reset_blending:
+            # Do not drive the gripper until the measured arm has settled at home.
+            for side in self.control_sides:
+                self.get_trigger_sample(side)
+            return
         for side in self.control_sides:
             self._update_dex1_side(side, dt)
         self._send_dex1_all()
 
     def _track_side(self, side: str, controller_poses: dict) -> None:
         st = self.track[side]
-        st.active = self.get_grip_state(side) > 0.9
+        st.active = f"{side}_controller" in controller_poses and self.get_grip_state(side) > 0.9
         if not st.active:
             self._last_ee_intent[side] = {}
         controller_pose = controller_poses.get(f"{side}_controller")
@@ -1007,7 +872,8 @@ class R1ArmTeleopControllerBase:
 
                     self._solve(side, target_pos, target_quat)
         else:
-            st.clear()
+            if st.ref_ee_pos is not None:
+                st.clear()
             self._last_ik_raw[side] = np.array([q[i] for i in self.arm_q_indices])
             self._last_ik_solver[side] = "stopping" if np.max(np.abs(self._trajectory_v_cmd[side])) > 1e-4 else "hold"
             stop_target = q.copy()
@@ -1017,15 +883,22 @@ class R1ArmTeleopControllerBase:
             self._set_q_for_side(side, q_stopped)
             self._solver_seeds[side] = q_stopped.copy()
 
-    def step(self, dt: float) -> np.ndarray:
-        self._step_dt = float(dt)
+    def prepare_step(self, dt: float) -> np.ndarray:
+        self._step_dt = command_interval(dt)
+        self._xr_cycle_snapshot = None
+        if not self.mock_xr:
+            shared = getattr(self, 'xr_input_snapshot', None)
+            if shared is not None:
+                self._xr_cycle_snapshot = shared
+            elif getattr(self, 'xr_snapshot', None) is None and self.xr_client is not None:
+                self._xr_cycle_snapshot = sample_xr(self.xr_client)
+        self._xr_snapshot_pending = True
         self.t += dt
         # Trigger/DDS control is independent of pose validity and reset state.
         self._step_grippers()
 
         if self._reset_blending:
             self._step_reset_blend()
-            self._output_command()
             return self.q
 
         controller_poses, valid = self.read_controller_poses()
@@ -1034,13 +907,11 @@ class R1ArmTeleopControllerBase:
                 self._track_side(side, {})
             self._publish_ik_diagnostics({}, xr_valid=False)
             self.active = any(self.track[side].active for side in self.control_sides)
-            self._output_command()
             return self.q
 
         if self.get_reset_button() and not self.is_reset_flag:
             self.reset()
             self._step_reset_blend()
-            self._output_command()
             return self.q
         if not self.get_reset_button():
             self.is_reset_flag = False
@@ -1054,9 +925,9 @@ class R1ArmTeleopControllerBase:
         if self.dual_arm:
             self.q_left = clamp_configuration(self.model, self.q_left)
 
-        self._output_command()
 
-        if self.debug and int(self.t * 5) % 5 == 0:
+        if self.debug and time.monotonic()-getattr(self,"_last_debug_print",0.) >= 1.:
+            self._last_debug_print = time.monotonic()
             parts = []
             for side in self.control_sides:
                 q = self._q_for_side(side)
@@ -1066,6 +937,11 @@ class R1ArmTeleopControllerBase:
                 )
             print(f"t={self.t:.2f}s | " + " | ".join(parts))
 
+        return self.q
+
+    def step(self, dt: float) -> np.ndarray:
+        self.prepare_step(dt)
+        self._output_command()
         return self.q
 
     def _output_command(self):
@@ -1133,12 +1009,12 @@ class R1ArmTeleopControllerBase:
         dt = 1.0 / rate
         try:
             self._on_start()
-            previous_start = time.monotonic()
+            previous_start = time.monotonic()-dt
             while self.running:
                 loop_start = time.monotonic()
                 actual_dt = loop_start - previous_start
                 previous_start = loop_start
-                self.step(actual_dt if 0.001 <= actual_dt <= 0.1 else dt)
+                self.step(actual_dt)
                 elapsed = time.monotonic() - loop_start
                 sleep_t = dt - elapsed
                 if sleep_t > 0:

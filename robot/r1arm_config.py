@@ -80,6 +80,7 @@ class R1ArmConfig:
     dual_arm: bool = False
     # 单臂模式跟哪只手柄；dual_arm=True 时无效
     control_side: str = "right"
+    home_q: tuple[float, ...] | None = None
     scale_factor: float = 1.0
     arm_control_mode: str = "pose"  # "pose" or "position"
     arm_task_weight: float = 1.0
@@ -102,16 +103,13 @@ class R1ArmConfig:
     # a_desired = position_gain * position_error - velocity_gain * velocity.
     trajectory_position_gain: float = 64.0
     trajectory_velocity_gain: float = 16.0
-    # One-Euro XR pose filter, updated only when XR frame stamp advances.
-    xr_filter_min_cutoff: float = 8.0
-    xr_filter_beta: float = 1.0
-    # Placo 内附加速度限制关闭；动态速度/加速度只由轨迹状态机负责。
-    # 逐关节覆盖：ik_joint_velocity_limits = {"J5": 0.8, ...}（未列关节用默认）。
-    ik_qp_velocity_limit: float | None = None
-    # Optional acceleration bound embedded in the Placo QP (rad/s^2).
-    ik_qp_acceleration_limit: float | None = None
-    # Optional jerk bound embedded in the Placo QP (rad/s^3); disabled by default.
-    ik_qp_jerk_limit: float | None = None
+    # XR input timing is independent of the joint trajectory generator.
+    xr_stale_timeout_s: float = .25
+    xr_recovery_time_s: float = .08
+    xr_jump_linear_speed: float = 3.0
+    xr_jump_angular_speed: float = 12.0
+    xr_grip_on: float = .90
+    xr_grip_off: float = .80
     ik_joint_velocity_limits: dict[str, float] | None = None
 
 

@@ -1,0 +1,11 @@
+{
+  "source": "right: /home/unitree/nt/R1ARM/r1arm_teleop/data/diagnostics/dex1_endpoints_right_20261023_181943; left: CHANGELOG_20261021_20261022, hardware recheck pending",
+  "right": {
+    "closed": -4.425779819488525,
+    "open": 0.8784417510032654
+  },
+  "left": {
+    "closed": -0.4818770587,
+    "open": 4.8165998459
+  }
+}

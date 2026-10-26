@@ -14,9 +14,9 @@ import numpy as np
 JOINT_COUNT = 7
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SDK_ROOT = Path(
-    os.environ.get("R1ARM_SDK_ROOT", "/home/ycb410/nt/R1_arm_SDK_x86/r1_arm")
+    os.environ.get("R1ARM_SDK_ROOT", str(PROJECT_ROOT.parent / "R1_arm_SDK_x86" / "r1_arm"))
 )
-DEFAULT_BRIDGE_LIBRARY = PROJECT_ROOT / "build/r1arm_sdk_bridge/libr1arm_sdk_bridge.so"
+DEFAULT_BRIDGE_LIBRARY = Path(os.environ.get("R1ARM_BRIDGE_LIB", PROJECT_ROOT / "build/r1arm_sdk_bridge/libr1arm_sdk_bridge.so"))
 MODEL_TO_SDK_SIGN = np.array([1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0])
 
 
@@ -51,7 +51,9 @@ def validate_calibration_file(path: str | Path) -> Path:
         scale = float(fields[2]) if len(fields) == 4 else 1.0
         if joint not in range(JOINT_COUNT) or joint in seen:
             raise ValueError(f"Bad/duplicate joint index on calibration line {line_no}: {joint}")
-        if abs(direction) < 1e-6 or abs(scale) < 1e-6:
+        if not np.isfinite([direction, scale, float(fields[-1])]).all():
+            raise ValueError(f"Non-finite calibration at line {line_no}")
+        if abs(direction) < 1e-6 or scale <= 0:
             raise ValueError(f"Zero direction/scale on calibration line {line_no}")
         float(fields[-1])
         seen.add(joint)
@@ -224,6 +226,8 @@ class R1ArmSdkBus:
         return bool(self._handle and self._lib.r1arm_bridge_is_open(self._handle))
 
     def open(self, port: str, baudrate: int, calibration_path: str | Path) -> None:
+        from dual.config import validate_arm_port
+        validate_arm_port(port)
         calibration = validate_calibration_file(calibration_path)
         self._call(
             self._lib.r1arm_bridge_open,

@@ -10,9 +10,14 @@ what the recorder will store. Quit with q or Esc.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
+
+# The OpenCV wheel in r1_teleop ships the xcb Qt plugin, not the Wayland one.
+if os.environ.get("QT_QPA_PLATFORM") == "wayland":
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import cv2
 import numpy as np
@@ -75,16 +80,26 @@ def main() -> None:
 
     camera = LocalCameraSubscriber(specs)
     camera.start()
-    camera.resolve_active(timeout=8.0)
-    for key, detail in camera.inactive:
-        print(f"[View] UNAVAILABLE {key}: {detail}")
-    if not camera.active_keys:
-        raise SystemExit("[View] no camera delivered a frame; run scripts/probe_r1arm_cameras.py")
-    print(f"[View] showing: {list(camera.active_keys)} (q or Esc to quit)")
-
-    active = camera.active_keys
-    deadline = time.monotonic() + args.seconds if args.seconds > 0 else None
     try:
+        print("[View] waiting up to 8s for camera frames...", flush=True)
+        deadline = time.monotonic() + 8.0
+        next_status = time.monotonic()
+        while time.monotonic() < deadline and not camera.wait_first_frame(timeout=0.2):
+            if time.monotonic() >= next_status:
+                print(f"[View] connecting: {camera.describe()}", flush=True)
+                next_status = time.monotonic() + 1.0
+        # Keep the same stability check used by recording before showing cameras.
+        camera.resolve_active(timeout=0.0)
+        for key, detail in camera.inactive:
+            print(f"[View] UNAVAILABLE {key}: {detail}")
+        if not camera.active_keys:
+            raise SystemExit(
+                "[View] no camera delivered a frame; run scripts/verify_r1arm_right_cameras.py"
+            )
+        print(f"[View] showing: {list(camera.active_keys)} (q or Esc to quit)")
+
+        active = camera.active_keys
+        deadline = time.monotonic() + args.seconds if args.seconds > 0 else None
         while True:
             frames, frame_id, _, _ = camera.get()
             health = camera.health()

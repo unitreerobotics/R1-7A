@@ -11,7 +11,7 @@ from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_
 
 
-DEX1_MAX_RANGE = 5.0
+from robot.eef.dex1_config import load_dex1_endpoints
 
 
 class Dex1Single:
@@ -30,6 +30,9 @@ class Dex1Single:
         if self.side not in {"left", "right"}:
             raise ValueError(f"Dex1 side must be left or right, got {side!r}")
 
+        self.closed_q, self.open_q = load_dex1_endpoints(self.side)
+        self.travel = self.open_q - self.closed_q
+
         if interface:
             ChannelFactoryInitialize(int(domain), interface)
         else:
@@ -40,7 +43,6 @@ class Dex1Single:
         self.publisher = ChannelPublisher(self.command_topic, MotorCmds_)
         self.publisher.Init()
         self.subscriber = ChannelSubscriber(self.state_topic, MotorStates_)
-        self.subscriber.Init()
 
         self.message = MotorCmds_()
         self.message.cmds = [unitree_go_msg_dds__MotorCmd_()]
@@ -59,7 +61,7 @@ class Dex1Single:
         self._command_count = 0
         self._command_publish_ok: bool | None = None
         self._command_publish_fail_count = 0
-        self._q = DEX1_MAX_RANGE
+        self._q = self.open_q
         self._tau = 0.0
         self._tau_zero_samples: list[float] = []
         self._tau_zero = 0.0
@@ -67,10 +69,9 @@ class Dex1Single:
         self._grip_torque_limit = float(grip_torque_limit)
         self._alpha = float(np.clip(torque_filter_alpha, 0.0, 0.999))
         self._latched_q: float | None = None
-        self.last_command = DEX1_MAX_RANGE
+        self.last_command = self.open_q
 
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+        self.subscriber.Init(self._receive_state)
 
         deadline = time.monotonic() + float(feedback_timeout)
         while not self.state_received and time.monotonic() < deadline:
@@ -85,21 +86,21 @@ class Dex1Single:
             f"cmd={self.command_topic}, state={self.state_topic}"
         )
 
-    def _read_loop(self) -> None:
-        while self._running:
-            message = self.subscriber.Read()
-            if message is not None and getattr(message, "states", None):
-                state = message.states[0]
-                with self._lock:
-                    self._q = float(state.q)
-                    self._tau = float(state.tau_est)
-                    self._state_received = True
-                    self._state_received_monotonic = time.monotonic()
-                    self._state_received_time_ns = time.time_ns()
-                    if len(self._tau_zero_samples) < 100:
-                        self._tau_zero_samples.append(self._tau)
-                        self._tau_zero = float(np.mean(self._tau_zero_samples))
-            time.sleep(0.002)
+    def _receive_state(self, message) -> None:
+        if not self._running or not getattr(message, "states", None):
+            return
+        state = message.states[0]
+        if not np.isfinite([state.q, state.dq, state.tau_est]).all():
+            return
+        with self._lock:
+            self._q = float(state.q)
+            self._tau = float(state.tau_est)
+            self._state_received = True
+            self._state_received_monotonic = time.monotonic()
+            self._state_received_time_ns = time.time_ns()
+            if len(self._tau_zero_samples) < 100:
+                self._tau_zero_samples.append(self._tau)
+                self._tau_zero = float(np.mean(self._tau_zero_samples))
 
     @property
     def state_received(self) -> bool:
@@ -126,9 +127,11 @@ class Dex1Single:
         return target
 
     def set_closed_ratio(self, ratio: float) -> None:
+        if not np.isfinite(ratio):
+            raise ValueError("Non-finite gripper ratio")
         ratio = float(np.clip(ratio, 0.0, 1.0))
-        target = (1.0 - ratio) * DEX1_MAX_RANGE
-        target = float(np.clip(self._force_limited_target(target), 0.0, DEX1_MAX_RANGE))
+        target = self.open_q - ratio * self.travel
+        target = float(np.clip(self._force_limited_target(target), self.closed_q, self.open_q))
         self.message.cmds[0].q = target
         publish_ok = bool(self.publisher.Write(self.message))
         with self._lock:
@@ -156,12 +159,16 @@ class Dex1Single:
             command_publish_ok = self._command_publish_ok
             command_publish_fail_count = self._command_publish_fail_count
             last_command = self.last_command
+            force_latched = self._latched_q is not None
         now = time.monotonic()
         feedback_age = now - state_received_monotonic if state_received_monotonic else None
         command_age = now - command_sent_monotonic if command_sent_monotonic else None
         return {
-            "hand_state": [q / DEX1_MAX_RANGE],
-            "hand_cmd": [last_command / DEX1_MAX_RANGE],
+            "motor_q": float(q),
+            "motor_command_q": float(last_command),
+            "force_latched": force_latched,
+            "hand_state": [float(np.clip((q-self.closed_q)/self.travel, 0., 1.))],
+            "hand_cmd": [float(np.clip((last_command-self.closed_q)/self.travel, 0., 1.))],
             "hand_torque": [tau],
             "feedback_age_s": feedback_age,
             "feedback_time_ns": state_received_time_ns or None,
@@ -174,5 +181,9 @@ class Dex1Single:
         }
 
     def stop(self) -> None:
-        self._running = False
-        self._thread.join(timeout=1.0)
+        if self._running:
+            self._running = False
+            try:
+                self.subscriber.Close()
+            finally:
+                self.publisher.Close()

@@ -23,6 +23,8 @@ episodes. ``DEFAULT_CAMERAS`` uses the external view plus the wrist view.
 from __future__ import annotations
 
 import os
+import math
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass
@@ -41,13 +43,19 @@ CAMERA_KEY_CHOICES = (
 
 BACKEND_CHOICES = ("v4l2", "realsense")
 
-#: The SN0002 UVC camera is the external/scene view, the D405 sits on the arm.
-#: The SN0002 negotiates 640x480 or 1280x720 only (800x600 silently falls back
-#: to 640x480); both cameras default to 640x480 to match the sim observations.
+#: Historical recording roles: D405 head view, JR0002 right wrist view.
 DEFAULT_CAMERAS = (
-    "key=color_0_head_left,backend=v4l2,match=SN0002,"
+    "key=color_0_head_left,backend=realsense,device=auto,size=640x480,fps=30,auto_exposure=false,exposure=8000,gain=16",
+    "key=color_3_wrist_right,backend=v4l2,match=JR0002,"
     "size=640x480,fps=30,fourcc=MJPG",
-    "key=color_3_wrist_right,backend=realsense,device=auto,size=640x480,fps=30",
+)
+
+#: JR0001 is the additional left-wrist device; verify its physical view on site.
+DUAL_DEFAULT_CAMERAS = (
+    DEFAULT_CAMERAS[0],
+    "key=color_2_wrist_left,backend=v4l2,match=JR0001,"
+    "size=640x480,fps=30,fourcc=MJPG",
+    DEFAULT_CAMERAS[1],
 )
 
 #: RealSense pixel formats tried in order.  ``bgr8``/``rgb8`` need USB 3.x
@@ -67,6 +75,9 @@ class CameraSpec:
     height: int = 480
     fps: float = 30.0
     fourcc: str = ""
+    exposure: float | None = None
+    auto_exposure: bool | None = None
+    gain: float | None = None
 
     @property
     def size(self) -> tuple[int, int]:
@@ -95,6 +106,7 @@ def parse_camera_spec(text: str) -> CameraSpec:
 
     unknown = set(fields) - {
         "key", "backend", "device", "match", "size", "fps", "fourcc",
+        "exposure", "auto_exposure", "gain",
     }
     if unknown:
         raise ValueError(f"unknown camera spec field(s): {sorted(unknown)}")
@@ -115,6 +127,16 @@ def parse_camera_spec(text: str) -> CameraSpec:
             raise ValueError(f"camera size must be WxH: {fields['size']!r}")
         width, height = int(parts[0]), int(parts[1])
 
+    auto = fields.get("auto_exposure")
+    if auto is not None and auto.lower() not in ("true", "false", "1", "0"):
+        raise ValueError("auto_exposure must be true/false or 1/0")
+    if auto is not None and auto.lower() in ("true", "1") and "exposure" in fields:
+        raise ValueError("manual exposure conflicts with auto_exposure=true")
+    for name in ("fps", "exposure", "gain"):
+        if name in fields and not math.isfinite(float(fields[name])):
+            raise ValueError(f"{name} must be finite")
+    if width <= 0 or height <= 0 or float(fields.get("fps", 30)) <= 0:
+        raise ValueError("camera dimensions and fps must be positive")
     return CameraSpec(
         key=key,
         backend=backend,
@@ -124,6 +146,9 @@ def parse_camera_spec(text: str) -> CameraSpec:
         height=height,
         fps=float(fields.get("fps", 30.0)),
         fourcc=fields.get("fourcc", "").upper(),
+        exposure=float(fields["exposure"]) if "exposure" in fields else None,
+        auto_exposure=None if auto is None else auto.lower() in ("true", "1"),
+        gain=float(fields["gain"]) if "gain" in fields else None,
     )
 
 
@@ -134,22 +159,22 @@ def resolve_v4l2_device(spec: CameraSpec) -> str:
     survive re-enumeration (video indices change on every replug).
     """
     if spec.device:
-        return spec.device
+        return os.path.realpath(spec.device)
     if spec.match:
         by_id = "/dev/v4l/by-id"
         try:
             for name in sorted(os.listdir(by_id)):
                 if spec.match.lower() in name.lower() and name.endswith("video-index0"):
-                    return f"{by_id}/{name}"
+                    return os.path.realpath(f"{by_id}/{name}")
         except OSError:
             pass
         raise RuntimeError(
             f"no V4L2 camera matching {spec.match!r} under /dev/v4l/by-id; "
-            "run scripts/probe_r1arm_cameras.py to list what is connected"
+            "run scripts/verify_r1arm_right_cameras.py to list what is connected"
         )
     raise RuntimeError(
         f"camera {spec.key} needs device= or match=; "
-        "run scripts/probe_r1arm_cameras.py to list what is connected"
+        "run scripts/verify_r1arm_right_cameras.py to list what is connected"
     )
 
 
@@ -169,6 +194,7 @@ class _CameraWorker(threading.Thread):
         #: Cleared by ``resolve_active`` when the camera stops delivering.
         self.usable = True
         self._lock = threading.Lock()
+        self._history = deque(maxlen=30)
         self._frame: np.ndarray | None = None
         self._received_at_ns = 0
         self._received_monotonic_ns = 0
@@ -181,8 +207,13 @@ class _CameraWorker(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def snapshot(self) -> tuple[np.ndarray | None, int, int, int, float | None]:
+    def snapshot(self, at_monotonic_ns=None) -> tuple[np.ndarray | None, int, int, int, float | None]:
         with self._lock:
+            if at_monotonic_ns is not None:
+                for frame, count, wall, mono, device in reversed(self._history):
+                    if mono <= at_monotonic_ns:
+                        return frame.copy(), count, wall, mono, device
+                return None, -1, 0, 0, None
             if self._frame is None:
                 return None, -1, 0, 0, None
             # Copy so the writer cannot race with the capture thread.
@@ -232,6 +263,8 @@ class _CameraWorker(threading.Thread):
             self._received_monotonic_ns = time.monotonic_ns()
             self._device_timestamp_ms = device_timestamp_ms
             self.frames_seen += 1
+            self._history.append((frame,self.frames_seen,self._received_at_ns,
+                                  self._received_monotonic_ns,device_timestamp_ms))
 
     def describe(self) -> str:
         return f"{self.spec.label()} status={self.status} frames={self.frames_seen}"
@@ -269,7 +302,22 @@ class V4L2Camera(_CameraWorker):
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.spec.width)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.spec.height)
         capture.set(cv2.CAP_PROP_FPS, self.spec.fps)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # JR0001/JR0002 lose frame throughput with a single queued V4L2 buffer.
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        settings = []
+        if self.spec.auto_exposure is not None or self.spec.exposure is not None:
+            enabled = self.spec.auto_exposure if self.spec.auto_exposure is not None else False
+            settings.append((cv2.CAP_PROP_AUTO_EXPOSURE, 3.0 if enabled else 1.0))
+        if self.spec.exposure is not None:
+            settings.append((cv2.CAP_PROP_EXPOSURE, self.spec.exposure))
+        if self.spec.gain is not None:
+            settings.append((cv2.CAP_PROP_GAIN, self.spec.gain))
+        for prop, value in settings:
+            if not capture.set(prop, value):
+                capture.release()
+                self.status = "settings-failed"
+                self.detail = f"camera rejected property {prop}={value}"
+                return False
         self._capture = capture
         self.status = "open"
         self.detail = self.device_path
@@ -343,6 +391,30 @@ class RealSenseCamera(_CameraWorker):
         )
         return config
 
+    def _set_exposure(self) -> None:
+        settings = []
+        rs = self._rs
+        if self.spec.auto_exposure is not None or self.spec.exposure is not None:
+            enabled = self.spec.auto_exposure if self.spec.auto_exposure is not None else False
+            settings.append((rs.option.enable_auto_exposure, float(enabled)))
+        if self.spec.exposure is not None:
+            settings.append((rs.option.exposure, self.spec.exposure))
+        if self.spec.gain is not None:
+            settings.append((rs.option.gain, self.spec.gain))
+        if not settings:
+            return
+        sensors = self._pipeline.get_active_profile().get_device().query_sensors()
+        sensor = next((item for item in sensors if all(item.supports(option) for option, _ in settings)), None)
+        if sensor is None:
+            raise RuntimeError("No RealSense sensor supports the requested exposure controls")
+        for option, value in settings:
+            if not sensor.supports(option):
+                raise RuntimeError(f"RealSense does not support {option}")
+            limits = sensor.get_option_range(option)
+            if not limits.min <= value <= limits.max:
+                raise ValueError(f"{option}={value} outside {limits.min}..{limits.max}")
+            sensor.set_option(option, float(value))
+
     def _open(self) -> bool:
         try:
             import pyrealsense2 as rs
@@ -366,8 +438,17 @@ class RealSenseCamera(_CameraWorker):
                     continue
                 if self._warm_up(pipeline):
                     self._pipeline = pipeline
+                    try:
+                        self._set_exposure()
+                    except Exception as exc:  # noqa: BLE001 - report unsupported camera settings
+                        self.detail = f"exposure setting failed: {exc}"
+                        self._close()
+                        continue
                     self.status = "open"
-                    self.detail = f"{pixel_format} attempt {attempt + 1}"
+                    self.detail = (
+                        f"{pixel_format} attempt {attempt + 1}"
+                        + (f", exposure={self.spec.exposure:g}" if self.spec.exposure is not None else "")
+                    )
                     return True
                 try:
                     pipeline.stop()
@@ -400,7 +481,7 @@ class RealSenseCamera(_CameraWorker):
     def _convert(self, frame) -> np.ndarray:
         raw = np.asanyarray(frame.get_data())
         if self.pixel_format == "bgr8":
-            return raw
+            return raw.copy()  # Retain ownership after librealsense recycles its frame buffer.
         if self.pixel_format == "rgb8":
             return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
         return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_YUY2)
@@ -549,7 +630,7 @@ class LocalCameraSubscriber:
             sources.append(worker.describe())
         return tuple(frames), min(counters), min(stamps), tuple(sources)
 
-    def get_atomic_snapshot(self) -> dict:
+    def get_atomic_snapshot(self, at_monotonic_ns=None) -> dict:
         """Return images and all per-camera identity/timing from one read per worker."""
         workers = self._active_workers()
         if not workers:
@@ -558,7 +639,7 @@ class LocalCameraSubscriber:
                     "source_streams": ()}
         frames, ids, wall, mono, device, sources = [], {}, {}, {}, {}, []
         for worker in workers:
-            frame, frame_id, wall_ns, mono_ns, device_ms = worker.snapshot()
+            frame, frame_id, wall_ns, mono_ns, device_ms = worker.snapshot(at_monotonic_ns)
             if frame is None:
                 return {"frames": None, "frame_ids": {}, "received_at_ns": {},
                         "received_monotonic_ns": {}, "device_timestamp_ms": {},

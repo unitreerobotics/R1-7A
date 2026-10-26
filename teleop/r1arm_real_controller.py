@@ -12,7 +12,7 @@ from robot.r1arm_config import ARM_JOINTS, ARM_LIMITS, R1ArmConfig
 from robot.arm_model import clamp_configuration
 from robot.r1arm_sdk import R1ArmSdkBus, R1ArmSdkState, model_to_sdk_q, sdk_to_model_q
 from teleop.r1arm_controller_base import R1ArmTeleopControllerBase
-from teleop.r1arm_placo_solver import joint_delta_bounds
+from teleop.joint_trajectory import command_interval
 
 
 MODEL_LOWER = np.array([ARM_LIMITS[name][0] for name in ARM_JOINTS], dtype=float)
@@ -30,6 +30,8 @@ def limit_sdk_position_command(
     *,
     max_delta: float,
     max_lead: float,
+    lower_limit: np.ndarray | None = None,
+    upper_limit: np.ndarray | None = None,
 ) -> np.ndarray:
     """Apply hard limits, per-cycle slew limiting and measured-position lead limiting."""
     target = np.asarray(target, dtype=float).reshape(7)
@@ -37,10 +39,12 @@ def limit_sdk_position_command(
     measured = np.asarray(measured, dtype=float).reshape(7)
     if not all(np.all(np.isfinite(values)) for values in (target, previous, measured)):
         raise RuntimeError("Non-finite R1Arm command/feedback")
+    hard_lower = SDK_LOWER if lower_limit is None else np.asarray(lower_limit)
+    hard_upper = SDK_UPPER if upper_limit is None else np.asarray(upper_limit)
     delta = abs(float(max_delta))
     lead = abs(float(max_lead))
-    slew_lower = np.maximum(SDK_LOWER, previous - delta)
-    slew_upper = np.minimum(SDK_UPPER, previous + delta)
+    slew_lower = np.maximum(hard_lower, previous - delta)
+    slew_upper = np.minimum(hard_upper, previous + delta)
     lower = np.maximum(slew_lower, measured - lead)
     upper = np.minimum(slew_upper, measured + lead)
     feasible = lower <= upper
@@ -49,7 +53,7 @@ def limit_sdk_position_command(
     # If measured position is already farther from the previous command than
     # lead + slew permits, preserve the hard per-cycle slew and catch up over
     # subsequent cycles; both constraints cannot hold on this one cycle.
-    return np.clip(command, SDK_LOWER, SDK_UPPER)
+    return np.clip(command, hard_lower, hard_upper)
 
 
 class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
@@ -66,6 +70,7 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         motion_mode: bool = False,
         enable_dex1: bool = False,
         dex1_interface: str = "",
+        dex1_side: str = "",
         dex1_domain: int = 0,
         grip_torque_limit: float = -1.0,
         kp: "float | np.ndarray" = 40.0,
@@ -105,6 +110,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.bridge_library = bridge_library
         self.enable_dex1 = bool(enable_dex1)
         self.dex1_interface = str(dex1_interface)
+        self.dex1_side = str(dex1_side or config.control_side)
+        if self.dex1_side not in {"left", "right"}:
+            raise ValueError(f"Dex1 side must be left or right, got {self.dex1_side!r}")
         self.dex1_domain = int(dex1_domain)
         self.grip_torque_limit = float(grip_torque_limit)
         # Scalar gains broadcast to all joints via the legacy bridge ABI; a
@@ -127,6 +135,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self.tau_clip = float(tau_clip)
         self.max_command_lead = float(max_command_lead)
         self.feedback_timeout = float(feedback_timeout)
+        self._issued_velocity = np.zeros(7)
+        self._issued_acceleration = np.zeros(7)
         self.foc_timeout = float(foc_timeout)
         self.home_on_start = bool(home_on_start)
         self.bus_factory = bus_factory
@@ -173,6 +183,10 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
 
     @staticmethod
     def _check_faults(state: R1ArmSdkState, require_foc: bool) -> None:
+        if np.any(state.timeout):
+            raise RuntimeError("R1Arm motor feedback timeout")
+        if not all(np.isfinite(x).all() for x in (state.q, state.dq, state.tau_est)):
+            raise RuntimeError("R1Arm non-finite motor feedback")
         faults = np.flatnonzero(state.error_code != 0)
         if faults.size:
             detail = ", ".join(
@@ -216,9 +230,20 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             track.clear()
         self.active = False
         self.command_sdk = state.q.copy()
+        self._update_startup_recovery_bounds()
         self.last_state = state
         self._reset_trajectory_state(self.control_side, q)
         self._last_command_monotonic_s = time.monotonic()
+
+    def _update_startup_recovery_bounds(self) -> None:
+        # Range-checked startup offsets may recover inward without a position jump.
+        # Each issued position contracts the corridor back to the URDF limits.
+        self._command_lower = np.minimum(SDK_LOWER, self.command_sdk)
+        self._command_upper = np.maximum(SDK_UPPER, self.command_sdk)
+        model_q = sdk_to_model_q(self.command_sdk)
+        self._trajectory_position_bounds = (
+            np.minimum(MODEL_LOWER, model_q), np.maximum(MODEL_UPPER, model_q)
+        )
 
     def _enable_foc_hold(self) -> R1ArmSdkState:
         assert self.arm_bus is not None and self.command_sdk is not None
@@ -250,6 +275,18 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             )
 
         try:
+            # DDS discovery waits for feedback; finish it before enabling the arm
+            # and starting its feedback/command watchdog clocks.
+            if self.enable_dex1:
+                from robot.eef.dex1_single import Dex1Single
+
+                self.hand_ctrl = Dex1Single(
+                    side=self.dex1_side,
+                    interface=self.dex1_interface,
+                    domain=self.dex1_domain,
+                    grip_torque_limit=self.grip_torque_limit,
+                )
+
             self.arm_bus = self.bus_factory(self.bridge_library)
             self.arm_bus.open(self.port, self.baudrate, self.calibration_path)
             print("Probing all 7 joints with zero-gain FOC; keep the arm supported...")
@@ -259,6 +296,7 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             print("  model q =", np.array2string(self.arm_q(), precision=3))
             state = self._enable_foc_hold()
             self.last_state = state
+            self._feedback_stream_diagnostics(state,time.monotonic_ns())
             print("All 7 joints are in FOC and holding the measured startup pose")
 
             if self.home_on_start:
@@ -270,16 +308,6 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                     f"{self.reset_blend_frames} frames); keep the arm clear..."
                 )
                 self.reset()
-
-            if self.enable_dex1:
-                from robot.eef.dex1_single import Dex1Single
-
-                self.hand_ctrl = Dex1Single(
-                    side=self.control_side,
-                    interface=self.dex1_interface,
-                    domain=self.dex1_domain,
-                    grip_torque_limit=self.grip_torque_limit,
-                )
         except Exception:
             self._safe_stop_arm()
             raise
@@ -336,6 +364,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "dex1_command_open_ratio": 1.0 - closed_ratio,
             "dex1_state_open_ratio": None,
             "dex1_tau_est": None,
+            "dex1_motor_q": None,
+            "dex1_motor_command_q": None,
+            "dex1_force_latched": None,
             "dex1_feedback_valid": False,
             "dex1_feedback_age_s": None,
             "dex1_feedback_time_ns": None,
@@ -350,6 +381,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         if self.hand_ctrl is not None:
             try:
                 data = self.hand_ctrl.get_record_data()
+                diagnostics["dex1_motor_q"] = data.get("motor_q")
+                diagnostics["dex1_motor_command_q"] = data.get("motor_command_q")
+                diagnostics["dex1_force_latched"] = data.get("force_latched")
                 diagnostics["dex1_command_open_ratio"] = float(data["hand_cmd"][0])
                 diagnostics["dex1_state_open_ratio"] = float(data["hand_state"][0])
                 diagnostics["dex1_tau_est"] = float(data["hand_torque"][0])
@@ -447,9 +481,12 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                 "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
                 "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
                 "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+                "xr_filter_enabled": False,
+                "xr_input_status": self._xr_input_status,
                 "xr_frame_stamp_ns": int(getattr(self, "_xr_last_stamp", 0) or 0),
                 "xr_received_monotonic_ns": int(getattr(self, "_xr_received_monotonic_ns", 0)),
                 "xr_valid": bool(getattr(self, "_xr_valid_last", False)),
+                "xr_native": getattr(getattr(self, '_xr_cycle_snapshot', None), 'metadata', {}),
                 "xr_seq": int(getattr(self, "_xr_frame_seq", 0)),
                 "control_mode": (
                     "home_reset" if self._reset_blending else
@@ -469,9 +506,12 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
 
         feedback_read_start_ns = time.time_ns()
         feedback_read_start_monotonic_ns = time.monotonic_ns()
-        state = self.arm_bus.read_state()
+        cached = getattr(self, "_cycle_feedback", None)
+        state = cached if cached is not None else self.arm_bus.read_state()
         feedback_read_end_ns = time.time_ns()
         feedback_read_end_monotonic_ns = time.monotonic_ns()
+        if cached is not None:
+            feedback_read_start_ns, feedback_read_start_monotonic_ns, feedback_read_end_ns, feedback_read_end_monotonic_ns = self._cycle_feedback_read
         feedback_time_ns = feedback_read_end_ns
         feedback_stream = self._feedback_stream_diagnostics(
             state, feedback_read_end_monotonic_ns
@@ -485,15 +525,18 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             now_mono_s - self._last_command_monotonic_s
             if self._last_command_monotonic_s is not None else 1.0 / self.rate_hz
         )
-        command_dt = float(np.clip(command_dt, 1e-4, 0.1))
+        command_dt = command_interval(command_dt)
+        lower = getattr(self, '_command_lower', None)
+        upper = getattr(self, '_command_upper', None)
+        lower = SDK_LOWER if lower is None else lower
+        upper = SDK_UPPER if upper is None else upper
         command = limit_sdk_position_command(
-            target_sdk,
-            self.command_sdk,
-            state.q,
-            max_delta=self._sdk_max_delta(command_dt),
-            max_lead=self.max_command_lead,
-        )
-        dq_target_sdk = (command - self.command_sdk) / command_dt
+            target_sdk, self.command_sdk, state.q,
+            max_delta=self._sdk_max_delta(command_dt), max_lead=self.max_command_lead,
+            lower_limit=lower, upper_limit=upper)
+        dq_target_sdk = (command-self.command_sdk)/command_dt
+        # Diagnostic derivative only; do not run a second trajectory generator.
+        issued_a = (dq_target_sdk-self._issued_velocity)/command_dt
         command_send_start_ns = time.time_ns()
         command_send_start_monotonic_ns = time.monotonic_ns()
         self.arm_bus.command_position(
@@ -504,6 +547,8 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         self._last_command_monotonic_s = now_mono_s
         self._last_command_dt = command_dt
         self.command_sdk = command
+        self._update_startup_recovery_bounds()
+        self._issued_velocity,self._issued_acceleration = dq_target_sdk,issued_a
         self.last_state = state
         self._reconcile_ik_seed(target_sdk, command)
         purpose_model = self.arm_q().copy()
@@ -537,6 +582,9 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "q_ik_raw": self._last_ik_raw.get(self.control_side, purpose_model).copy(),
             "q_motor_target": sdk_to_model_q(command),
             "dq_target": sdk_to_model_q(dq_target_sdk),
+            "ddq_target": sdk_to_model_q(issued_a),
+            "command_dt_s": command_dt,
+            "lead_limit_exceeded": bool(np.any(np.abs(command-state.q) > self.max_command_lead+1e-9)),
             "q_measured": sdk_to_model_q(state.q.copy()),
             "dq_measured": sdk_to_model_q(state.dq.copy()),
             "tau_est": sdk_to_model_q(state.tau_est.copy()),
@@ -544,9 +592,14 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "ik_solver": self._last_ik_solver.get(self.control_side, "hold"),
             "xr_raw": None if xr_raw_pose is None else xr_raw_pose.copy(),
             "xr_filtered": None if xr_filtered_pose is None else xr_filtered_pose.copy(),
+            "xr_filter_enabled": False,
+            "xr_input_status": self._xr_input_status,
             "xr_frame_stamp_ns": int(getattr(self, "_xr_last_stamp", 0) or 0),
             "xr_received_monotonic_ns": int(getattr(self, "_xr_received_monotonic_ns", 0)),
             "xr_valid": bool(getattr(self, "_xr_valid_last", False)),
+            "xr_native": getattr(getattr(self, '_xr_cycle_snapshot', None), 'metadata', {}),
+            "xr_cache_age_s": getattr(self, "_xr_cache_age_s", None),
+            "xr_cache_stale": bool(getattr(self, "_xr_cache_stale", False)),
             "xr_seq": int(getattr(self, "_xr_frame_seq", 0)),
             "control_mode": (
                 "home_reset" if self._reset_blending else
@@ -555,6 +608,12 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "grip_active": bool(self.track[self.control_side].active),
             **diagnostics,
         })
+        writer = getattr(self, "gripper_diagnostic_writer", None)
+        if writer is not None:
+            row = dict(diagnostics, time_ns=command_time_ns,
+                       home_reset=self._reset_blending,
+                       gripper_wait_release=self.control_side in self._gripper_wait_release)
+            writer.writerow({name: row.get(name) for name in writer.fieldnames})
         if self.debug and time.monotonic() - self.last_report_time >= 1.0:
             self.last_report_time = time.monotonic()
             error = command - state.q
@@ -566,9 +625,19 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
                 " error=",
                 np.array2string(error, precision=3),
             )
+            if self.hand_ctrl is not None:
+                print(
+                    f"[dex1/{self.dex1_side}] trigger={diagnostics['trigger_value']:.3f} "
+                    f"valid={diagnostics['trigger_valid']} "
+                    f"wait_open_release={self.control_side in self._gripper_wait_release} "
+                    f"target_rad={diagnostics['dex1_motor_command_q']} "
+                    f"measured_rad={diagnostics['dex1_motor_q']} "
+                    f"publish_ok={diagnostics['dex1_publish_ok']} "
+                    f"force_latched={diagnostics['dex1_force_latched']}"
+                )
 
     def _sdk_max_delta(self, dt: float) -> float:
-        return self.max_delta
+        return self.max_joint_speed * command_interval(dt)
 
     def _safe_stop_arm(self) -> None:
         bus = self.arm_bus
@@ -592,170 +661,3 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
     def _on_stop(self) -> None:
         self._safe_stop_arm()
         super()._on_stop()
-
-
-class R1ArmUnshapedIKTeleopController(R1ArmRealTeleopController):
-    """Direct IK tracking; home and grip-release transitions stay shaped."""
-
-    def __init__(self, config: R1ArmConfig, *, max_joint_speed: float = 0.5, **kwargs) -> None:
-        # Move the speed constraint into the IK solvers instead of post-IK shaping.
-        config.ik_qp_velocity_limit = float(max_joint_speed)
-        super().__init__(config, max_joint_speed=max_joint_speed, **kwargs)
-        self._dls_max_step = self.max_delta
-
-    def _solve(self, side: str, target_pos: np.ndarray, target_quat: np.ndarray | None) -> None:
-        q = self._q_for_side(side)
-        solver_seed = self._solver_seeds.get(side, q)
-        solver = self._placo_for_side(side)
-        q_next = None
-        solver_name = "dls"
-        if self.use_placo and solver is not None:
-            sol = solver.solve(solver_seed, target_pos, target_quat)
-            if sol is not None:
-                q_next = q.copy()
-                for idx in self.arm_q_indices:
-                    q_next[idx] = sol[idx]
-                solver_name = "placo"
-        if q_next is None:
-            q_next = self._solve_dls(solver_seed, target_pos, target_quat)
-        q_next = clamp_configuration(self.model, q_next)
-        dt = min(max(float(getattr(self, "_step_dt", 1.0 / self.rate_hz)), 1e-4), 0.1)
-        self._ensure_trajectory_state(side, q)
-        q_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
-        v_cmd = (q_cmd - self._trajectory_q_cmd[side]) / dt
-        a_cmd = np.clip(
-            (v_cmd - self._trajectory_v_cmd[side]) / dt,
-            -self.config.ik_max_acc_per_s2,
-            self.config.ik_max_acc_per_s2,
-        )
-        # Keep transition state current for a smooth release, without shaping
-        # the active IK result itself.
-        self._trajectory_q_cmd[side] = q_cmd
-        self._trajectory_v_cmd[side] = v_cmd
-        self._trajectory_a_cmd[side] = a_cmd
-        self._set_q_for_side(side, q_next)
-        self._solver_seeds[side] = q_next.copy()
-        self._last_ik_raw[side] = q_cmd.copy()
-        self._last_ik_solver[side] = solver_name
-
-
-class R1ArmQPConstrainedIKTeleopController(R1ArmRealTeleopController):
-    """Active IK with optional velocity/acceleration/jerk QP bounds."""
-
-    def __init__(
-        self, config: R1ArmConfig, *, max_joint_speed: float = 1.0,
-        qp_jerk_limit: float | None = None, **kwargs,
-    ) -> None:
-        config.ik_qp_velocity_limit = float(max_joint_speed)
-        config.ik_qp_acceleration_limit = float(config.ik_max_acc_per_s2)
-        config.ik_qp_jerk_limit = (
-            float(qp_jerk_limit) if qp_jerk_limit is not None and qp_jerk_limit > 0.0 else None
-        )
-        super().__init__(config, max_joint_speed=max_joint_speed, **kwargs)
-        per_joint = config.ik_joint_velocity_limits or {}
-        self._qp_velocity_limits = np.array([
-            float(per_joint.get(name, max_joint_speed)) for name in ARM_JOINTS
-        ])
-        self._qp_velocity_limits = np.where(
-            self._qp_velocity_limits > 0.0,
-            self._qp_velocity_limits,
-            float(max_joint_speed),
-        )
-        self._qp_acceleration_limit = float(config.ik_max_acc_per_s2)
-        self._qp_jerk_limit = config.ik_qp_jerk_limit
-        self._qp_action_state: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._qp_last_motor_q: np.ndarray | None = None
-        self._qp_last_motor_v = np.zeros(7)
-
-    def _seed_model_from_feedback(self, state: R1ArmSdkState) -> None:
-        super()._seed_model_from_feedback(state)
-        self._qp_last_motor_q = sdk_to_model_q(state.q.copy())
-        self._qp_last_motor_v = np.zeros(7)
-
-    def _action_trajectory_state(
-        self, side: str, q: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._last_ik_solver.get(side) in {
-            "placo_va_qp", "dls_va_projected", "placo_vaj_qp", "dls_vaj_projected"
-        }:
-            state = self._qp_action_state.get(side)
-            if state is not None:
-                return tuple(value.copy() for value in state)
-        return super()._action_trajectory_state(side, q)
-
-    def _solve(self, side: str, target_pos: np.ndarray, target_quat: np.ndarray | None) -> None:
-        q = self._q_for_side(side)
-        solver_seed = self._solver_seeds.get(side, q).copy()
-        self._ensure_trajectory_state(side, q)
-        dt = float(np.clip(getattr(self, "_step_dt", 1.0 / self.rate_hz), 1e-4, 0.1))
-        previous_velocity = self._trajectory_v_cmd[side].copy()
-        solver = self._placo_for_side(side)
-        q_next = None
-        q_raw = None
-        suffix = "vaj" if self._qp_jerk_limit is not None else "va"
-        solver_name = f"dls_{suffix}_projected"
-        previous_acceleration = self._trajectory_a_cmd[side].copy()
-
-        if self.use_placo and solver is not None:
-            sol = solver.solve(
-                solver_seed, target_pos, target_quat,
-                dt=dt, previous_velocity=previous_velocity,
-                previous_acceleration=previous_acceleration,
-            )
-            if sol is not None:
-                q_next = solver_seed.copy()
-                for idx in self.arm_q_indices:
-                    q_next[idx] = sol[idx]
-                q_raw = q_next.copy()
-                solver_name = f"placo_{suffix}_qp"
-
-        if q_next is None:
-            lower, upper = joint_delta_bounds(
-                previous_velocity, self._qp_velocity_limits,
-                self._qp_acceleration_limit, dt,
-                previous_acceleration=previous_acceleration,
-                jerk_limit=self._qp_jerk_limit,
-            )
-            q_raw = self._solve_dls(solver_seed, target_pos, target_quat)
-            q_next = solver_seed.copy()
-            for i, idx in enumerate(self.arm_q_indices):
-                delta = float(q_raw[idx] - solver_seed[idx])
-                q_next[idx] = solver_seed[idx] + float(np.clip(delta, lower[i], upper[i]))
-
-        q_next = clamp_configuration(self.model, q_next)
-        q_cmd = np.asarray([q_next[idx] for idx in self.arm_q_indices], dtype=float)
-        q_prev = np.asarray([solver_seed[idx] for idx in self.arm_q_indices], dtype=float)
-        v_next = (q_cmd - q_prev) / dt
-        a_next = (v_next - previous_velocity) / dt
-        self._trajectory_q_cmd[side] = q_cmd.copy()
-        self._trajectory_v_cmd[side] = v_next.copy()
-        self._trajectory_a_cmd[side] = a_next.copy()
-        self._qp_action_state[side] = (q_cmd.copy(), v_next.copy(), a_next.copy())
-        self._set_q_for_side(side, q_next)
-        self._solver_seeds[side] = q_next.copy()
-        self._last_ik_raw[side] = np.asarray(
-            [q_raw[idx] for idx in self.arm_q_indices], dtype=float
-        )
-        self._last_ik_solver[side] = solver_name
-
-    def _reconcile_ik_seed(self, target_sdk: np.ndarray, command_sdk: np.ndarray) -> None:
-        command_q = sdk_to_model_q(command_sdk)
-        dt = float(np.clip(self._last_command_dt, 1e-4, 0.1))
-        if self._qp_last_motor_q is None:
-            command_v = np.zeros(7)
-        else:
-            command_v = (command_q - self._qp_last_motor_q) / dt
-        command_a = (command_v - self._qp_last_motor_v) / dt
-        self._qp_last_motor_q = command_q.copy()
-        self._qp_last_motor_v = command_v.copy()
-
-        seed = self.q.copy()
-        for idx, value in zip(self.arm_q_indices, command_q):
-            seed[idx] = value
-        self._solver_seeds[self.control_side] = seed
-        self._trajectory_q_cmd[self.control_side] = command_q.copy()
-        self._trajectory_v_cmd[self.control_side] = command_v.copy()
-        self._trajectory_a_cmd[self.control_side] = command_a.copy()
-
-    def _sdk_max_delta(self, dt: float) -> float:
-        return self.max_joint_speed * dt

@@ -4,8 +4,7 @@
 Reads ``actions.q_purpose`` (the already-shaped action) or measured
 ``states.joint_state`` from an MCAP episode written by ``record_r1arm_real.py``.
 By default, the action trajectory is replayed without another trajectory
-shaper. ``--reshape-raw-ik`` optionally replays recorded ``q_ik_raw`` through
-the same q/v/a shaper to compare shaper gains against a fixed raw-IK trace.
+shaper. The baseline replays the recorded shaped command directly.
 
 The arm is driven in FOC position mode through ``R1ArmSdkBus`` with SDK-side
 slew, lead, and joint-limit guards. Frames use recorded ``sample_time_ns``;
@@ -24,12 +23,19 @@ reachable and support the arm during startup probing.
 from __future__ import annotations
 
 import argparse
+import os
+import base64
 import csv
 import json
 import sys
 import time
 from pathlib import Path
 
+# The OpenCV wheel in r1_teleop ships the xcb Qt plugin, not the Wayland one.
+if os.environ.get("QT_QPA_PLATFORM") == "wayland":
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+import cv2
 import numpy as np
 
 
@@ -61,6 +67,7 @@ from teleop.r1arm_real_controller import (
 )
 
 JOINT_COUNT = 7
+PREVIEW_WINDOW = "R1Arm real replay observations"
 
 
 def _episode_id(path: Path) -> int:
@@ -84,7 +91,7 @@ def resolve_episode(target: Path) -> Path:
 
 def load_episode_states(
     path: Path, section_mode: str = "state", data_source: str = "auto"
-) -> tuple[list[np.ndarray], list[dict], dict, dict]:
+) -> tuple[list[np.ndarray], list[dict], dict, dict, list[dict]]:
     """Return ordered 8-DoF vectors (arm 7 + gripper 1), raw frames, metadata.
 
     ``section_mode="state"`` reads measured ``states.joint_state``;
@@ -108,6 +115,7 @@ def load_episode_states(
                 frames.append(payload)
             else:
                 control_samples.append(payload)
+    observation_frames = sorted(frames, key=lambda item: int(item.get("idx", 0)))
     if data_source not in {"auto", "frame", "control"}:
         raise SystemExit(f"Unknown replay data source: {data_source}")
     selected_source = (
@@ -175,7 +183,43 @@ def load_episode_states(
                 f"at least {JOINT_COUNT + 1} finite arm/gripper values"
             )
         states.append(arr.copy())
-    return states, frames, info, config
+    return states, frames, info, config, observation_frames
+
+
+def observation_mosaic(
+    frame: dict, index: int, total: int, camera_order: tuple[str, ...]
+) -> np.ndarray:
+    images = []
+    colors = frame.get("colors", {})
+    for key in camera_order:
+        record = colors.get(key)
+        if not record or record.get("encoding") != "jpeg":
+            continue
+        encoded = base64.b64decode(record["data"])
+        image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        label = "_".join(key.split("_")[2:]) or key
+        cv2.putText(image, f"{label} | {index + 1}/{total}", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 0), 2, cv2.LINE_AA)
+        images.append(image)
+    if not images:
+        raise ValueError(f"No decodable camera images in observation frame {index}")
+    height = min(image.shape[0] for image in images)
+    resized = [
+        image if image.shape[0] == height else cv2.resize(
+            image, (int(image.shape[1] * height / image.shape[0]), height),
+            interpolation=cv2.INTER_AREA,
+        )
+        for image in images
+    ]
+    columns = 1 if len(resized) == 1 else 2
+    while len(resized) % columns:
+        resized.append(np.zeros_like(resized[0]))
+    return np.vstack([
+        np.hstack(resized[offset:offset + columns])
+        for offset in range(0, len(resized), columns)
+    ])
 
 
 def recorded_sample_times(states: list[np.ndarray], frames: list[dict]) -> np.ndarray:
@@ -217,62 +261,6 @@ def recorded_peak_speed(arm_traj: np.ndarray, intervals: np.ndarray) -> float:
     return float(np.max(speeds)) if speeds.size else 0.0
 
 
-def reshape_raw_ik_trajectory(
-    frames: list[dict], start_q: np.ndarray, intervals: np.ndarray, *,
-    speed_limit: float, acceleration_limit: float, jerk_limit: float,
-    position_gain: float, velocity_gain: float, rate_hz: float,
-    segment_ids: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run recorded raw IK targets through the production q/v/a shaper."""
-    raw_targets = []
-    for frame in frames:
-        raw = np.asarray(frame.get("actions", {}).get("q_ik_raw", []), dtype=float).reshape(-1)
-        if raw.size < JOINT_COUNT or not np.all(np.isfinite(raw[:JOINT_COUNT])):
-            raise SystemExit(
-                f"frame {frame.get('idx')} has no valid 7-joint actions.q_ik_raw"
-            )
-        raw_targets.append(raw[:JOINT_COUNT].copy())
-
-    from robot.r1arm_config import R1ArmConfig
-    from teleop.r1arm_mujoco_controller import R1ArmMujocoTeleopController
-
-    config = R1ArmConfig(
-        control_side="right",
-        trajectory_max_speed_rad_s=speed_limit,
-        ik_max_acc_per_s2=acceleration_limit,
-        ik_max_jerk_per_s3=jerk_limit,
-        trajectory_position_gain=position_gain,
-        trajectory_velocity_gain=velocity_gain,
-    )
-    controller = R1ArmMujocoTeleopController(
-        config=config, mock_xr=True, show_viewer=False, sim_substeps=1
-    )
-    try:
-        side = "right"
-        q = controller._create_initial_q()
-        for idx, value in zip(controller.arm_q_indices, np.asarray(start_q, dtype=float)[:JOINT_COUNT]):
-            q[idx] = value
-        controller.q = q
-        controller.rate_hz = float(rate_hz)
-        controller._reset_trajectory_state(side, q)
-        shaped = np.repeat(np.asarray(start_q, dtype=float)[None, :JOINT_COUNT], len(frames), axis=0)
-        velocities = np.zeros_like(shaped)
-        for i in range(1, len(frames)):
-            q_desired = controller.q.copy()
-            for idx, value in zip(controller.arm_q_indices, raw_targets[i]):
-                q_desired[idx] = value
-            segment_boundary = segment_ids is not None and segment_ids[i] != segment_ids[i - 1]
-            dt = (
-                1.0 / max(rate_hz, 1.0) if segment_boundary else
-                float(intervals[i]) if intervals[i] > 0 else 1.0 / max(rate_hz, 1.0)
-            )
-            controller.q = controller._trajectory_step(side, controller.q, q_desired, dt)
-            q_cmd, v_cmd, _ = controller._trajectory_state(side, controller.q)
-            shaped[i] = q_cmd
-            velocities[i] = v_cmd
-        return shaped, velocities
-    finally:
-        controller._on_stop()
 
 
 def interp_trajectory(arm_traj: np.ndarray, gripper_traj: np.ndarray,
@@ -362,6 +350,8 @@ def check_feedback_range(state) -> np.ndarray:
 
 
 def check_faults(state, require_foc: bool) -> None:
+    if np.any(state.timeout):
+        raise RuntimeError("R1Arm motor feedback timeout")
     faults = np.flatnonzero(state.error_code != 0)
     if faults.size:
         detail = ", ".join(f"J{i + 1}=0x{int(state.error_code[i]):x}" for i in faults)
@@ -455,12 +445,7 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
     print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
           f"gravity_ff={'on' if args.gravity_ff is not False else 'off'}"
           f"{'' if args.gravity_ff is None else ' (user)'}")
-    if args.reshape_raw_ik:
-        print(f"  replay shaper: q_ik_raw → q_purpose (kp={args.trajectory_position_gain:g}, "
-              f"kd={args.trajectory_velocity_gain:g}, "
-              f"v≤{args.trajectory_max_speed if args.trajectory_max_speed is not None else 'episode metadata'} rad/s)")
-    else:
-        print("  replay shaping: off (q_purpose is already shaped)")
+    print("  replay shaping: off (q_purpose is already shaped)")
     print(f"  max speed:    {args.max_joint_speed if args.max_joint_speed is not None else 'auto (peak x 1.2, capped)'}")
     print(f"  approach speed: {args.approach_speed} rad/s")
     print(f"  max lead:     {args.max_command_lead} rad")
@@ -473,9 +458,18 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
 
 def run(args: argparse.Namespace, calibration: Path) -> None:
     episode = resolve_episode(Path(args.episode))
-    states, frames, info, config = load_episode_states(
+    states, frames, info, config, observation_frames = load_episode_states(
         episode, args.section, data_source=args.data_source
     )
+    camera_order = tuple(info.get("camera_order", ()))
+    if not camera_order and observation_frames:
+        camera_order = tuple(observation_frames[0].get("colors", {}).keys())
+    observation_stamps = np.asarray([
+        int(frame.get("sample_time_ns", 0) or 0) for frame in observation_frames
+    ], dtype=np.int64)
+    if args.show_observations and not observation_frames:
+        print("[Replay] WARNING: episode has no camera frames; preview disabled")
+        args.show_observations = False
 
     state_dim = int(config.get("state_dim", 8))
     if state_dim != 8:
@@ -497,43 +491,8 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     stamps = recorded_sample_times(states, frames)
     intervals = plan_frame_intervals(stamps, freq, args.max_frame_gap)
     paced = bool(np.any(intervals != 1.0 / freq))
-    reshaped_velocity = None
-    shaper_position_gain = float(
-        args.trajectory_position_gain
-        if args.trajectory_position_gain is not None
-        else config.get("trajectory_position_gain", 64.0)
-    )
-    shaper_velocity_gain = float(
-        args.trajectory_velocity_gain
-        if args.trajectory_velocity_gain is not None
-        else config.get("trajectory_velocity_gain", 16.0)
-    )
-    if args.reshape_raw_ik:
-        if args.section != "action":
-            raise SystemExit("--reshape-raw-ik requires --section action")
-        if args.control_hz > 0:
-            raise SystemExit("--reshape-raw-ik currently requires recorded frame timing; omit --control-hz")
-        shaper_speed = float(args.trajectory_max_speed if args.trajectory_max_speed is not None else (
-            config.get("trajectory_max_speed_rad_s")
-            or config.get("teleop_max_joint_speed") or 1.0
-        ))
-        shaper_acc = float(config.get("ik_max_acc_per_s2", 6.0))
-        shaper_jerk = float(config.get("ik_max_jerk_per_s3", 80.0))
-        arm_traj, reshaped_velocity = reshape_raw_ik_trajectory(
-            frames, arm_traj[0], intervals,
-            speed_limit=shaper_speed,
-            acceleration_limit=shaper_acc,
-            jerk_limit=shaper_jerk,
-            position_gain=shaper_position_gain,
-            velocity_gain=shaper_velocity_gain,
-            rate_hz=freq,
-            segment_ids=segment_ids,
-        )
-        print(
-            f"[Replay] re-shaped fixed q_ik_raw trace: kp={shaper_position_gain:g}, "
-            f"kd={shaper_velocity_gain:g}, v≤{shaper_speed:g}, "
-            f"a≤{shaper_acc:g}, jerk≤{shaper_jerk:g}; IK is not re-solved"
-        )
+    shaper_position_gain = float(config.get("trajectory_position_gain",64.0))
+    shaper_velocity_gain = float(config.get("trajectory_velocity_gain",16.0))
 
     # ② Command-rate upsampling: resample the paced trajectory onto a
     # control-rate grid (e.g. a 50 Hz recording driven at 100 Hz with linear
@@ -618,9 +577,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     print(f"[Replay] recorded_hz= {recorded_hz:.1f}  replay_hz={freq:.1f}  speed={args.speed:.2f}")
     print(f"[Replay] peak speed = {peak_speed:.2f} rad/s; slew cap {max_joint_speed:.2f} ({speed_source})")
     shaping_summary = (
-        f"q_ik_raw through shaper (kp={shaper_position_gain:g}, "
-        f"kd={shaper_velocity_gain:g})" if args.reshape_raw_ik
-        else "off (q_purpose is already shaped)"
+        ("off (q_purpose is already shaped)")
     )
     print(f"[Replay] gravity_ff = {'on' if use_ff else 'off'}"
           f"{' (episode meta)' if args.gravity_ff is None else ' (user)'}"
@@ -706,7 +663,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
 
         if args.enable_dex1:
             hand = Dex1Single(
-                side="right",
+                side=args.dex1_side,
                 interface=args.dex1_net,
                 domain=args.dex1_domain,
                 grip_torque_limit=args.grip_torque_limit,
@@ -790,6 +747,18 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         last_command_mono = time.monotonic()
         print(f"[Replay] telemetry CSV: {telemetry_path}")
         print(f"Playing {len(arm_traj)} frames at {freq:.1f} Hz x {args.speed:.2f} speed...")
+        preview_cursor = -1
+        replay_start_ns = int(stamps[0] * 1e9) if len(stamps) and stamps[0] > 0 else 0
+        preview_scale = max(float(args.preview_scale), 0.1)
+        if args.show_observations:
+            print(f"[Replay] camera preview: {list(camera_order)} (q/Esc closes replay)")
+            cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+            cv2.moveWindow(PREVIEW_WINDOW, 40, 40)
+            try:
+                cv2.setWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_TOPMOST, 1)
+            except cv2.error:
+                pass
+            cv2.waitKey(100)
         while True:
             tick_origin = time.monotonic()
             for i, model_target in enumerate(arm_traj):
@@ -833,7 +802,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                     "gravity_ff": int(use_ff), "max_joint_speed_rad_s": max_joint_speed,
                     "trajectory_position_gain": shaper_position_gain,
                     "trajectory_velocity_gain": shaper_velocity_gain,
-                    "trajectory_max_speed_rad_s": shaper_speed if args.reshape_raw_ik else "",
+                    "trajectory_max_speed_rad_s": "",
                     "q_ik_raw_rad": json.dumps(
                         source_frame.get("actions", {}).get("q_ik_raw", [])
                     ),
@@ -843,8 +812,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                     "record_segment": source_frame.get("record_segment", ""),
                     "q_purpose_rad": json.dumps(model_target.tolist()),
                     "dq_purpose_rad_s": json.dumps(
-                        reshaped_velocity[i].tolist() if reshaped_velocity is not None
-                        else source_frame.get("actions", {}).get("dq_purpose", [])
+                        source_frame.get("actions", {}).get("dq_purpose", [])
                     ),
                     "q_motor_target_rad": json.dumps(command_model_q.tolist()),
                     "dq_target_rad_s": json.dumps(dq_target_model.tolist()),
@@ -860,6 +828,29 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 last_command_mono = command_mono
                 command_sdk = cmd
                 command_gripper(gripper_traj[i])
+                if args.show_observations:
+                    replay_elapsed = float(np.sum(intervals[1 : i + 1]))
+                    replay_stamp_ns = replay_start_ns + int(replay_elapsed * 1e9)
+                    camera_index = max(0, int(np.searchsorted(
+                        observation_stamps, replay_stamp_ns, side="right"
+                    ) - 1))
+                    if camera_index >= 0 and camera_index != preview_cursor:
+                        preview = observation_mosaic(
+                            observation_frames[camera_index], camera_index,
+                            len(observation_frames), camera_order,
+                        )
+                        if preview_scale != 1.0:
+                            preview = cv2.resize(
+                                preview, None, fx=preview_scale, fy=preview_scale,
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        cv2.imshow(PREVIEW_WINDOW, preview)
+                        if preview_cursor < 0:
+                            print(f"[Replay] first camera preview frame: {preview.shape[1]}x{preview.shape[0]}")
+                            cv2.waitKey(100)
+                        preview_cursor = camera_index
+                    if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                        raise KeyboardInterrupt
                 if args.debug and (i % 10 == 0 or i == len(arm_traj) - 1):
                     print(
                         f"  frame {i}/{len(arm_traj) - 1} "
@@ -948,6 +939,8 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     except KeyboardInterrupt:
         print("\n[Replay] interrupted")
     finally:
+        if args.show_observations:
+            cv2.destroyAllWindows()
         if telemetry_stream is not None and not telemetry_stream.closed:
             telemetry_stream.close()
         if hand is not None:
@@ -983,27 +976,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--reshape-raw-ik", action="store_true",
-        help="re-run recorded actions.q_ik_raw through the q/v/a trajectory shaper; "
-             "IK itself is not re-solved",
-    )
-    parser.add_argument(
-        "--trajectory-position-gain", type=float, default=None,
-        help="shaper position gain for --reshape-raw-ik (otherwise use episode metadata)",
-    )
-    parser.add_argument(
-        "--trajectory-velocity-gain", type=float, default=None,
-        help="shaper velocity gain for --reshape-raw-ik (otherwise use episode metadata)",
-    )
-    parser.add_argument(
-        "--trajectory-max-speed", type=float, default=None,
-        help="shaper speed limit for --reshape-raw-ik (otherwise use episode metadata); "
-             "separate from the replay SDK --max-joint-speed cap",
-    )
-    parser.add_argument(
         "--motion-mode", action="store_true", help="Actually open and command the arm"
     )
-    parser.add_argument("--port", default="/dev/ttyUSB2")
+    parser.add_argument("--port", default=os.environ.get("PORT", ""))
     parser.add_argument("--baud", type=int, default=6_000_000)
     parser.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK_ROOT)
     parser.add_argument("--calib", type=Path, help="joint calibration file")
@@ -1083,7 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Replay the Dex1 gripper (state index 7) through DDS as a closed ratio",
     )
-    parser.add_argument("--dex1-net", default="enp4s0", help="DDS interface for the single Dex1")
+    parser.add_argument("--dex1-net", default=os.environ.get("DEX1_NETWORK", ""), help="DDS interface for the single Dex1")
+    parser.add_argument("--dex1-side", choices=("left", "right"), default=os.environ.get("DEX1_SIDE", "right"),
+                        help="DDS side topic for the physical Dex1")
     parser.add_argument("--dex1-domain", type=int, default=0)
     parser.add_argument("--grip-torque-limit", type=float, default=-1.0)
     parser.add_argument("--approach-timeout", type=float, default=10.0)
@@ -1092,6 +1069,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop", action="store_true", help="repeat the trajectory until Ctrl+C")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int, default=-1)
+    parser.add_argument(
+        "--show-observations", action="store_true",
+        help="show the recorded camera views in a mosaic synchronized by MCAP timestamps",
+    )
+    parser.add_argument("--preview-scale", type=float, default=0.75)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--no-confirm", action="store_true")
     return parser
@@ -1099,23 +1081,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.motion_mode and not args.port:
+        raise SystemExit("Set --port or PORT to the verified arm serial device")
+    if args.motion_mode and args.enable_dex1 and not args.dex1_net:
+        raise SystemExit("Set --dex1-net or DEX1_NETWORK to the DDS interface")
     if args.rate <= 0 or args.speed <= 0:
         raise SystemExit("--rate and --speed must be positive")
-    if args.reshape_raw_ik:
-        if args.section != "action":
-            raise SystemExit("--reshape-raw-ik requires --section action")
-        for name in ("trajectory_position_gain", "trajectory_velocity_gain"):
-            value = getattr(args, name)
-            if value is not None and (not np.isfinite(value) or value <= 0.0):
-                raise SystemExit(f"--{name.replace('_', '-')} must be finite and positive")
-        if args.trajectory_max_speed is not None and (
-            not np.isfinite(args.trajectory_max_speed) or args.trajectory_max_speed <= 0.0
-        ):
-            raise SystemExit("--trajectory-max-speed must be finite and positive")
-    elif args.trajectory_position_gain is not None or args.trajectory_velocity_gain is not None:
-        raise SystemExit("shaper gains only apply with --reshape-raw-ik")
-    elif args.trajectory_max_speed is not None:
-        raise SystemExit("--trajectory-max-speed only applies with --reshape-raw-ik")
     if args.motion_mode and not args.bridge_lib.expanduser().is_file():
         raise SystemExit(
             f"bridge library not found: {args.bridge_lib}; "
@@ -1124,7 +1095,7 @@ def main() -> None:
     if args.motion_mode and not Path(args.port).exists():
         raise SystemExit(f"serial port not found: {args.port}")
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_zero_右臂.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

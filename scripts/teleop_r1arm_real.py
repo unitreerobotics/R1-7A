@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -23,9 +24,7 @@ from robot.r1arm_sdk import (
     validate_calibration_file,
 )
 from teleop.r1arm_real_controller import (
-    R1ArmQPConstrainedIKTeleopController,
     R1ArmRealTeleopController,
-    R1ArmUnshapedIKTeleopController,
 )
 
 
@@ -36,43 +35,26 @@ def confirm_motion(args: argparse.Namespace) -> None:
     print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
           f"gravity_ff={'on' if args.gravity_ff else 'off'}")
     print(f"  max speed:    {args.max_joint_speed} rad/s")
-    if not args.unshaped_ik and not args.qp_constrained_ik:
-        if args.velocity_only_shaper:
-            print(f"  q_purpose shaper: velocity-only; "
-                  f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s "
-                  "(acceleration/jerk disabled during grip tracking)")
-        else:
-            print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
-                  f"kd={args.trajectory_velocity_gain:g} s^-1; "
-                  f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
+    print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
+          f"kd={args.trajectory_velocity_gain:g} s^-1; "
+          f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
     kp_arr = as_gain_array(args.kp)
-    kd_arr = as_gain_array(args.kd)
-    torque_cap = float(np.max(kp_arr * args.max_command_lead
-                              + kd_arr * args.max_joint_speed
-                              + (args.tau_clip if args.gravity_ff else 0.0)))
-    print(f"  max lead:     {args.max_command_lead} rad → 力矩上界 {torque_cap:.1f} Nm"
-          f"（三项合计；电机峰值 34.4 Nm 的 {torque_cap / 34.4 * 100:.0f}%）")
+    print(f"  max lead:     {args.max_command_lead} rad; nominal kp×lead="
+          f"{float(np.max(kp_arr*args.max_command_lead)):.1f} Nm "
+          "(not a total torque bound; slew and lead limits may conflict)")
     print(f"  controller:   {args.side} PICO controller")
-    if args.unshaped_ik:
-        print("  IK shaping:   off (Placo/DLS per-cycle speed limits; no accel/jerk shaping)")
-    if args.qp_constrained_ik:
-        jerk_note = (
-            f" + jerk ≤{args.qp_jerk_limit:g} rad/s³"
-            if args.qp_jerk_limit is not None else " (jerk disabled)"
-        )
-        print(f"  IK shaping:   Placo QP velocity + acceleration bounds{jerk_note}")
     print("Keep the emergency stop reachable and support the arm during startup probing.")
     answer = input("Type MOVE to continue: ").strip()
     if answer != "MOVE":
         raise SystemExit("Cancelled; no real motor command was sent")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--motion-mode", action="store_true", help="Actually open and command the arm")
     parser.add_argument(
         "--port",
-        default=os.environ.get("PORT", "/dev/ttyUSB2"),
+        default=os.environ.get("PORT", ""),
         help="R1Arm RS485 serial device",
     )
     parser.add_argument("--baud", type=int, default=6_000_000)
@@ -88,11 +70,7 @@ def main() -> None:
     parser.add_argument("--side", choices=["left", "right"], default="right")
     parser.add_argument("--scale-factor", type=float, default=1.0)
     parser.add_argument("--rate", type=float, default=90.0,
-                        help="控制环 Hz。默认 90；XR 输入约 30Hz，图像采样频率单独配置")
-    parser.add_argument("--xr-filter-min-cutoff", type=float, default=8.0,
-                        help="XR One-Euro pose filter minimum cutoff Hz")
-    parser.add_argument("--xr-filter-beta", type=float, default=1.0,
-                        help="XR One-Euro speed response; higher follows fast hand motion more")
+                        help="控制环 Hz。默认 90；XR 独立接收，图像采样频率单独配置")
     parser.add_argument("--trajectory-position-gain", type=float, default=64.0,
                         help="Baseline q_purpose position-error response (s^-2)")
     parser.add_argument("--trajectory-velocity-gain", type=float, default=16.0,
@@ -127,14 +105,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--max-command-lead", type=float, default=0.15,
-        help="命令相对实测的最大超前量 rad（默认 0.15）。它限制的是力矩公式"
-             "首项 kp×误差 的上界：异常单拍位移 ≤8.6°，三项合计力矩"
-             "（kp×lead + kd×|dq| + tau_ff）≈ 峰值一半；正常跟踪不触发",
+        help="命令相对实测的目标最大超前量 rad（默认 0.15）；与位置步长冲突时优先步长，不能作为总力矩上界",
     )
     parser.add_argument("--feedback-timeout", type=float, default=3.0)
     parser.add_argument("--foc-timeout", type=float, default=1.0)
     parser.add_argument("--enable-dex1", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--dex1-net", default="enp4s0", help="DDS interface for the one real Dex1")
+    parser.add_argument("--dex1-net", default=os.environ.get("DEX1_NETWORK", ""), help="DDS interface for the one real Dex1")
+    parser.add_argument("--dex1-side", choices=("left", "right"), default=os.environ.get("DEX1_SIDE", "right"),
+                        help="DDS side topic for the physical Dex1; independent of the arm side")
     parser.add_argument("--dex1-domain", type=int, default=0)
     parser.add_argument("--grip-torque-limit", type=float, default=-1.0)
     parser.add_argument(
@@ -156,37 +134,29 @@ def main() -> None:
     )
     parser.add_argument("--mock-xr", action="store_true", help="Dry-run only; rejected with --motion-mode")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument(
-        "--unshaped-ik", action="store_true",
-        help="Experimental direct IK tracking; retain SDK and transition safety limits",
-    )
-    parser.add_argument(
-        "--velocity-only-shaper", action="store_true",
-        help="Limit active IK tracking to a per-cycle joint-speed bound only; no acceleration/jerk shaping",
-    )
-    parser.add_argument(
-        "--qp-constrained-ik", action="store_true",
-        help="Experimental active IK with velocity/acceleration bounds inside Placo QP",
-    )
-    parser.add_argument("--qp-jerk-limit", type=float, default=None,
-                        help="Optional active IK jerk bound in Placo QP (rad/s^3; e.g. 80)")
+    parser.add_argument("--gripper-log", type=Path, help="Write per-cycle trigger/DDS diagnostics to a new CSV")
     parser.add_argument("--no-confirm", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None, *, controller_cls=None, defaults=None) -> None:
+    parser = build_parser()
+    if defaults:
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    if args.motion_mode and not args.port:
+        parser.error("Set --port or PORT to the verified arm serial device")
+    if args.motion_mode and args.enable_dex1 and not args.dex1_net:
+        parser.error("Set --dex1-net or DEX1_NETWORK to the DDS interface")
 
     if args.motion_mode and args.mock_xr:
         parser.error("--mock-xr cannot be combined with --motion-mode")
-    if sum((args.unshaped_ik, args.velocity_only_shaper, args.qp_constrained_ik)) > 1:
-        parser.error("--unshaped-ik, --velocity-only-shaper, and --qp-constrained-ik are mutually exclusive")
-    if args.qp_jerk_limit is not None and args.qp_jerk_limit <= 0.0:
-        parser.error("--qp-jerk-limit must be positive")
     if args.trajectory_position_gain <= 0.0 or args.trajectory_velocity_gain <= 0.0:
         parser.error("trajectory follower gains must be positive")
     if args.max_joint_speed <= 0.0:
         parser.error("--max-joint-speed must be positive")
     if args.trajectory_max_speed is not None and args.trajectory_max_speed <= 0.0:
         parser.error("--trajectory-max-speed must be positive")
-    if args.qp_jerk_limit is not None and not args.qp_constrained_ik:
-        parser.error("--qp-jerk-limit requires --qp-constrained-ik")
     if args.motion_mode and not args.bridge_lib.expanduser().is_file():
         parser.error(
             f"bridge library not found: {args.bridge_lib}; "
@@ -197,7 +167,7 @@ def main() -> None:
             f"serial port not found: {args.port}; check /dev/serial/by-id and /dev/ttyUSB*"
         )
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_zero_右臂.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)
@@ -211,8 +181,6 @@ def main() -> None:
         control_side=args.side,
         scale_factor=args.scale_factor,
         reset_blend_frames=args.reset_blend_frames,
-        xr_filter_min_cutoff=args.xr_filter_min_cutoff,
-        xr_filter_beta=args.xr_filter_beta,
         trajectory_position_gain=args.trajectory_position_gain,
         trajectory_velocity_gain=args.trajectory_velocity_gain,
         trajectory_max_speed_rad_s=(
@@ -223,10 +191,8 @@ def main() -> None:
     if args.urdf:
         config.urdf_path = str(args.urdf.expanduser().resolve())
 
-    controller_cls = (
-        R1ArmQPConstrainedIKTeleopController if args.qp_constrained_ik
-        else R1ArmUnshapedIKTeleopController if args.unshaped_ik
-        else R1ArmRealTeleopController
+    controller_cls = controller_cls or (
+        (R1ArmRealTeleopController)
     )
     controller = controller_cls(
         config=config,
@@ -237,9 +203,9 @@ def main() -> None:
         motion_mode=args.motion_mode,
         enable_dex1=args.enable_dex1,
         dex1_interface=args.dex1_net,
+        dex1_side=args.dex1_side,
         dex1_domain=args.dex1_domain,
         grip_torque_limit=args.grip_torque_limit,
-        **({"qp_jerk_limit": args.qp_jerk_limit} if args.qp_constrained_ik else {}),
         kp=args.kp,
         kd=args.kd,
         rate=args.rate,
@@ -256,8 +222,25 @@ def main() -> None:
         tau_clip=args.tau_clip,
     )
     controller.enable_a_button_reset = bool(args.enable_a_reset)
-    controller.velocity_only_shaper = bool(args.velocity_only_shaper)
-    controller.run(rate=args.rate)
+    if args.gripper_log is None:
+        controller.run(rate=args.rate)
+    else:
+        args.gripper_log.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with args.gripper_log.open("x", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=[
+                    "time_ns", "home_reset", "gripper_wait_release", "trigger_value", "trigger_valid",
+                    "dex1_motor_command_q", "dex1_motor_q", "dex1_tau_est", "dex1_force_latched",
+                    "dex1_publish_ok", "dex1_publish_fail_count", "dex1_command_count",
+                    "dex1_feedback_valid", "dex1_feedback_age_s", "dex1_feedback_time_ns"])
+                writer.writeheader()
+                controller.gripper_diagnostic_writer = writer
+                print(f"Gripper diagnostics: {args.gripper_log.resolve()}")
+                controller.run(rate=args.rate)
+        finally:
+            controller.gripper_diagnostic_writer = None
+            if controller.running:
+                controller._on_stop()
 
 
 if __name__ == "__main__":

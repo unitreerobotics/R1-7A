@@ -1,0 +1,131 @@
+diff --git a/RoboticsService/PXREAGRPCServer/FeedbackController.cpp b/RoboticsService/PXREAGRPCServer/FeedbackController.cpp
+index b455e21..cacfd13 100644
+--- a/RoboticsService/PXREAGRPCServer/FeedbackController.cpp
++++ b/RoboticsService/PXREAGRPCServer/FeedbackController.cpp
+@@ -28,7 +28,8 @@ FeedbackController::FeedbackController(::grpc::ServerWriter<PXREAService::Server
+         m_writer->Write(feedBackMsg);
+     });
+ 
+-    QObject::connect(this,&FeedbackController::replyDeviceMessage,this,[this](QString devid, int type, QByteArray msgbody){onReplyDeviceMessage(devid,type,msgbody);});
++    QObject::connect(this,&FeedbackController::replyDeviceMessage,this,
++                     &FeedbackController::enqueueDeviceMessage, Qt::DirectConnection);
+ 
+ }
+ 
+@@ -69,6 +70,25 @@ void FeedbackController::StopFeedback()
+ 
+ 
+ 
++void FeedbackController::enqueueDeviceMessage(QString devid, int type, QByteArray msgbody)
++{
++    if (type != PXREAServerMsgDeviceStateJson) {
++        QMetaObject::invokeMethod(this, [this, devid, type, msgbody] {
++            onReplyDeviceMessage(devid, type, msgbody);
++        }, Qt::QueuedConnection);
++        return;
++    }
++    if (m_latestStates.put(devid.toStdString(), std::string(msgbody.constData(), msgbody.size()))) {
++        QMetaObject::invokeMethod(this, [this] {
++            // take() releases its lock before the potentially blocking gRPC Write.
++            for (const auto& item : m_latestStates.take()) {
++                onReplyDeviceMessage(QString::fromStdString(item.first), PXREAServerMsgDeviceStateJson,
++                                     QByteArray(item.second.data(), static_cast<int>(item.second.size())));
++            }
++        }, Qt::QueuedConnection);
++    }
++}
++
+ void FeedbackController::onReplyDeviceMessage(QString devid, int type, QByteArray msgbody)
+ {
+     PXREAService::ServerFeedback feedBackMsg;
+diff --git a/RoboticsService/PXREAGRPCServer/FeedbackController.h b/RoboticsService/PXREAGRPCServer/FeedbackController.h
+index 255e9f7..c9775d1 100644
+--- a/RoboticsService/PXREAGRPCServer/FeedbackController.h
++++ b/RoboticsService/PXREAGRPCServer/FeedbackController.h
+@@ -11,6 +11,7 @@
+ #include <Business_global.h>
+ #include <atomic>
+ #include <QHash>
++#include "LatestFrameMailbox.h"
+ 
+ 
+ class FeedbackController : public QObject
+@@ -39,12 +40,14 @@ signals:
+      void destroyStreamMonitorSharedMemory(QString uid);
+ public slots:
+     void onReplyDeviceMessage(QString devid, int type, QByteArray msgbody);
++    void enqueueDeviceMessage(QString devid, int type, QByteArray msgbody);
+ 
+ 
+ private:
+      QThread m_thd;
+      std::atomic_int m_waitTimes;
+      ::grpc::ServerWriter<PXREAService::ServerFeedback> *m_writer;
++     LatestFrameMailbox m_latestStates;
+ };
+ 
+ #endif // FEEDBACKCONTROLLER_H
+diff --git a/RoboticsService/PXREAGRPCServer/LatestFrameMailbox.h b/RoboticsService/PXREAGRPCServer/LatestFrameMailbox.h
+new file mode 100644
+index 0000000..523a021
+--- /dev/null
++++ b/RoboticsService/PXREAGRPCServer/LatestFrameMailbox.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++// State snapshots replace pending snapshots; commands must never enter this mailbox.
++class LatestFrameMailbox {
++public:
++    bool put(std::string device, std::string payload) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (pending_.count(device)) ++superseded_;
++        pending_[std::move(device)] = std::move(payload);
++        const bool schedule = !scheduled_;
++        scheduled_ = true;
++        return schedule;
++    }
++    std::unordered_map<std::string, std::string> take() {
++        std::lock_guard<std::mutex> lock(mutex_);
++        std::unordered_map<std::string, std::string> result;
++        result.swap(pending_);
++        scheduled_ = false;
++        return result;
++    }
++    uint64_t superseded() const {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return superseded_;
++    }
++private:
++    mutable std::mutex mutex_;
++    std::unordered_map<std::string, std::string> pending_;
++    bool scheduled_{false};
++    uint64_t superseded_{0};
++};
+diff --git a/RoboticsService/PXREAGRPCServer/PXREAGRPCServer.cpp b/RoboticsService/PXREAGRPCServer/PXREAGRPCServer.cpp
+index 4b948af..a2fc08c 100644
+--- a/RoboticsService/PXREAGRPCServer/PXREAGRPCServer.cpp
++++ b/RoboticsService/PXREAGRPCServer/PXREAGRPCServer.cpp
+@@ -16,7 +16,8 @@ void PXREAServerAPI::init(quint64 devMng, bool login, bool runAsService)
+     connect(&m_devMng->m_connectEvent, &DevConnSDK::ConnectEventHandlerInQt::userJoinedSignal, this, &PXREAServerAPI::replyDeviceFind);
+     connect(&m_devMng->m_connectEvent, &DevConnSDK::ConnectEventHandlerInQt::userLeaveSignal, this, &PXREAServerAPI::replyDeviceMissing);
+     connect(m_devMng,&DeviceManagement::replyExistDevice,this,&PXREAServerAPI::replyDeviceFind);
+-    connect(m_devMng,&DeviceManagement::recvDeviceMessageSignal,this,&PXREAServerAPI::replyDeviceMessage);
++    connect(m_devMng,&DeviceManagement::recvDeviceMessageSignal,this,&PXREAServerAPI::replyDeviceMessage,
++            Qt::DirectConnection);
+ }
+ 
+ void PXREAServerAPI::deinit()
+@@ -76,7 +77,8 @@ grpc::Status PXREAServerAPI::WatchServerFeedback(grpc::ServerContext *context, c
+ 
+     connect(this,&PXREAServerAPI::replyDeviceFind,feedback.get(),&FeedbackController::replyDeviceFind);
+     connect(this,&PXREAServerAPI::replyDeviceMissing,feedback.get(),&FeedbackController::replyDeviceMissing);
+-    connect(this,&PXREAServerAPI::replyDeviceMessage,feedback.get(),&FeedbackController::replyDeviceMessage);
++    connect(this,&PXREAServerAPI::replyDeviceMessage,feedback.get(),&FeedbackController::enqueueDeviceMessage,
++            Qt::DirectConnection);
+ 
+ 
+     m_allClientFeedback[request->pid()] = feedback;

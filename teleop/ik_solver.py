@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pinocchio as pin
 
-from robot.arm_model import clamp_configuration
+from robot.arm_model import clamp_configuration, joint_indices_by_name
 from robot.r1arm_config import ARM_SAFE_LIMITS
 
 
@@ -65,6 +65,7 @@ def solve_upper_arm_ik(
     ee_frame_id = model.getFrameId(ee_frame_name)
     elbow_frame_id = model.getFrameId(elbow_frame_name) if elbow_frame_name else None
     q_indices_array = np.asarray(q_indices, dtype=int)
+    names_by_index = {index: name for name, index in joint_indices_by_name(model).items()}
     first_jac = None
     first_error_norm = 0.0
     _iter_count = 0
@@ -138,7 +139,8 @@ def solve_upper_arm_ik(
         # This prevents the arm from reaching the URDF hard-limit where clamping
         # would cause violent oscillation.
         if joint_limit_weight > 0.0:
-            for i, name in enumerate(q_indices):
+            for i, index in enumerate(q_indices):
+                name = names_by_index.get(index)
                 if name not in ARM_SAFE_LIMITS:
                     continue
                 lo, hi = ARM_SAFE_LIMITS[name]
@@ -169,10 +171,11 @@ def solve_upper_arm_ik(
         # the damping is smoothly ramped up to damping_max to suppress oscillation.
         man = float(np.sqrt(max(0.0, np.linalg.det(jac[:3] @ jac[:3].T))))
         d = damping if man > manipulability_threshold else float(
-            damping + (damping_max - damping) * (1.0 - man / max(man, 1e-9))
+            damping + (damping_max - damping) * (1.0 - np.clip(man / max(manipulability_threshold, 1e-9), 0.0, 1.0))
         )
 
         # Damped least-squares solve
+        # damping and damping_max are lambda squared (the diagonal regularizer).
         lhs = jac @ jac.T + d * np.eye(jac.shape[0])
         dq = jac.T @ np.linalg.solve(lhs, error)
         dq = np.clip(dq, -max_step, max_step)
@@ -199,6 +202,7 @@ def solve_upper_arm_ik(
         "ee_pos_error_norm": float(np.linalg.norm(final_pos_error)),
         "q_indices": q_indices_array.copy(),
         "manipulability": float(man),
+        "damping_squared": float(d),
     }
 
     if control_mode in {"pose", "pose-elbow"} and ee_target_rot is not None:
@@ -225,7 +229,7 @@ def solve_upper_arm_ik(
                 f"iter={_iter_count}  ee={ee_frame_name}"
             )
 
-        return q_next, diagnostics
+    return q_next, diagnostics
 
 
 def solve_position_ik(

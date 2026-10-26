@@ -1,11 +1,18 @@
 # Datasets / runtime output
 data/
+dataset/
 logs/
 *.mcap
 *.log
 
 # Third-party SDKs (pulled by setup.sh)
-third_party/
+third_party/*
+!third_party/dex1_1_service/
+!third_party/unitree_sdk2_python/
+!third_party/unitree_sdk2/
+!third_party/r1_arm_sdk/
+!third_party/XRoboToolkit-PC-Service-Pybind/
+!third_party/XRoboToolkit-PC-Service/
 
 # Python
 __pycache__/
@@ -41,7 +48,11 @@ env/
 Thumbs.db
 
 # Local / secrets
+docs/deployment-review.md
 .env
 .env.*
 !.env.example
 *.pem
+
+# Local endpoint backups; the active endpoint config is versioned.
+robot/eef/*.backup_*

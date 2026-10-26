@@ -81,8 +81,6 @@ class R1ArmSimMcapRecorder:
             control_side=args.side,
             reset_blend_frames=args.reset_blend_frames,
             trajectory_max_speed_rad_s=args.max_joint_speed,
-            xr_filter_min_cutoff=args.xr_filter_min_cutoff,
-            xr_filter_beta=args.xr_filter_beta,
         )
         if args.urdf:
             config.urdf_path = args.urdf
@@ -224,6 +222,8 @@ class R1ArmSimMcapRecorder:
             "teleop_stack": "R1ArmMujocoTeleopController",
             "dual_arm": bool(self.args.use_dual_arm),
             "control_side": self.args.side,
+            "xr_filter_enabled": False,
+            "xr_filter_mode": "none_after_jump_rejection",
             "urdf_path": str(self.config.urdf_path),
             "mjcf_path": str(self.config.mjcf_path),
             "camera_views": list(self.camera_views),
@@ -243,8 +243,6 @@ class R1ArmSimMcapRecorder:
             "record_frequency_hz": float(self.args.frequency),
             "trajectory_max_speed_rad_s": float(self.config.trajectory_max_speed_rad_s),
             "ik_dt_s": float(self.args.ik_dt) if self.args.ik_dt > 0 else 1.0 / float(self.args.rate),
-            "xr_filter_min_cutoff": float(self.config.xr_filter_min_cutoff),
-            "xr_filter_beta": float(self.config.xr_filter_beta),
             "trajectory_position_gain": float(self.config.trajectory_position_gain),
             "trajectory_velocity_gain": float(self.config.trajectory_velocity_gain),
             "ik_max_acc_per_s2": float(self.config.ik_max_acc_per_s2),
@@ -512,8 +510,6 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--rate", type=float, default=50.0)
     sim.add_argument("--ik-dt", type=float, default=0.0,
                      help="Placo IK timestep seconds; 0 aligns it to 1/--rate")
-    sim.add_argument("--xr-filter-min-cutoff", type=float, default=8.0)
-    sim.add_argument("--xr-filter-beta", type=float, default=1.0)
     sim.add_argument("--max-joint-speed", type=float, default=1.0,
                      help="q_purpose shaper speed limit rad/s")
     sim.add_argument("--no-viewer", action="store_true")

@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = PROJECT_ROOT / "native/r1arm_sdk_bridge"
 DEFAULT_BUILD_DIR = PROJECT_ROOT / "build/r1arm_sdk_bridge"
 DEFAULT_SDK_ROOT = Path(
-    os.environ.get("R1ARM_SDK_ROOT", "/home/ycb410/nt/R1_arm_SDK_x86/r1_arm")
+    os.environ.get("R1ARM_SDK_ROOT", str(PROJECT_ROOT / "third_party" / "r1_arm_sdk"))
 )
 
 

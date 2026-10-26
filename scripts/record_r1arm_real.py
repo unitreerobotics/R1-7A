@@ -6,12 +6,11 @@ The controlled vector is compacted to the real right arm: J1..J7 plus one
 logical Dex1 position (8 values total).
 
 Cameras are read from the devices wired to this workstation. ``--camera``
-selects them; defaults are the UVC scene camera and the Intel RealSense D405 on
-the arm. Frames use stable ``color_*`` keys readable by the sim replay tool.
+selects them; defaults are the D405 head view and JR0002 right-wrist view. Frames use stable ``color_*`` keys readable by the sim replay tool.
 
 A camera that never delivers a frame is dropped *before* the episode opens and
 recorded in the metadata, because one sample must carry one image per camera.
-At least one working camera is required; run ``scripts/probe_r1arm_cameras.py``
+At least one working camera is required; run ``scripts/verify_r1arm_right_cameras.py``
 if a device went missing.
 
 Pico controls (X/Y live on the LEFT controller, A/B on the RIGHT controller):
@@ -28,6 +27,8 @@ toggle recording from the right controller instead.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+import os
 import datetime as dt
 import hashlib
 import json
@@ -66,7 +67,6 @@ from teleop.local_camera_client import (
 from teleop.mcap_writer import FourCameraMcapRecorder
 from teleop.r1arm_dataset import R1ArmDatasetAdapter
 from teleop.r1arm_real_controller import (
-    R1ArmQPConstrainedIKTeleopController,
     R1ArmRealTeleopController,
 )
 
@@ -245,10 +245,8 @@ class R1ArmRealMcapRecord:
         self.preview_created = False
         self.preview_broken = False
         self._preview_last_render = 0.0
-        # P2 修复抖动：预览彻底移出控制线程。控制循环只无锁读取共享的
-        # 最近帧引用（原子替换），渲染（拼图/imshow/waitKey/Qt 事件泵）
-        # 全在独立 preview 线程——GIL/周期争抢不再进入 20ms 控制预算。
-        self._preview_state: dict | None = None  # 渲染线程读，控制线程写
+        # Preview construction and display belong to the preview worker.
+        self._preview_state: dict | None = None
         self._preview_quit = False
         self.preview_thread: threading.Thread | None = None
         self.last_stale_warning = 0.0
@@ -257,8 +255,6 @@ class R1ArmRealMcapRecord:
             control_side="right",
             scale_factor=args.scale_factor,
             reset_blend_frames=args.reset_blend_frames,
-            xr_filter_min_cutoff=args.xr_filter_min_cutoff,
-            xr_filter_beta=args.xr_filter_beta,
             trajectory_position_gain=args.trajectory_position_gain,
             trajectory_velocity_gain=args.trajectory_velocity_gain,
             trajectory_max_speed_rad_s=(
@@ -269,10 +265,7 @@ class R1ArmRealMcapRecord:
         if args.urdf:
             config.urdf_path = str(Path(args.urdf).expanduser().resolve())
         self.config = config
-        controller_cls = (
-            R1ArmQPConstrainedIKTeleopController
-            if args.qp_constrained_ik else R1ArmRealTeleopController
-        )
+        controller_cls = R1ArmRealTeleopController
         self.controller = controller_cls(
             config=config,
             port=args.port,
@@ -282,9 +275,9 @@ class R1ArmRealMcapRecord:
             motion_mode=args.motion_mode,
             enable_dex1=args.enable_dex1,
             dex1_interface=args.dex1_net,
+            dex1_side=args.dex1_side,
             dex1_domain=args.dex1_domain,
             grip_torque_limit=args.grip_torque_limit,
-            **({"qp_jerk_limit": args.qp_jerk_limit} if args.qp_constrained_ik else {}),
             kp=args.kp,
             kd=args.kd,
             rate=args.rate,
@@ -353,10 +346,7 @@ class R1ArmRealMcapRecord:
             "motion_mode": bool(self.args.motion_mode),
             "teleop_stack": type(self.controller).__name__,
             "ik_control_mode": (
-                ("placo_qp_velocity_acceleration_jerk_constraints"
-                 if self.args.qp_jerk_limit is not None else
-                 "placo_qp_velocity_acceleration_constraints")
-                if self.args.qp_constrained_ik else "shaped_ik_baseline"
+                ("shaped_ik_baseline")
             ),
             "dual_arm": False,
             "control_side": "right",
@@ -364,16 +354,30 @@ class R1ArmRealMcapRecord:
             "serial_port": self.args.port if self.args.motion_mode else "",
             "camera_keys": list(self.camera_keys),
             "camera_count": len(self.camera_keys),
+            "camera_specs": [asdict(spec) for spec in self.camera_specs],
             "camera_source_streams": list(source_streams),
             "camera_inactive": [key for key, _ in inactive],
             "camera_devices": self.camera.describe() if self.camera is not None else "",
             "record_contract_version": 2,
+            "writer_execution": "thread",
             "task_goal": self.args.task_goal or None,
             "experiment_description": self.args.task_description,
             "task_outcome": self.args.task_outcome,
             "operator_notes": self.args.operator_notes,
             "feedback_semantics": "SDK latest cached per-axis state; read bracket timestamps are host read times, not per-axis receive times",
             "camera_timestamp_semantics": "host receive/decode time; device timestamp retained separately when exposed; neither is asserted to be exposure time",
+            "xr_filter_enabled": False,
+            "xr_filter_mode": "none_after_jump_rejection",
+            "xr_jump_protection_enabled": True,
+            "xr_input_processing": {
+                "execution": "dedicated_worker",
+                "stale_timeout_s": self.config.xr_stale_timeout_s,
+                "recovery_time_s": self.config.xr_recovery_time_s,
+                "grip_on": self.config.xr_grip_on,
+                "grip_off": self.config.xr_grip_off,
+                "jump_linear_speed_m_s": self.config.xr_jump_linear_speed,
+                "jump_angular_speed_rad_s": self.config.xr_jump_angular_speed,
+            },
             "xr_timestamp_semantics": "XR server frame stamp plus host monotonic receive time; server clock mapping is not assumed",
             "calibration_path": str(self.controller.calibration_path) if hasattr(self.controller, "calibration_path") else str(self.args.calib),
             "calibration_sha256": hashlib.sha256(
@@ -424,20 +428,9 @@ class R1ArmRealMcapRecord:
             "trajectory_position_gain": float(self.controller.config.trajectory_position_gain),
             "trajectory_velocity_gain": float(self.controller.config.trajectory_velocity_gain),
             "trajectory_max_speed_rad_s": self.controller.config.trajectory_max_speed_rad_s,
-            "xr_filter_min_cutoff": float(self.controller.config.xr_filter_min_cutoff),
-            "xr_filter_beta": float(self.controller.config.xr_filter_beta),
             "trajectory_generator": (
-                ("Placo QP velocity+acceleration+jerk bounds; "
-                 "home/reset/release keep baseline trajectory"
-                 if self.args.qp_jerk_limit is not None else
-                 "Placo QP velocity+acceleration bounds; no active jerk limit; "
-                 "home/reset/release keep baseline trajectory")
-                if self.args.qp_constrained_ik else
-                "independent q_cmd/v_cmd/a_cmd; velocity+acceleration+jerk limited"
+                ("independent q_cmd/v_cmd/a_cmd; velocity+acceleration+jerk limited")
             ),
-            "ik_qp_velocity_limit": self.controller.config.ik_qp_velocity_limit,
-            "ik_qp_acceleration_limit": self.controller.config.ik_qp_acceleration_limit,
-            "ik_qp_jerk_limit": self.controller.config.ik_qp_jerk_limit,
             # P3 字段契约（训练转换据此选字段，不必读代码）：
             #   actions.q_purpose = 训练主字段：整形后的 IK 关节意图；
             #                     actions.action 是同值兼容别名。
@@ -451,15 +444,11 @@ class R1ArmRealMcapRecord:
                 "train_action": "actions.q_purpose",
                 "train_action_alias": "actions.action",
                 "q_purpose": (
-                    "Placo QP velocity/acceleration-constrained joint intent in model coordinates"
-                    if self.args.qp_constrained_ik else
-                    "shaped IK joint intent in model coordinates"
+                    ("shaped IK joint intent in model coordinates")
                 ),
                 "q_purpose_dim": 8,
                 "q_ik_raw": (
-                    "Placo IK result with velocity/acceleration constraints before SDK limiting"
-                    if self.args.qp_constrained_ik else
-                    "raw IK solution before trajectory shaping"
+                    ("raw IK solution before trajectory shaping")
                 ),
                 "q_ik_raw_dim": 7,
                 "q_motor_target": "final SDK position target converted to model coordinates",
@@ -467,8 +456,8 @@ class R1ArmRealMcapRecord:
                 "dq_purpose": "trajectory generator desired velocity, model coordinates (rad/s)",
                 "ddq_purpose": "trajectory generator acceleration, model coordinates (rad/s^2)",
                 "dq_target": "finite-difference velocity of final SDK position target, model coordinates (rad/s)",
-                "xr_raw": "raw XR controller pose [xyz,xyzw] before One-Euro filtering",
-                "xr_filtered": "filtered XR controller pose [xyz,xyzw] after jump rejection",
+                "xr_raw": "raw XR controller pose [xyz,xyzw] before jump rejection",
+                "xr_filtered": "XR controller pose [xyz,xyzw] after jump rejection; no smoothing (legacy field name)",
                 "trigger_value": "latest raw XR trigger value in [0,1]",
                 "trigger_valid": "whether this trigger sample was valid; invalid samples reuse previous input",
                 "trigger_age_s": "age of latest valid trigger sample at control output",
@@ -1147,6 +1136,7 @@ class R1ArmRealMcapRecord:
                             self.preview_broken = True
                     continue
                 next_render = now + period
+                self._publish_preview_state()
                 state = self._preview_state  # atomic read
                 if state is None:
                     continue
@@ -1169,12 +1159,7 @@ class R1ArmRealMcapRecord:
         self.preview_thread.start()
 
     def _publish_preview_state(self) -> None:
-        """Control-thread side: build (cheap) and publish the preview frame.
-
-        Only the tile concatenation + resize happen here (sub-millisecond on
-        640x480 pairs); imshow/waitKey/Qt stay in the preview thread. GUI
-        errors are detected in the render thread, not here.
-        """
+        """Build preview images only in the preview worker, outside motor control."""
         if not self.args.image_show or self.camera is None:
             return
         if self.preview_broken or self._preview_quit:
@@ -1243,12 +1228,12 @@ class R1ArmRealMcapRecord:
                 print(
                     "[Camera]   hint: a RealSense color stream stalls when it is linked "
                     "at USB 2.0; move the camera to a USB 3.x port, replug it, then "
-                    "re-run scripts/probe_r1arm_cameras.py"
+                    "re-run scripts/verify_r1arm_right_cameras.py"
                 )
         if not self.camera.active_keys:
             raise SystemExit(
                 "[Camera] no camera delivered a frame; "
-                "run scripts/probe_r1arm_cameras.py and pass --camera"
+                "run scripts/verify_r1arm_right_cameras.py and pass --camera"
             )
         if self.camera.inactive and self.args.require_all_cameras:
             raise SystemExit(
@@ -1312,7 +1297,7 @@ class R1ArmRealMcapRecord:
             self._start_preview_thread()
 
             control_dt = 1.0 / max(float(self.args.rate), 1.0)
-            previous_tick = time.monotonic()
+            previous_tick = time.monotonic()-control_dt
             while self.running:
                 tick = time.monotonic()
                 actual_control_dt = tick - previous_tick
@@ -1323,7 +1308,7 @@ class R1ArmRealMcapRecord:
                     or self.controller._reset_blending
                 ):
                     self.controller.step(
-                        actual_control_dt if 0.001 <= actual_control_dt <= 0.1 else control_dt
+                        actual_control_dt
                     )
                 else:
                     # In real mode this keeps polling feedback and refreshing
@@ -1338,8 +1323,6 @@ class R1ArmRealMcapRecord:
                         self._stop_episode()
                         if self.args.exit_after_duration:
                             self.running = False
-                # 预览：控制线程只做轻量拼图+原子发布；imshow/Qt 在渲染线程
-                self._publish_preview_state()
                 remaining = control_dt - (time.monotonic() - tick)
                 if remaining > 0:
                     time.sleep(remaining)
@@ -1384,25 +1367,14 @@ def confirm_motion(args: argparse.Namespace, calibration: Path) -> None:
     print(f"  gains:        kp={format_gain(args.kp)}, kd={format_gain(args.kd)}, "
           f"gravity_ff={'on' if args.gravity_ff else 'off'}")
     print(f"  max speed:    {args.max_joint_speed} rad/s")
-    if not args.qp_constrained_ik:
-        print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
-              f"kd={args.trajectory_velocity_gain:g} s^-1; "
-              f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
-    # FOC 三项合计（kp·lead + kd·|dq| + tau_clip）的保守上界 vs 电机峰值
+    print(f"  q_purpose follower: kp={args.trajectory_position_gain:g} s^-2, "
+          f"kd={args.trajectory_velocity_gain:g} s^-1; "
+          f"v≤{(args.trajectory_max_speed or args.max_joint_speed):g} rad/s")
     kp_arr = as_gain_array(args.kp)
-    kd_arr = as_gain_array(args.kd)
-    torque_cap = float(np.max(kp_arr * args.max_command_lead
-                              + kd_arr * args.max_joint_speed
-                              + (args.tau_clip if args.gravity_ff else 0.0)))
-    print(f"  max lead:     {args.max_command_lead} rad → 力矩上界 {torque_cap:.1f} Nm"
-          f"（三项合计；电机峰值 34.4 Nm 的 {torque_cap / 34.4 * 100:.0f}%）")
+    print(f"  max lead:     {args.max_command_lead} rad; nominal kp×lead="
+          f"{float(np.max(kp_arr*args.max_command_lead)):.1f} Nm "
+          "(not a total torque bound; lead may be exceeded during smooth braking)")
     print("  controller:   right PICO controller")
-    if args.qp_constrained_ik:
-        if args.qp_jerk_limit is None:
-            print("  IK mode:      Placo QP velocity + acceleration bounds; jerk disabled")
-        else:
-            print("  IK mode:      Placo QP velocity + acceleration + "
-                  f"jerk ≤{args.qp_jerk_limit:g} rad/s³")
     print("Keep the emergency stop reachable and support the arm during startup probing.")
     if input("Type MOVE to continue: ").strip() != "MOVE":
         raise SystemExit("Cancelled; no real motor command was sent")
@@ -1414,7 +1386,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teleop = parser.add_argument_group("right R1Arm real teleoperation")
     teleop.add_argument("--motion-mode", action="store_true")
-    teleop.add_argument("--port", default="/dev/ttyUSB2")
+    teleop.add_argument("--port", default=os.environ.get("PORT", ""))
     teleop.add_argument("--baud", type=int, default=6_000_000)
     teleop.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK_ROOT)
     teleop.add_argument("--calib", type=Path)
@@ -1423,8 +1395,6 @@ def build_parser() -> argparse.ArgumentParser:
     teleop.add_argument("--scale-factor", type=float, default=1.0)
     teleop.add_argument("--rate", type=float, default=90.0,
                         help="控制环 Hz（默认 90；MCAP 图像/观测采样仍由 --frequency 默认 30Hz）")
-    teleop.add_argument("--xr-filter-min-cutoff", type=float, default=8.0)
-    teleop.add_argument("--xr-filter-beta", type=float, default=1.0)
     teleop.add_argument("--trajectory-position-gain", type=float, default=64.0,
                         help="Baseline q_purpose position-error response (s^-2)")
     teleop.add_argument("--trajectory-velocity-gain", type=float, default=16.0,
@@ -1433,10 +1403,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--trajectory-max-speed", type=float, default=None,
         help="q_purpose shaper speed limit (rad/s; defaults to --max-joint-speed)",
     )
-    teleop.add_argument("--qp-constrained-ik", action="store_true",
-                        help="Embed active IK velocity/acceleration limits in Placo QP")
-    teleop.add_argument("--qp-jerk-limit", type=float, default=None,
-                        help="Optional active IK jerk bound in Placo QP (rad/s^3; e.g. 80)")
     teleop.add_argument(
         "--ik-dt", type=float, default=0.0,
         help="IK 积分步长 s；0 = 跟随 1/--rate（对齐）",
@@ -1462,13 +1428,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="SDK command speed limit (rad/s; default 1.0)")
     teleop.add_argument(
         "--max-command-lead", type=float, default=0.15,
-        help="命令相对实测的最大超前量 rad（默认 0.15）：异常单拍位移 ≤8.6°，"
-             "力矩三项合计 ≈ 峰值一半；正常跟踪不触发",
+        help="命令相对实测的目标最大超前量 rad（默认 0.15）；平滑制动冲突时可暂时超过，不能作为总力矩上界",
     )
     teleop.add_argument("--feedback-timeout", type=float, default=3.0)
     teleop.add_argument("--foc-timeout", type=float, default=1.0)
     teleop.add_argument("--enable-dex1", action=argparse.BooleanOptionalAction, default=True)
-    teleop.add_argument("--dex1-net", default="enp4s0")
+    teleop.add_argument("--dex1-net", default=os.environ.get("DEX1_NETWORK", ""))
+    teleop.add_argument("--dex1-side", choices=("left", "right"), default=os.environ.get("DEX1_SIDE", "right"),
+                        help="DDS side topic for the physical Dex1; independent of the right-arm PICO")
     teleop.add_argument("--dex1-domain", type=int, default=0)
     teleop.add_argument("--grip-torque-limit", type=float, default=-1.0)
     teleop.add_argument(
@@ -1507,7 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Fields: key=<" + "|".join(CAMERA_KEY_CHOICES) + ">, "
             "backend=v4l2|realsense, device=<path|serial|auto>, "
             "match=<substring of /dev/v4l/by-id>, size=WxH, fps=N, fourcc=MJPG. "
-            "Default: the UVC scene camera plus the D405 on the arm"
+            "Default: D405 head view plus JR0002 right-wrist view"
         ),
     )
     image.add_argument(
@@ -1538,8 +1505,7 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--image-preview-scale", type=float, default=0.75)
     image.add_argument(
         "--preview-hz", type=float, default=12.0,
-        help="预览渲染频率 Hz（默认 12）。渲染在控制循环内执行，50Hz 满频会"
-             "挤占控制周期预算导致遥操抖动；人眼监控 12 Hz 足够",
+        help="Preview worker frequency in Hz (default 12); rendering stays outside control",
     )
 
     record = parser.add_argument_group("compact R1Arm MCAP recording")
@@ -1562,7 +1528,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--frequency", type=float, default=30.0)
     record.add_argument(
         "--output-dir", "--task-dir", dest="output_dir",
-        default="/home/ycb410/nt/r1arm_teleop/dataset/teleop_kp64_kd16_control90_baseline",
+        default=str(PROJECT_ROOT / "dataset/teleop_kp64_kd16_control90_baseline"),
         help="Episode output directory (default: control90 teleop baseline dataset)",
     )
     record.add_argument("--data-root", default=str(PROJECT_ROOT / "data"))
@@ -1587,18 +1553,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.motion_mode and not args.port:
+        parser.error("Set --port or PORT to the verified arm serial device")
+    if args.motion_mode and args.enable_dex1 and not args.dex1_net:
+        parser.error("Set --dex1-net or DEX1_NETWORK to the DDS interface")
     if args.motion_mode and args.mock_xr:
         parser.error("--mock-xr cannot be combined with --motion-mode")
-    if args.qp_jerk_limit is not None and args.qp_jerk_limit <= 0.0:
-        parser.error("--qp-jerk-limit must be positive")
     if args.trajectory_position_gain <= 0.0 or args.trajectory_velocity_gain <= 0.0:
         parser.error("trajectory follower gains must be positive")
     if args.max_joint_speed <= 0.0:
         parser.error("--max-joint-speed must be positive")
     if args.trajectory_max_speed is not None and args.trajectory_max_speed <= 0.0:
         parser.error("--trajectory-max-speed must be positive")
-    if args.qp_jerk_limit is not None and not args.qp_constrained_ik:
-        parser.error("--qp-jerk-limit requires --qp-constrained-ik")
     if args.rate <= 0 or args.frequency <= 0:
         parser.error("--rate and --frequency must be positive")
     if args.no_cameras and args.camera:
@@ -1625,7 +1591,7 @@ def main() -> None:
     if args.motion_mode and not Path(args.port).exists():
         parser.error(f"serial port not found: {args.port}")
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib_candidate.txt"
+    calibration = args.calib or args.sdk_root / "config/joint_calib_zero_右臂.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

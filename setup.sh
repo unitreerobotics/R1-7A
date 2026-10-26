@@ -41,6 +41,20 @@ done
 
 log() { printf '\n==> %s\n' "$*"; }
 
+# Idempotent source adaptation; preserve user edits and fail on patch conflicts.
+apply_dependency_patch() {
+  local dependency_dir="$PROJECT_ROOT/third_party/$1"
+  local dependency_patch="$PROJECT_ROOT/native/dependency_patches/$2"
+  if git -C "$dependency_dir" apply --reverse --check "$dependency_patch" 2>/dev/null; then
+    log "$1: 本地基线补丁已应用"
+  elif git -C "$dependency_dir" apply --check "$dependency_patch"; then
+    git -C "$dependency_dir" apply "$dependency_patch"
+  else
+    echo "$1: 补丁与当前工作树冲突；保留现有文件，停止安装" >&2
+    exit 1
+  fi
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "缺少命令: $1" >&2
@@ -66,6 +80,7 @@ if [[ "$SKIP_APT" -eq 0 ]]; then
   sudo apt update
   sudo apt install -y \
     g++ make build-essential cmake ffmpeg \
+    libserialport-dev libboost-program-options-dev libyaml-cpp-dev libfmt-dev libspdlog-dev \
     libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev \
     libxcb-shape0-dev libxcb-xkb-dev libxcb-cursor0 \
     libx11-xcb1 libqt5gui5
@@ -132,14 +147,11 @@ python -m pip install \
 # ---------------------------------------------------------------------------
 # 5. Unitree SDK2 Python
 # ---------------------------------------------------------------------------
-log "安装 Unitree SDK2 Python"
+log "初始化固定版本的机械臂和 Unitree SDK submodule"
+git -C "$PROJECT_ROOT" submodule update --init --recursive -- \
+  third_party/r1_arm_sdk third_party/unitree_sdk2_python third_party/unitree_sdk2 third_party/dex1_1_service
 mkdir -p "$PROJECT_ROOT/third_party"
 cd "$PROJECT_ROOT/third_party"
-
-if [[ ! -d unitree_sdk2_python/.git ]]; then
-  git -c http.version=HTTP/1.1 clone --depth 1 \
-    https://github.com/unitreerobotics/unitree_sdk2_python.git
-fi
 
 cd unitree_sdk2_python
 python -m pip install -e .
@@ -150,22 +162,13 @@ python -c "import unitree_sdk2py; print('Unitree SDK 安装成功')"
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_XRT" -eq 0 ]]; then
   log "安装 XRoboToolkit Python SDK"
-  cd "$PROJECT_ROOT/third_party"
+  git -C "$PROJECT_ROOT" submodule update --init --recursive -- \
+    third_party/XRoboToolkit-PC-Service-Pybind third_party/XRoboToolkit-PC-Service
 
-  if [[ ! -d XRoboToolkit-PC-Service-Pybind/.git ]]; then
-    git -c http.version=HTTP/1.1 clone --depth 1 \
-      https://github.com/YanjieZe/XRoboToolkit-PC-Service-Pybind.git
-  fi
-
+  apply_dependency_patch XRoboToolkit-PC-Service xr_pc_service.patch
+  apply_dependency_patch XRoboToolkit-PC-Service-Pybind xr_pybind.patch
   PYBIND_ROOT="$PROJECT_ROOT/third_party/XRoboToolkit-PC-Service-Pybind"
-  SDK_ROOT="$PYBIND_ROOT/tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK"
-  mkdir -p "$PYBIND_ROOT/tmp"
-  cd "$PYBIND_ROOT/tmp"
-
-  if [[ ! -d XRoboToolkit-PC-Service/.git ]]; then
-    git -c http.version=HTTP/1.1 clone --depth 1 --single-branch \
-      https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git
-  fi
+  SDK_ROOT="$PROJECT_ROOT/third_party/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK"
 
   cd "$SDK_ROOT"
   # 丢掉可能从别处拷来的、带绝对路径的旧 CMake 缓存
@@ -192,7 +195,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. 自检
+# 7. 原生机械臂 SDK、bridge 和夹爪服务（仅构建，不连接硬件）
+# ---------------------------------------------------------------------------
+log "构建机械臂 SDK / bridge / Dex1 服务"
+cd "$PROJECT_ROOT"
+apply_dependency_patch r1_arm_sdk r1_arm_sdk.patch
+apply_dependency_patch dex1_1_service dex1_1_service.patch
+R1ARM_NATIVE_ROOT="${R1ARM_SDK_ROOT:-${ARM:-$PROJECT_ROOT/third_party/r1_arm_sdk}}"
+UNITREE_NATIVE_ROOT="${UNITREE_SDK2_ROOT:-$PROJECT_ROOT/third_party/unitree_sdk2}"
+cmake -S "$R1ARM_NATIVE_ROOT" -B "$PROJECT_ROOT/build/r1_arm_sdk" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$PROJECT_ROOT/build/r1_arm_sdk" -j"$(nproc)"
+python scripts/build_r1arm_sdk_bridge.py --sdk-root "$R1ARM_NATIVE_ROOT"
+cmake -S "$PROJECT_ROOT/third_party/dex1_1_service" -B "$PROJECT_ROOT/build/dex1_1_service" \
+  -DUNITREE_SDK2_ROOT="$UNITREE_NATIVE_ROOT" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$PROJECT_ROOT/build/dex1_1_service" -j"$(nproc)"
+
+# ---------------------------------------------------------------------------
+# 8. 自检
 # ---------------------------------------------------------------------------
 log "依赖自检"
 cd "$PROJECT_ROOT"

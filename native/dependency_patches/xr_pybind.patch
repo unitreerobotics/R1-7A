@@ -1,0 +1,224 @@
+diff --git a/bindings/XrFrameCache.h b/bindings/XrFrameCache.h
+new file mode 100644
+index 0000000..14d1900
+--- /dev/null
++++ b/bindings/XrFrameCache.h
+@@ -0,0 +1,28 @@
++#pragma once
++#include <array>
++#include <cstdint>
++#include <memory>
++#include <atomic>
++
++struct XrFrame {
++    std::array<double, 7> left{}, right{}, headset{};
++    std::array<double, 4> keys{}; // left grip/trigger, right grip/trigger
++    std::array<bool, 4> buttons{}; // X,Y,A,B
++    int64_t source_stamp_ns{0}, received_monotonic_ns{0}, published_monotonic_ns{0};
++    std::array<int64_t, 3> pose_received_ns{}, pose_source_ns{}; // left, right, headset
++    std::array<bool, 3> pose_valid{};
++    std::array<uint64_t, 4> button_press_counts{};
++    uint64_t payload_hash{0};
++    uint64_t sequence{0};
++};
++
++class XrFrameCache {
++public:
++    void publish(XrFrame frame) {
++        std::atomic_store(&latest_, std::make_shared<const XrFrame>(std::move(frame)));
++    }
++    std::shared_ptr<const XrFrame> latest() const { return std::atomic_load(&latest_); }
++    void clear() { std::atomic_store(&latest_, std::shared_ptr<const XrFrame>{}); }
++private:
++    std::shared_ptr<const XrFrame> latest_;
++};
+diff --git a/bindings/py_bindings.cpp b/bindings/py_bindings.cpp
+index d562f63..f8feeb1 100644
+--- a/bindings/py_bindings.cpp
++++ b/bindings/py_bindings.cpp
+@@ -8,9 +8,52 @@
+ #include <array>
+ #include <nlohmann/json.hpp>
+ #include "PXREARobotSDK.h"
++#include "XrFrameCache.h"
++#include <chrono>
++#include <cmath>
++#include <cstring>
+ 
+ using json = nlohmann::json;
+ 
++XrFrameCache frameCache;
++std::mutex stateCallbackMutex;
++std::atomic<uint64_t> frameSequence{0}, frameParseErrors{0};
++int64_t steadyNowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++std::atomic<int64_t> callbackTotalNs{0}, callbackTailNs{0}, callbackMaxNs{0}, callbackLockWaitNs{0};
++std::atomic<uint64_t> callbackCount{0};
++struct CallbackTimer {
++    int64_t start, primaryEnd{0};
++    explicit CallbackTimer(int64_t ns): start(ns) {}
++    ~CallbackTimer() {
++        const auto end=steadyNowNs(), total=end-start;
++        callbackTotalNs=total;
++        callbackTailNs=primaryEnd ? end-primaryEnd : 0;
++        auto previous=callbackMaxNs.load();
++        while(total>previous && !callbackMaxNs.compare_exchange_weak(previous,total)) {}
++        ++callbackCount;
++    }
++};
++uint64_t payloadHash(const char* data) {
++    uint64_t hash=14695981039346656037ULL;
++    const auto size=std::strlen(data);
++    for(size_t i=0;i<size;++i) {
++        hash^=static_cast<unsigned char>(data[i]);hash*=1099511628211ULL;
++    }
++    return hash;
++}
++bool validPose(const std::array<double,7>& pose) {
++    double norm=0.;
++    for(size_t i=0;i<pose.size();++i) {
++        if(!std::isfinite(pose[i])) return false;
++        if(i>=3) norm+=pose[i]*pose[i];
++    }
++    return norm>1e-10;
++}
++
+ std::array<double, 7> LeftControllerPose;
+ std::array<double, 7> RightControllerPose;
+ std::array<double, 7> HeadsetPose;
+@@ -108,6 +151,10 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
+         break;
+     case PXREADeviceStateJson:
+         auto& dsj = *((PXREADevStateJson*)userData);
++        const auto receivedNs = steadyNowNs();
++        CallbackTimer callbackTimer(receivedNs);
++        std::lock_guard<std::mutex> callbackLock(stateCallbackMutex);
++        callbackLockWaitNs=steadyNowNs()-receivedNs;
+         try {
+             json data = json::parse(dsj.stateJson);
+             if (data.contains("value")) {
+@@ -153,6 +200,35 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
+                     std::lock_guard<std::mutex> lock(timestampMutex);
+                     TimeStampNs = value["timeStampNs"].get<int64_t>();
+                 }
++                {
++                    const auto previous=frameCache.latest();
++                    XrFrame frame=previous ? *previous : XrFrame{};
++                    std::scoped_lock lock(leftMutex, rightMutex, headsetPoseMutex, timestampMutex);
++                    const bool present[3]={value["Controller"].contains("left"),
++                                           value["Controller"].contains("right"), value.contains("Head")};
++                    if(present[0]) frame.left=LeftControllerPose;
++                    if(present[1]) frame.right=RightControllerPose;
++                    if(present[2]) frame.headset=HeadsetPose;
++                    for(int i=0;i<3;++i) if(present[i]) {
++                        frame.pose_received_ns[i]=receivedNs;
++                        frame.pose_source_ns[i]=value.contains("timeStampNs") ? TimeStampNs : 0;
++                        frame.pose_valid[i]=validPose(i==0 ? frame.left : (i==1 ? frame.right : frame.headset));
++                    }
++                    if(present[0]) { frame.keys[0]=LeftGrip; frame.keys[1]=LeftTrigger; }
++                    if(present[1]) { frame.keys[2]=RightGrip; frame.keys[3]=RightTrigger; }
++                    auto buttons=frame.buttons;
++                    if(present[0]) { buttons[0]=LeftPrimaryButton; buttons[1]=LeftSecondaryButton; }
++                    if(present[1]) { buttons[2]=RightPrimaryButton; buttons[3]=RightSecondaryButton; }
++                    for(int i=0;i<4;++i) if(buttons[i] && !frame.buttons[i]) ++frame.button_press_counts[i];
++                    frame.buttons=buttons;
++                    frame.source_stamp_ns = TimeStampNs;
++                    frame.received_monotonic_ns = receivedNs;
++                    frame.published_monotonic_ns = steadyNowNs();
++                    frame.payload_hash=payloadHash(dsj.stateJson);
++                    frame.sequence = ++frameSequence;
++                    frameCache.publish(std::move(frame));
++                    callbackTimer.primaryEnd=steadyNowNs();
++                }
+                 if (value["Hand"].contains("leftHand")) {
+                     auto& leftHand = value["Hand"]["leftHand"];
+                     {
+@@ -257,14 +333,19 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
+                     }
+                 }
+             }
+-        } catch (const json::exception& e) {
+-            std::cerr << "JSON parsing error: " << e.what() << std::endl;
++        } catch (const std::exception& e) {
++            if (++frameParseErrors == 1)
++                std::cerr << "XR parse error (further errors counted in frame snapshot): " << e.what() << std::endl;
+         }
+             break;
+     }
+ }
+ 
+ void init() {
++    frameCache.clear();
++    frameSequence = 0;
++    frameParseErrors = 0;
++    callbackTotalNs=0; callbackTailNs=0; callbackMaxNs=0; callbackCount=0; callbackLockWaitNs=0;
+     if (PXREAInit(NULL, OnPXREAClientCallback, PXREAFullMask) != 0) {
+         throw std::runtime_error("PXREAInit failed");
+     }
+@@ -272,6 +353,48 @@ void init() {
+ 
+ void deinit() {
+     PXREADeinit();
++    frameCache.clear();
++}
++
++pybind11::object getFrameSnapshot() {
++    const auto frame = frameCache.latest();
++    if (!frame) return pybind11::none();
++    pybind11::dict poses, keys, buttons, result;
++    poses["headset"] = frame->headset;
++    poses["left_controller"] = frame->left;
++    poses["right_controller"] = frame->right;
++    keys["left_grip"] = frame->keys[0]; keys["left_trigger"] = frame->keys[1];
++    keys["right_grip"] = frame->keys[2]; keys["right_trigger"] = frame->keys[3];
++    buttons["X"] = frame->buttons[0]; buttons["Y"] = frame->buttons[1];
++    buttons["A"] = frame->buttons[2]; buttons["B"] = frame->buttons[3];
++    result["poses"] = poses; result["keys"] = keys; result["buttons"] = buttons;
++    result["source_stamp_ns"] = frame->source_stamp_ns;
++    result["received_monotonic_ns"] = frame->received_monotonic_ns;
++    result["published_monotonic_ns"] = frame->published_monotonic_ns;
++    result["sequence"] = frame->sequence;
++    result["payload_hash"] = frame->payload_hash;
++    result["primary_parse_ns"] = frame->published_monotonic_ns-frame->received_monotonic_ns;
++    result["parse_errors"] = frameParseErrors.load();
++    result["callback_last_complete_ns"] = callbackTotalNs.load();
++    result["callback_tail_ns"] = callbackTailNs.load();
++    result["callback_max_ns"] = callbackMaxNs.load();
++    result["callback_lock_wait_ns"] = callbackLockWaitNs.load();
++    result["callback_completed_count"] = callbackCount.load();
++    pybind11::dict fields;
++    const char* names[]={"left_controller","right_controller","headset"};
++    for(int i=0;i<3;++i) {
++        pybind11::dict status;
++        status["received_monotonic_ns"]=frame->pose_received_ns[i];
++        status["source_stamp_ns"]=frame->pose_source_ns[i];
++        status["valid"]=frame->pose_valid[i];
++        fields[names[i]]=status;
++    }
++    result["pose_fields"]=fields;
++    pybind11::dict presses;
++    const char* buttonNames[]={"X","Y","A","B"};
++    for(int i=0;i<4;++i) presses[buttonNames[i]]=frame->button_press_counts[i];
++    result["button_press_counts"]=presses;
++    return result;
+ }
+ 
+ std::array<double, 7> getLeftControllerPose() {
+@@ -474,6 +597,7 @@ int64_t getMotionTimeStampNs() {
+ 
+ 
+ PYBIND11_MODULE(xrobotoolkit_sdk, m) {
++    m.def("get_frame_snapshot", &getFrameSnapshot, "Latest coherent frame with native reception timing; does not initialize the SDK.");
+     m.def("init", &init, "Initialize the PXREARobot SDK.");
+     m.def("close", &deinit, "Deinitialize the PXREARobot SDK.");
+     m.def("get_left_controller_pose", &getLeftControllerPose, "Get the left controller pose.");
+@@ -516,4 +640,4 @@ PYBIND11_MODULE(xrobotoolkit_sdk, m) {
+     m.def("get_motion_timestamp_ns", &getMotionTimeStampNs, "Get the motion data timestamp in nanoseconds.");
+     
+     m.doc() = "Python bindings for PXREARobot SDK using pybind11.";
+-}
+\ No newline at end of file
++}

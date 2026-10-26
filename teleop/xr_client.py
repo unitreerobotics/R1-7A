@@ -61,6 +61,10 @@ class XrClient:
 
     # ---- controller / headset poses (7-element: x,y,z,qx,qy,qz,qw) -------
 
+    def get_frame_snapshot(self) -> dict | None:
+        getter = getattr(self._xrt, "get_frame_snapshot", None)
+        return getter() if getter is not None else None
+
     def get_pose_by_name(self, name: str) -> np.ndarray:
         if name == "headset":
             return np.asarray(self._xrt.get_headset_pose(), dtype=float)
