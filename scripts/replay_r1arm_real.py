@@ -65,6 +65,7 @@ from teleop.r1arm_real_controller import (
     MODEL_UPPER,
     limit_sdk_position_command,
 )
+from teleop.replay_preview import ReplayPreview
 
 JOINT_COUNT = 7
 PREVIEW_WINDOW = "R1Arm real replay observations"
@@ -363,14 +364,14 @@ def check_faults(state, require_foc: bool) -> None:
             raise RuntimeError(f"R1Arm left FOC mode: {joints}")
 
 
-def wait_for_feedback(bus: R1ArmSdkBus, rate: float, timeout: float):
+def wait_for_feedback(bus: R1ArmSdkBus, rate: float, timeout: float, check_state=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         bus.probe_once()
         time.sleep(1.0 / rate)
         state = bus.read_state()
         if np.all(state.ready):
-            check_feedback_range(state)
+            (check_state or check_feedback_range)(state)
             check_faults(state, require_foc=False)
             return state
     state = bus.read_state()
@@ -383,7 +384,7 @@ def wait_for_feedback(bus: R1ArmSdkBus, rate: float, timeout: float):
 def enable_foc_hold(
     bus: R1ArmSdkBus, command_sdk: np.ndarray, kp: "float | np.ndarray",
     kd: "float | np.ndarray", rate: float, timeout: float,
-    tau_fn=None,
+    tau_fn=None, check_state=None,
 ):
     deadline = time.monotonic() + timeout
     zero_dq = np.zeros(JOINT_COUNT, dtype=float)
@@ -392,7 +393,7 @@ def enable_foc_hold(
         _command_position_v3(bus, command_sdk, zero_dq, kp, kd, tau)
         time.sleep(1.0 / rate)
         state = bus.read_state()
-        check_feedback_range(state)
+        (check_state or check_feedback_range)(state)
         check_faults(state, require_foc=False)
         if np.all(state.mode == 1):
             return state
@@ -603,6 +604,7 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         print("Add --motion-mode to actually command the arm (keep the e-stop reachable).")
         return
 
+    preview_worker = None
     bus: R1ArmSdkBus | None = None
     hand: Dex1Single | None = None
     command_sdk: np.ndarray | None = None
@@ -646,6 +648,12 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     telemetry.writeheader()
 
     try:
+        if args.show_observations and observation_frames and camera_order:
+            preview_worker = ReplayPreview(
+                episode, camera_order, scale=args.preview_scale,
+                window="R1Arm real replay observations",
+            )
+            preview_worker.update(int(observation_stamps[0]))
         bus = R1ArmSdkBus(args.bridge_lib)
         bus.open(args.port, args.baud, calibration)
 
@@ -747,18 +755,9 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
         last_command_mono = time.monotonic()
         print(f"[Replay] telemetry CSV: {telemetry_path}")
         print(f"Playing {len(arm_traj)} frames at {freq:.1f} Hz x {args.speed:.2f} speed...")
-        preview_cursor = -1
         replay_start_ns = int(stamps[0] * 1e9) if len(stamps) and stamps[0] > 0 else 0
-        preview_scale = max(float(args.preview_scale), 0.1)
-        if args.show_observations:
-            print(f"[Replay] camera preview: {list(camera_order)} (q/Esc closes replay)")
-            cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
-            cv2.moveWindow(PREVIEW_WINDOW, 40, 40)
-            try:
-                cv2.setWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_TOPMOST, 1)
-            except cv2.error:
-                pass
-            cv2.waitKey(100)
+        if preview_worker is not None:
+            print(f"[Replay] camera preview process: {list(camera_order)} (q/Esc stops replay)")
         while True:
             tick_origin = time.monotonic()
             for i, model_target in enumerate(arm_traj):
@@ -828,28 +827,13 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 last_command_mono = command_mono
                 command_sdk = cmd
                 command_gripper(gripper_traj[i])
-                if args.show_observations:
+                if preview_worker is not None:
                     replay_elapsed = float(np.sum(intervals[1 : i + 1]))
                     replay_stamp_ns = replay_start_ns + int(replay_elapsed * 1e9)
                     camera_index = max(0, int(np.searchsorted(
                         observation_stamps, replay_stamp_ns, side="right"
                     ) - 1))
-                    if camera_index >= 0 and camera_index != preview_cursor:
-                        preview = observation_mosaic(
-                            observation_frames[camera_index], camera_index,
-                            len(observation_frames), camera_order,
-                        )
-                        if preview_scale != 1.0:
-                            preview = cv2.resize(
-                                preview, None, fx=preview_scale, fy=preview_scale,
-                                interpolation=cv2.INTER_AREA,
-                            )
-                        cv2.imshow(PREVIEW_WINDOW, preview)
-                        if preview_cursor < 0:
-                            print(f"[Replay] first camera preview frame: {preview.shape[1]}x{preview.shape[0]}")
-                            cv2.waitKey(100)
-                        preview_cursor = camera_index
-                    if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                    if preview_worker.update(observation_stamps[camera_index]):
                         raise KeyboardInterrupt
                 if args.debug and (i % 10 == 0 or i == len(arm_traj) - 1):
                     print(
@@ -939,10 +923,6 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     except KeyboardInterrupt:
         print("\n[Replay] interrupted")
     finally:
-        if args.show_observations:
-            cv2.destroyAllWindows()
-        if telemetry_stream is not None and not telemetry_stream.closed:
-            telemetry_stream.close()
         if hand is not None:
             try:
                 hand.stop()
@@ -950,6 +930,10 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 print(f"Warning: Dex1 stop failed: {exc}")
         if bus is not None:
             safe_stop(bus, args.rate)
+        if telemetry_stream is not None and not telemetry_stream.closed:
+            telemetry_stream.close()
+        if preview_worker is not None:
+            preview_worker.close()
         print("[Replay] stopped")
 
 
@@ -1069,10 +1053,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop", action="store_true", help="repeat the trajectory until Ctrl+C")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int, default=-1)
-    parser.add_argument(
-        "--show-observations", action="store_true",
-        help="show the recorded camera views in a mosaic synchronized by MCAP timestamps",
-    )
+    parser.add_argument("--show-observations", action=argparse.BooleanOptionalAction, default=True,
+                        help="show recorded camera views by timestamp (default; use --no-show-observations to disable)")
     parser.add_argument("--preview-scale", type=float, default=0.75)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--no-confirm", action="store_true")

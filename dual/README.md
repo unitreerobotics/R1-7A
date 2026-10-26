@@ -9,8 +9,11 @@ bash dual/start_grippers.sh
 # 终端二：三路图像、90 Hz 控制／30 Hz 观测录制
 python dual/record.py --motion-mode --data-root data/dual_real
 
-# 只读检查；确认后增加 --motion-mode，可加 --show-observations
+# 只读检查；确认后增加 --motion-mode；图像默认由独立进程显示
 python dual/replay.py --episode data/dual_real/episode_0000.mcap
+
+# 不驱动真机，播放图像和轨迹
+python scripts/replay_r1arm_sim.py --episode data/dual_real/episode_0000.mcap
 ```
 
 上述命令前需激活 `r1_teleop` 并 source `scripts/real_env.sh`。

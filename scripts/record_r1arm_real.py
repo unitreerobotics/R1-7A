@@ -32,6 +32,7 @@ import os
 import datetime as dt
 import hashlib
 import json
+import queue
 import signal
 import sys
 import threading
@@ -239,6 +240,8 @@ class R1ArmRealMcapRecord:
             self.previous_buttons[args.pause_button] = False
         self.writer_lock = threading.Lock()
         self.record_stop_event = threading.Event()
+        self.record_commands = queue.Queue(maxsize=16)
+        self.resume_tracking = threading.Event()
         self.record_thread: threading.Thread | None = None
         self.record_error: BaseException | None = None
         self.record_generation = 0
@@ -556,13 +559,15 @@ class R1ArmRealMcapRecord:
             })
         print(f"[Record] START episode {self.writer.episode_id}: {path}")
 
-    def _stop_episode(self) -> None:
+    def _stop_episode(self, *, stop_time: float | None = None) -> None:
         if self.writer is None:
             return
         if not self.is_recording and self.writer.writer is None:
             return
-        duration = max(self._active_duration(), 1e-9)
+        duration = max(self._active_duration(stop_time), 1e-9)
         was_paused = bool(self.record_paused)
+        if was_paused:
+            self.resume_tracking.set()
         self.is_recording = False
         self.record_generation = getattr(self, "record_generation", 0) + 1
         self.record_paused = False
@@ -807,6 +812,8 @@ class R1ArmRealMcapRecord:
             print("[Record] B ignored: no active episode")
             return
         now = time.monotonic()
+        if self.record_paused:
+            self.resume_tracking.set()
         self.record_paused = not self.record_paused
         if self.record_paused:
             self.record_generation = getattr(self, "record_generation", 0) + 1
@@ -845,8 +852,6 @@ class R1ArmRealMcapRecord:
                     "control_seq": int((self.controller.control_sample() or {}).get("control_seq", -1)),
                     "frame_idx": int(self.record_frame_count),
                 })
-            for track in self.controller.track.values():
-                track.clear()
             print("[Record] RESUMED")
 
     def _flush_control_samples_locked(self, *, stop: bool = False) -> dict | None:
@@ -892,12 +897,28 @@ class R1ArmRealMcapRecord:
     def _handle_buttons(self) -> None:
         edges = self._button_edges()
         if edges[self.args.record_button]:
-            if self.is_recording:
-                self._stop_episode()
-            else:
-                self._start_episode()
+            self.record_commands.put_nowait('toggle')
         if self.args.pause_button != "none" and edges[self.args.pause_button]:
-            self._toggle_pause()
+            self.record_commands.put_nowait('pause')
+        if self.resume_tracking.is_set():
+            self.resume_tracking.clear()
+            for track in self.controller.track.values():
+                track.clear()
+
+    def _process_record_commands(self) -> None:
+        # Opening, finalizing and reporting an episode can exceed a control tick.
+        while True:
+            try:
+                command = self.record_commands.get_nowait()
+            except queue.Empty:
+                return
+            if command == 'toggle':
+                if self.is_recording:
+                    self._stop_episode()
+                else:
+                    self._start_episode()
+            elif command == 'pause':
+                self._toggle_pause()
 
     def _state_action(self, sample: dict) -> tuple[dict, dict]:
         commanded_arm = np.asarray(sample["q_purpose"], dtype=float).copy()
@@ -1000,6 +1021,18 @@ class R1ArmRealMcapRecord:
         interval = 1.0 / max(float(self.args.frequency), 1.0)
         last_control_seq = -1
         while not self.record_stop_event.is_set():
+            try:
+                self._process_record_commands()
+                if self.args.duration > 0 and self.is_recording:
+                    if self._active_duration() >= self.args.duration:
+                        self._stop_episode()
+                        if self.args.exit_after_duration:
+                            self.running = False
+                            return
+            except BaseException as exc:
+                self.record_error = exc
+                self.running = False
+                return
             now = time.monotonic()
             if not self.is_recording or self.record_paused:
                 time.sleep(0.005)
@@ -1258,13 +1291,14 @@ class R1ArmRealMcapRecord:
     def run(self) -> None:
         try:
             self._start_cameras()
-            self.controller._on_start()
-            self.started = True
-            self.controller.last_gripper_update = time.monotonic()
             self.record_thread = threading.Thread(
                 target=self._record_loop, name="r1arm-real-mcap-record", daemon=True
             )
             self.record_thread.start()
+            self._start_preview_thread()
+            self.controller._on_start()
+            self.started = True
+            self.controller.last_gripper_update = time.monotonic()
 
             print("\n[R1Arm right-arm MCAP Record] ready")
             print("  Teleoperation is active immediately")
@@ -1293,8 +1327,7 @@ class R1ArmRealMcapRecord:
                         "(this episode records WITHOUT them; see camera_inactive in metadata)"
                     )
             if self.args.auto_start:
-                self._start_episode()
-            self._start_preview_thread()
+                self.record_commands.put_nowait('toggle')
 
             control_dt = 1.0 / max(float(self.args.rate), 1.0)
             previous_tick = time.monotonic()-control_dt
@@ -1302,9 +1335,10 @@ class R1ArmRealMcapRecord:
                 tick = time.monotonic()
                 actual_control_dt = tick - previous_tick
                 previous_tick = tick
+                tracking_paused = self.record_paused
                 self._handle_buttons()
                 if (
-                    (self.teleop_active and not self.record_paused)
+                    (self.teleop_active and not tracking_paused)
                     or self.controller._reset_blending
                 ):
                     self.controller.step(
@@ -1317,15 +1351,11 @@ class R1ArmRealMcapRecord:
 
                 if self.record_error is not None:
                     raise RuntimeError("MCAP recording worker failed") from self.record_error
-                now = time.monotonic()
-                if self.args.duration > 0 and self.is_recording:
-                    if self._active_duration(now) >= self.args.duration:
-                        self._stop_episode()
-                        if self.args.exit_after_duration:
-                            self.running = False
                 remaining = control_dt - (time.monotonic() - tick)
                 if remaining > 0:
                     time.sleep(remaining)
+            if self.record_error is not None:
+                raise RuntimeError("MCAP recording worker failed") from self.record_error
         except KeyboardInterrupt:
             pass
         finally:
@@ -1334,21 +1364,27 @@ class R1ArmRealMcapRecord:
     def shutdown(self) -> None:
         self.running = False
         self._preview_quit = True
+        self.record_stop_event.set()
+        stop_time = time.monotonic()
         try:
-            self._stop_episode()
+            # Stop hardware before waiting for encoding, disk writes or reports.
+            self.controller._on_stop()
+        except BaseException as exc:
+            self.record_error = self.record_error or exc
+            print(f"[Record] controller shutdown failed: {exc}")
+        finally:
+            if self.record_thread is not None:
+                self.record_thread.join()
+                self.record_thread = None
+        try:
+            self._stop_episode(stop_time=stop_time)
         except BaseException as exc:
             self.record_error = self.record_error or exc
             print(f"[Record] episode finalization failed: {exc}")
         finally:
-            self.record_stop_event.set()
-            if self.record_thread is not None:
-                self.record_thread.join()
-                self.record_thread = None
             if self.preview_thread is not None:
                 self.preview_thread.join(timeout=2.0)
                 self.preview_thread = None
-            # Always stop the arm even when writer/report finalization fails.
-            self.controller._on_stop()
             self.started = False
             if self.camera is not None:
                 self.camera.close()

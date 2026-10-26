@@ -219,6 +219,7 @@ class ArmSafety(unittest.TestCase):
             q[5]+=.04
             with self.assertRaises(RuntimeError): arm._check_feedback_range(state(q))
         finally: arm._on_stop()
+
         arm=self.make_arm(home_on_start=True)
         try:
             q=HOME.copy();q[5]=-6.15
@@ -427,6 +428,67 @@ class ServiceLifecycle(unittest.TestCase):
 
 
 class Integration(unittest.TestCase):
+    def test_startup_discovers_both_hands_then_holds_ready_arm_during_slow_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ports = [Path(directory)/side for side in ('right', 'left')]
+            for port in ports:
+                port.touch()
+            c = R1ArmDualRealController(R1ArmConfig(), right_port=str(ports[0]), left_port=str(ports[1]),
+                right_calibration='r', left_calibration='l', mock_xr=True, rate=90,
+                baudrate=6000000, motion_mode=False, enable_dex1=False, home_on_start=True)
+            discovered = []
+            test = self
+            class Bus(FakeBus):
+                def open(self, *args):
+                    test.assertEqual(discovered, ['right', 'left'])
+                    super().open(*args)
+            for side, arm in c.arms.items():
+                arm.motion_mode = True
+                arm.bus_factory = Bus
+                arm._initialize_gripper = lambda side=side: discovered.append(side) if side not in discovered else None
+            left = c.arms['left']
+            wait_feedback = left._wait_for_feedback
+            def slow_probe():
+                time.sleep(.23)
+                return wait_feedback()
+            left._wait_for_feedback = slow_probe
+            try:
+                c.start()
+                right = c.arms['right']
+                self.assertGreaterEqual(len(right.arm_bus.commands), 5)
+                for q, dq, _ in right.arm_bus.commands:
+                    np.testing.assert_allclose(q, model_to_sdk_q(HOME))
+                    if dq is not None:
+                        np.testing.assert_allclose(dq, 0.)
+                pair = c.step(1/90)
+                self.assertLess(pair['right']['command_dt_s'], .1)
+            finally:
+                for arm in c.arms.values():
+                    if arm.arm_bus is not None:
+                        arm.arm_bus.close()
+                        arm.arm_bus = None
+                c.stop()
+
+    def test_startup_failure_releases_sibling_hold_loop_and_stops_both(self):
+        c = R1ArmDualRealController.__new__(R1ArmDualRealController)
+        c.pool = ThreadPoolExecutor(max_workers=2)
+        c.closed = False
+        c.native_xr = None
+        holding = threading.Event()
+        stopped = []
+        def fail():
+            if not holding.wait(timeout=2):
+                raise RuntimeError('sibling did not hold')
+            raise RuntimeError('fake probe failure')
+        c.arms = {side: SimpleNamespace(control_side=side, rate_hz=90., xr_client=None,
+            _initialize_gripper=lambda: None, _on_start=(fail if side == 'left' else lambda: None),
+            _output_command=holding.set, _on_stop=lambda side=side: stopped.append(side))
+            for side in ('right', 'left')}
+        with self.assertRaisesRegex(RuntimeError, 'fake probe failure'):
+            c.start()
+        self.assertEqual(set(stopped), {'right', 'left'})
+        self.assertTrue(c.closed)
+
     def test_independent_models_and_mock_controller(self):
         c=R1ArmDualRealController(R1ArmConfig(),right_port='right',left_port='left',right_calibration='r',left_calibration='l',
             baudrate=6000000,mock_xr=True,rate=90)

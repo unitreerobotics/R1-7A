@@ -109,6 +109,15 @@ class Controller(unittest.TestCase):
         arm.q[arm.arm_q_indices]=HOME
         return arm
 
+    def test_real_entrypoint_dry_run_publishes_one_complete_sample_per_step(self):
+        arm = self.arm
+        arm.start_control_sample_capture()
+        for _ in range(3):
+            arm.step(1/90)
+        samples, _ = arm.drain_control_sample_capture(stop=True)
+        self.assertEqual([row['control_seq'] for row in samples], [1, 2, 3])
+        self.assertTrue(all('q_motor_target' in row and 'q_measured' in row for row in samples))
+
     def test_slow_dex1_startup_does_not_age_arm_feedback_or_command_clock(self):
         arm=self.arm
         arm.motion_mode=True
@@ -128,6 +137,29 @@ class Controller(unittest.TestCase):
             arm._output_command()
         self.assertEqual(len(arm.arm_bus.commands),2)
         self.assertLess(arm.control_sample()['command_dt_s'],.02)
+
+    def test_slow_foc_entry_keeps_single_arm_command_clock_fresh(self):
+        clock = [100.]
+
+        class SlowFocBus(FakeBus):
+            def command_position(self, *args, **kwargs):
+                super().command_position(*args, **kwargs)
+                self.state = dataclasses.replace(
+                    self.state, mode=np.full(7, 0 if len(self.commands) < 20 else 1, dtype=np.uint8))
+
+        arm = self.arm
+        arm.motion_mode = True
+        arm.enable_dex1 = False
+        arm.bus_factory = SlowFocBus
+        with patch('teleop.r1arm_real_controller.time.monotonic', side_effect=lambda: clock[0]), patch(
+                'teleop.r1arm_real_controller.time.monotonic_ns', side_effect=lambda: int(clock[0]*1e9)), patch(
+                'teleop.r1arm_real_controller.time.sleep', side_effect=lambda dt: clock.__setitem__(0, clock[0]+dt)):
+            arm._on_start()
+            self.assertGreater(clock[0]-100., .2)
+            clock[0] += 1/90
+            arm._output_command()
+        self.assertEqual(len(arm.arm_bus.commands), 21)
+        self.assertLess(arm.control_sample()['command_dt_s'], .03)
 
     def test_right_trigger_publishes_gripper_without_grip_or_arm_motion(self):
         arm=self.arm

@@ -136,11 +136,11 @@ def main():
             mock_xr=args.mock_xr, debug=False, ik_dt=args.ik_dt,
             gravity_ff=args.gravity_ff, tau_clip=args.tau_clip,
         )
-        controller.start()
         recorder = DualRecorder(args, camera)
         print('A: BOTH home | X: start/save episode | B: pause/resume recording and tracking')
         print('Left/right grip: corresponding arm tracking; trigger: corresponding gripper')
         previous = dict.fromkeys(('A', 'X', 'B'), False)
+        controller.start()
         clock = PeriodicDeadline(args.rate)
         start = time.monotonic()
         last = start-1.0/args.rate

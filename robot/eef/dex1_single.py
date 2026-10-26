@@ -14,6 +14,10 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_
 from robot.eef.dex1_config import load_dex1_endpoints
 
 
+# CycloneDDS lazily builds shared IDL types without a thread-safe first-use guard.
+_DDS_INIT_LOCK = threading.Lock()
+
+
 class Dex1Single:
     """Publish commands for the single Dex1 attached to an R1Arm."""
 
@@ -33,16 +37,8 @@ class Dex1Single:
         self.closed_q, self.open_q = load_dex1_endpoints(self.side)
         self.travel = self.open_q - self.closed_q
 
-        if interface:
-            ChannelFactoryInitialize(int(domain), interface)
-        else:
-            ChannelFactoryInitialize(int(domain))
-
         self.command_topic = f"rt/dex1/{self.side}/cmd"
         self.state_topic = f"rt/dex1/{self.side}/state"
-        self.publisher = ChannelPublisher(self.command_topic, MotorCmds_)
-        self.publisher.Init()
-        self.subscriber = ChannelSubscriber(self.state_topic, MotorStates_)
 
         self.message = MotorCmds_()
         self.message.cmds = [unitree_go_msg_dds__MotorCmd_()]
@@ -71,7 +67,15 @@ class Dex1Single:
         self._latched_q: float | None = None
         self.last_command = self.open_q
 
-        self.subscriber.Init(self._receive_state)
+        with _DDS_INIT_LOCK:
+            if interface:
+                ChannelFactoryInitialize(int(domain), interface)
+            else:
+                ChannelFactoryInitialize(int(domain))
+            self.publisher = ChannelPublisher(self.command_topic, MotorCmds_)
+            self.publisher.Init()
+            self.subscriber = ChannelSubscriber(self.state_topic, MotorStates_)
+            self.subscriber.Init(self._receive_state)
 
         deadline = time.monotonic() + float(feedback_timeout)
         while not self.state_received and time.monotonic() < deadline:

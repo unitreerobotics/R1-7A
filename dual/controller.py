@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import replace
 from copy import deepcopy
 import time
+import threading
 
 import numpy as np
 
@@ -173,8 +174,10 @@ class R1ArmDualRealController:
             self.stop()
             raise
 
-    def _parallel(self, method):
-        futures = {side: self.pool.submit(getattr(arm, method)) for side, arm in self.arms.items()}
+    def _parallel(self, method, *, operation=None):
+        futures = {side: (self.pool.submit(operation, arm) if operation is not None
+                          else self.pool.submit(getattr(arm, method)))
+                   for side, arm in self.arms.items()}
         try:
             wait(futures.values())
         except BaseException:
@@ -196,8 +199,29 @@ class R1ArmDualRealController:
             raise RuntimeError(f'{side} {method} failed: {error}') from error
 
     def start(self):
+        startup_done = threading.Event()
+        ready_lock = threading.Lock()
+        ready = set()
+
+        def start_and_hold(arm):
+            try:
+                arm._on_start()
+                with ready_lock:
+                    ready.add(arm.control_side)
+                    if len(ready) == len(self.arms):
+                        startup_done.set()
+                # Keep the measured pose alive while the other bus is probing.
+                while not startup_done.wait(1.0 / arm.rate_hz):
+                    arm._output_command()
+            except BaseException:
+                startup_done.set()
+                raise
+
         try:
-            self._parallel('_on_start')
+            # Finish discovery for BOTH hands before either motor bus is enabled.
+            for arm in self.arms.values():
+                arm._initialize_gripper()
+            self._parallel('_on_start', operation=start_and_hold)
         except BaseException:
             self.stop()
             raise

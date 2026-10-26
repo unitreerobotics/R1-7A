@@ -12,7 +12,6 @@ import signal
 import sys
 import time
 
-import cv2
 from mcap.reader import make_reader
 import numpy as np
 
@@ -28,9 +27,59 @@ from dual.config import CALIBRATIONS, PORTS, validate_pair
 from robot.r1arm_config import DEFAULT_URDF_PATH, DEX1_SIM_CLOSE, DEX1_SIM_OPEN, sim_to_closed_ratio
 from robot.r1arm_sdk import DEFAULT_BRIDGE_LIBRARY, R1ArmSdkBus, model_to_sdk_q, sdk_to_model_q, validate_calibration_file
 from dual.controller import LeftArmBus
-from teleop.r1arm_real_controller import MODEL_LOWER, MODEL_UPPER, limit_sdk_position_command
+from teleop.r1arm_real_controller import (
+    MODEL_LOWER, MODEL_UPPER, limit_sdk_position_command,
+)
+from teleop.replay_preview import ReplayPreview
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class StartupLimitRecovery:
+    """Allow a bounded, inward-only replay start from a small model-limit offset."""
+    def __init__(self, side, margin=.25):
+        self.side = side
+        self.margin = float(margin)
+        self.origin = None
+        self.lower = self.upper = None
+        self.command_lower = self.command_upper = None
+
+    @property
+    def active(self):
+        return self.origin is not None
+
+    def check(self, state, *, startup=False):
+        if not np.all(state.ready) or not np.isfinite(state.q).all():
+            return check_feedback_range(state)
+        q = sdk_to_model_q(state.q)
+        if self.active:
+            if np.any(q < self.lower - .02) or np.any(q > self.upper + .02):
+                raise RuntimeError(f'{self.side}: feedback left bounded replay startup recovery corridor')
+            return q
+        if startup:
+            excess = max(float(np.max(MODEL_LOWER-q)), float(np.max(q-MODEL_UPPER)), 0.)
+            if excess > self.margin:
+                raise RuntimeError(f'{self.side}: startup exceeds replay recovery margin {self.margin:g} rad')
+            if excess > 0:
+                self.origin = q.copy()
+                self.lower, self.upper = np.minimum(MODEL_LOWER, q), np.maximum(MODEL_UPPER, q)
+                a, b = model_to_sdk_q(self.lower), model_to_sdk_q(self.upper)
+                self.command_lower, self.command_upper = np.minimum(a, b), np.maximum(a, b)
+                print(f'[Replay] {self.side} starts {excess:.3f} rad outside model limits; '
+                      f'slewing inward within the {self.margin:g} rad startup bound')
+                return q
+        return check_feedback_range(state)
+
+    def target(self, model_target):
+        return np.clip(model_target, MODEL_LOWER, MODEL_UPPER) if self.active else model_target
+
+    def finish_if_inside(self, measured_model, command_sdk):
+        if self.active and (np.all(measured_model >= MODEL_LOWER) and
+                            np.all(measured_model <= MODEL_UPPER)):
+            command_model = sdk_to_model_q(command_sdk)
+            if np.all(command_model >= MODEL_LOWER) and np.all(command_model <= MODEL_UPPER):
+                self.origin = self.lower = self.upper = None
+                self.command_lower = self.command_upper = None
 
 
 class ReplayTelemetry:
@@ -131,7 +180,8 @@ def parse_args(argv=None):
     parser.add_argument('--right-calib', type=Path, default=CALIBRATIONS['right'])
     parser.add_argument('--left-calib', type=Path, default=CALIBRATIONS['left'])
     parser.add_argument('--data-source', choices=('auto','control','frame'), default='auto')
-    parser.add_argument('--show-observations', action='store_true')
+    parser.add_argument('--show-observations', action=argparse.BooleanOptionalAction, default=True,
+                        help='show recorded camera views by timestamp (default; use --no-show-observations to disable)')
     parser.add_argument('--section', choices=('action', 'state'), default='action')
     parser.add_argument('--speed', type=float, default=1.0)
     parser.add_argument('--max-gap', type=float, default=0.5)
@@ -184,19 +234,17 @@ def run(args):
         if not observations:
             print('[Replay] No recorded images; preview disabled')
     observation_times = np.array([row['sample_time_ns'] for row in observations],dtype=np.int64)
+    preview_worker = None
     preview_index = -1
     def preview(stamp):
         nonlocal preview_index
-        if not observations:
+        if preview_worker is None or not observations:
             return
         index = int(np.searchsorted(observation_times,stamp,side='right'))-1
         if index >= 0 and index != preview_index:
-            row = observations[index]
-            image = observation_mosaic(row,index,len(observations),tuple(info.get('camera_order') or row['colors']))
-            cv2.imshow('Dual recorded observations: q to stop',image)
+            if preview_worker.update(observations[index]['sample_time_ns']):
+                raise KeyboardInterrupt
             preview_index = index
-        if cv2.waitKey(1)&255 in (27,ord('q')):
-            raise KeyboardInterrupt
     hz = float(info.get('frequency_hz', 30.0))
     if not math.isfinite(hz) or hz <= 0:
         raise ValueError('Episode frequency must be finite and positive')
@@ -220,6 +268,7 @@ def run(args):
         if input('Type MOVE to replay on BOTH arms: ').strip() != 'MOVE':
             raise SystemExit('Cancelled')
     buses, commands, hands = {}, {}, {}
+    recovery = {side: StartupLimitRecovery(side) for side in ('right', 'left')}
     last_command_time = {}
     model, _ = load_robot_model(str(args.urdf or DEFAULT_URDF_PATH))
     gravity_data = {side: model.createData() for side in ('right', 'left')}
@@ -251,19 +300,23 @@ def run(args):
         if not running:
             raise KeyboardInterrupt
         feedback = {side: bus.read_state() for side,bus in buses.items()}
-        for state in feedback.values():
-            check_feedback_range(state)
+        for side, state in feedback.items():
+            recovery[side].check(state)
             check_faults(state, require_foc=True)
         def output(side, offset):
             state = feedback[side]
             model_q = sdk_to_model_q(state.q)
-            target = model_to_sdk_q(vector[offset:offset+7])
+            target = model_to_sdk_q(recovery[side].target(vector[offset:offset+7]))
             now = time.monotonic()
             dt = now-last_command_time[side]
             if not 0 < dt <= .1:
                 raise RuntimeError(f'{side} replay command interval invalid: {dt:.6f}s')
+            bounds = {}
+            if recovery[side].active:
+                bounds = dict(lower_limit=recovery[side].command_lower,
+                              upper_limit=recovery[side].command_upper)
             command = limit_sdk_position_command(target,commands[side],state.q,
-                max_delta=speed_limit*dt,max_lead=args.max_command_lead)
+                max_delta=speed_limit*dt,max_lead=args.max_command_lead,**bounds)
             dq=(command-commands[side])/dt
             tau = gravity_feedforward(model,gravity_data[side],sdk_to_model_q(command),args.tau_clip) if args.gravity_ff else None
             try:
@@ -272,6 +325,7 @@ def run(args):
                 raise RuntimeError(f'{side} replay output failed: {exc}') from exc
             commands[side]=command
             last_command_time[side]=now
+            recovery[side].finish_if_inside(model_q, command)
             if side in hands:
                 hands[side].set_closed_ratio(sim_to_closed_ratio(vector[offset+7]))
             return model_q, dict(side=side,time_ns=time.time_ns(),command_dt_s=dt,
@@ -312,16 +366,24 @@ def run(args):
             time.sleep(max(0., tick - (time.monotonic() - start)))
 
     try:
+        if args.show_observations and observations:
+            preview_worker = ReplayPreview(
+                path, tuple(info.get('camera_order') or observations[0]['colors']),
+                window='Dual recorded observations',
+            )
+            preview_worker.update(observations[0]['sample_time_ns'])
         log_path = args.telemetry_csv or path.with_name(path.stem + f'_dual_replay_{time.time_ns()}.csv')
         telemetry = ReplayTelemetry(log_path,['time_ns', *[f'target_{i}' for i in range(16)],
             *[f'{s}_measured_J{i}' for s in ('right','left') for i in range(1,8)],'diagnostics_json'])
         def startup(side, port, calib, factory):
             bus = buses[side] = factory(args.bridge_lib)
             bus.open(port,args.baud,calib)
-            state=wait_for_feedback(bus,args.rate,args.feedback_timeout)
+            validate = lambda sample: recovery[side].check(sample, startup=(side == 'left'))
+            state=wait_for_feedback(bus,args.rate,args.feedback_timeout,check_state=validate)
             commands[side]=state.q.copy()
             tau_fn=lambda q: gravity_feedforward(model,gravity_data[side],sdk_to_model_q(q),args.tau_clip) if args.gravity_ff else None
-            enable_foc_hold(bus,commands[side],args.kp,args.kd,args.rate,args.foc_timeout,tau_fn=tau_fn)
+            enable_foc_hold(bus,commands[side],args.kp,args.kd,args.rate,args.foc_timeout,
+                            tau_fn=tau_fn,check_state=validate)
             last_command_time[side]=time.monotonic()
         barrier([lambda: startup('right',args.right_port,args.right_calib,R1ArmSdkBus),
                  lambda: startup('left',args.left_port,args.left_calib,LeftArmBus)])
@@ -358,8 +420,8 @@ def run(args):
         for hand in hands.values():
             hand.stop()
         try:
-            if observations:
-                cv2.destroyAllWindows()
+            if preview_worker is not None:
+                preview_worker.close()
             if telemetry is not None:
                 telemetry.close()
         finally:

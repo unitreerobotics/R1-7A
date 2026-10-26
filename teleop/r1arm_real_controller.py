@@ -249,9 +249,11 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         assert self.arm_bus is not None and self.command_sdk is not None
         deadline = time.monotonic() + self.foc_timeout
         while time.monotonic() < deadline:
+            command_start = time.monotonic()
             self.arm_bus.command_position(
                 self.command_sdk, self.kp, self.kd, tau=self._tau_ff(self.command_sdk)
             )
+            self._last_command_monotonic_s = command_start
             time.sleep(1.0 / self.rate_hz)
             state = self.arm_bus.read_state()
             self._check_feedback_range(state)
@@ -261,6 +263,17 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         state = self.arm_bus.read_state()
         stopped = np.flatnonzero(state.mode != 1).tolist()
         raise TimeoutError(f"Joints did not enter FOC within {self.foc_timeout:.1f}s: {stopped}")
+
+    def _initialize_gripper(self) -> None:
+        if self.motion_mode and self.enable_dex1 and self.hand_ctrl is None:
+            from robot.eef.dex1_single import Dex1Single
+
+            self.hand_ctrl = Dex1Single(
+                side=self.dex1_side,
+                interface=self.dex1_interface,
+                domain=self.dex1_domain,
+                grip_torque_limit=self.grip_torque_limit,
+            )
 
     def _on_start(self) -> None:
         if not self.motion_mode:
@@ -277,15 +290,7 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
         try:
             # DDS discovery waits for feedback; finish it before enabling the arm
             # and starting its feedback/command watchdog clocks.
-            if self.enable_dex1:
-                from robot.eef.dex1_single import Dex1Single
-
-                self.hand_ctrl = Dex1Single(
-                    side=self.dex1_side,
-                    interface=self.dex1_interface,
-                    domain=self.dex1_domain,
-                    grip_torque_limit=self.grip_torque_limit,
-                )
+            self._initialize_gripper()
 
             self.arm_bus = self.bus_factory(self.bridge_library)
             self.arm_bus.open(self.port, self.baudrate, self.calibration_path)
@@ -433,6 +438,10 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             "feedback_last_step_fresh": state.last_step_feedback,
             "feedback_freshness_available": True,
         }
+
+    def _publish_ik_diagnostics(self, controller_poses: dict, xr_valid: bool) -> None:
+        # This entrypoint publishes one complete output sample, also in dry runs.
+        return
 
     def _output_command(self) -> None:
         purpose_model = self.arm_q().copy()

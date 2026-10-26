@@ -64,6 +64,7 @@ python scripts/record_r1arm_real.py --motion-mode \
 X 在左手柄，B/A 在右手柄；“单臂”指只驱动右臂，不是只需要一个手柄完成默认录制操作。
 暂停不记录，恢复后以新的 `record_segment` 继续，训练或回放时不可跨段直接拼接动作。
 保存后等待完成提示，再用 Ctrl+C 退出。目录中自动生成 `episode_XXXX.mcap`，不需要每轮手动创建时间戳目录。
+单臂录制的开始、保存和暂停事件由现有录制线程处理，按键后以 `START`／`SAVED` 提示确认；恢复跟踪时由控制线程清理旧锚点。
 可选 `--image-show` 显示录制预览；`--no-cameras` 只录状态／动作，此时去掉 `--require-all-cameras`。
 
 先只读检查回放：
@@ -76,11 +77,13 @@ python scripts/replay_r1arm_real.py --episode data/right_real/episode_0000.mcap
 
 ```bash
 python scripts/replay_r1arm_real.py \
-  --episode data/right_real/episode_0000.mcap --motion-mode --show-observations
+  --episode data/right_real/episode_0000.mcap --motion-mode
 ```
 
 回放默认优先使用高频控制流的整形目标 `q_purpose`，不重复整形。
 `--section state` 播放实测位置；`--speed 0.5` 慢放；`--data-source frame` 显式选择观测流。
+图像默认在独立预览进程中按 MCAP 时间同步显示，不占用电机控制线程；无图像的 episode 会跳过预览。加 `--no-show-observations` 可关闭窗口，预览按 `q`／Esc 会停止回放。
+不加 `--motion-mode` 的单臂／双臂真机 replay 只做只读数据检查，不播放时间轴；要看图且不驱动真机，使用下面的仿真 replay。
 
 ## 4. 双臂：遥操 → 录制 → 回放
 
@@ -95,6 +98,7 @@ python dual/record.py --motion-mode --data-root data/dual_real
 ```
 
 输入 MOVE 后两臂回 home。左右 grip/trigger 分别控制各自机械臂／夹爪。
+启动时先确认双侧夹爪反馈，再使能机械臂；先就绪的机械臂会持续保持实测姿态，等待另一侧就绪后才开始归位控制。
 X 开始／保存 episode，B 暂停／恢复记录和跟踪，A 两臂回 home；暂停后以新 `record_segment` 继续。
 `--no-cameras` 只录状态／动作。双臂默认要求所有指定相机都可用。
 
@@ -108,13 +112,14 @@ python dual/replay.py --episode data/dual_real/episode_0000.mcap
 
 ```bash
 python dual/replay.py \
-  --episode data/dual_real/episode_0000.mcap --motion-mode --show-observations
+  --episode data/dual_real/episode_0000.mcap --motion-mode
 ```
 
 默认 `--data-source auto` 优先高频控制流，旧数据没有控制流时回退观测流。
 支持 `--section action/state`、`--speed`；跨暂停分段先保持、再分别接近新段首帧，不跨段直接插值。
 回放前检查峰值速度；若要求降低速度，使用 `--speed 0.5`，不要放宽速度限值。
 双臂并行执行两个串口事务；`pair_skew_ns` 表示完成时间差，不代表硬件同步。
+图像默认在独立预览进程中按 MCAP 时间同步显示；加 `--no-show-observations` 可关闭窗口。预览按 `q`／Esc 会停止回放。
 
 ## 5. 图像配置
 
@@ -151,6 +156,7 @@ python scripts/replay_r1arm_sim.py --episode data/sim_right/episode_0000.mcap
 ```
 
 仿真双臂在遥操／录制命令中增加 `--use-dual-arm`。仿真入口默认控制 50 Hz、每拍 10 个仿真子步、reset-blend 100 帧；仿真录制默认观测 30 Hz、渲染 320×240，需 640×480 时加 `--image-width 640 --image-height 480`，不能把真机相机设置误认为仿真渲染默认。
+用 `replay_r1arm_sim.py` 查看单臂或双臂 MCAP 时，图像默认按录制时间显示；加 `--no-show-observations` 关闭图像窗口。`--no-viewer` 只关闭 MuJoCo 机器人窗口，不关闭图像预览。
 各入口完整参数使用 `--help` 查看；仿真输出目录与真机录制格式兼容，但设备反馈含义不同。
 
 ## 7. 基线参数及数据含义
@@ -213,7 +219,7 @@ python scripts/replay_r1arm_sim.py --episode data/sim_right/episode_0000.mcap
 | 接近超时 | 10 s | 30 s | 未稳定到位则退出 |
 | 记录长间隔上限 | `--max-frame-gap 2` s | `--max-gap 0.5` s | 回放长暂停时的压缩上限；分段首帧仍单独接近 |
 | `--hold-time` | 2 s | 2 s | 结束后保持时间 |
-| `--show-observations` | 关 | 关 | 显式开启后按记录时间显示图像 |
+| `--show-observations` | 开 | 开 | 独立进程按记录时间显示图像；`--no-show-observations` 关闭预览 |
 
 - 单臂向量为右臂七轴＋夹爪，共 8 维；双臂为右臂七轴＋右夹爪＋左臂七轴＋左夹爪，共 16 维。
 - `/r1arm/control_sample` 保存完整控制快照，`/whole_body/frame` 保存图像和观测；state 是反馈，action 是整形目标，最终电机指令另存。

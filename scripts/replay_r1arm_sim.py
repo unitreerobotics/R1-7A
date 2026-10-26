@@ -30,6 +30,7 @@ from robot.r1arm_config import (
     R1ArmConfig,
 )
 from teleop.r1arm_dataset import R1ArmDatasetAdapter, validate_r1arm_frame
+from teleop.replay_preview import ReplayPreview
 
 
 PREVIEW_WINDOW = "R1Arm MCAP observations"
@@ -173,7 +174,10 @@ def replay(args: argparse.Namespace) -> None:
     )
 
     index = start
+    preview_worker = None
     try:
+        if args.show_observations and camera_order:
+            preview_worker = ReplayPreview(episode, camera_order, scale=args.preview_scale)
         while True:
             tick = time.monotonic()
             frame = frames[index]
@@ -189,19 +193,8 @@ def replay(args: argparse.Namespace) -> None:
                 substeps = max(1, int(round(period / float(sim.model.opt.timestep))))
                 sim.step(substeps)
 
-            if args.show_observations:
-                display = observation_mosaic(frame, index, len(frames), camera_order)
-                if args.preview_scale != 1.0:
-                    display = cv2.resize(
-                        display,
-                        None,
-                        fx=args.preview_scale,
-                        fy=args.preview_scale,
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                cv2.imshow(PREVIEW_WINDOW, display)
-                if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
-                    break
+            if preview_worker is not None and preview_worker.update(int(frame.get("sample_time_ns", 0) or 0)):
+                break
 
             index += 1
             if index >= end:
@@ -216,8 +209,8 @@ def replay(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        if args.show_observations:
-            cv2.destroyAllWindows()
+        if preview_worker is not None:
+            preview_worker.close()
         final_q = sim.get_q()
         sim.close()
         print(f"[Replay] finished at frame {index}; final_sim_q={np.round(final_q, 4)}")
@@ -239,7 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     arms.add_argument("--single-arm", dest="dual_arm", action="store_false")
     parser.set_defaults(dual_arm=None)
     parser.add_argument("--no-viewer", action="store_true")
-    parser.add_argument("--show-observations", action="store_true")
+    parser.add_argument("--show-observations", action=argparse.BooleanOptionalAction, default=True,
+                        help="show recorded camera views by timestamp (default; use --no-show-observations to disable)")
     parser.add_argument("--preview-scale", type=float, default=0.75)
     return parser
 
