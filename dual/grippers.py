@@ -82,6 +82,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)
         for process in processes:
             try:
                 os.killpg(process.pid, signal.SIGTERM)

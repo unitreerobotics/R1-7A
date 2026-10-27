@@ -7,7 +7,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 SDK_ROOT = Path(os.environ.get('R1ARM_SDK_ROOT', ROOT.parent / 'R1_arm_SDK_x86/r1_arm')).expanduser().resolve()
-SERIAL_PREFIX = '/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBPG771-'
+SERIAL_PREFIX = os.environ.get('R1ARM_SERIAL_PREFIX', '/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBPG771-')
 PORTS = {side: Path(SERIAL_PREFIX + suffix + '-port0') for side, suffix in
          (('right', 'if01'), ('left', 'if03'), ('grip_right', 'if00'), ('grip_left', 'if02'))}
 CALIBRATIONS = {side: SDK_ROOT / f'config/joint_calib_zero_{label}臂.txt'
@@ -35,7 +35,7 @@ def validate_arm_port(port, side=None):
     if any(path.resolve() == PORTS[key].resolve() for key in ('grip_right', 'grip_left')):
         raise ValueError(f'Arm port {port} is a known GRIPPER device')
     name = str(path)
-    if 'FTBPG771-' in name:
+    if name.startswith(SERIAL_PREFIX):
         expected = 'if01' if side == 'right' else 'if03' if side == 'left' else None
         if expected and expected not in name:
             raise ValueError(f'{side} arm requires {expected}, got {port}')

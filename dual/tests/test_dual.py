@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import signal
 import subprocess
 import tempfile
 import threading
@@ -380,6 +381,27 @@ class Recording(unittest.TestCase):
 
 
 class ServiceLifecycle(unittest.TestCase):
+    def test_shutdown_ignores_repeated_interrupts_until_children_are_reaped(self):
+        from dual.grippers import main
+        with tempfile.TemporaryDirectory() as directory:
+            port = Path(directory) / 'right'
+            port.touch()
+            with patch.dict(os.environ, {'XDG_RUNTIME_DIR': directory}), \
+                    patch('dual.grippers.port_users', return_value=[]), \
+                    patch('dual.grippers.subprocess.run', return_value=SimpleNamespace(returncode=0)), \
+                    patch('dual.grippers.signal.signal', return_value=signal.SIG_DFL) as install, \
+                    patch('dual.grippers.os.killpg'):
+                def reap(timeout):
+                    for sig in (signal.SIGINT, signal.SIGTERM):
+                        handler = [call.args[1] for call in install.call_args_list if call.args[0] == sig][-1]
+                        self.assertEqual(handler, signal.SIG_IGN)
+                process = SimpleNamespace(pid=900001, returncode=1, poll=lambda: 1, wait=reap)
+                with patch('dual.grippers.subprocess.Popen', return_value=process):
+                    with self.assertRaises(RuntimeError):
+                        main(['--side', 'right', '--right-port', str(port)])
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    install.assert_any_call(sig, signal.SIG_DFL)
+
     def test_id7_topic_side_and_sibling_cleanup(self):
         from dual.grippers import main
         with tempfile.TemporaryDirectory() as directory:

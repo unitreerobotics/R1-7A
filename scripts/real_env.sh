@@ -3,7 +3,7 @@
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ARM="${R1ARM_SDK_ROOT:-$PROJECT_ROOT/../R1_arm_SDK_x86/r1_arm}"
 export R1ARM_SDK_ROOT="$ARM"
-R1ARM_SERIAL_PREFIX=/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBPG771-
+export R1ARM_SERIAL_PREFIX="${R1ARM_SERIAL_PREFIX:-/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBPG771-}"
 export PORT_RIGHT="${PORT_RIGHT:-${R1ARM_SERIAL_PREFIX}if01-port0}"
 export PORT_LEFT="${PORT_LEFT:-${R1ARM_SERIAL_PREFIX}if03-port0}"
 export RIGHT_DEX1_PORT="${RIGHT_DEX1_PORT:-${R1ARM_SERIAL_PREFIX}if00-port0}"

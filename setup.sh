@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# R1Arm teleoperation environment setup.
+# R1-7A teleoperation environment setup.
 # 默认使用清华 Conda / PyPI 镜像；不配置也不依赖 HTTP 代理。
 #
 # 用法:
@@ -142,7 +142,7 @@ python -m pip install \
   "meshcat>=0.3.2" \
   "mujoco>=3.1" \
   "sshkeyboard>=2.3.1" \
-  tyro scipy mcap pyzmq opencv-python pytest
+  tyro scipy mcap pyzmq opencv-python pyrealsense2 pytest
 
 # ---------------------------------------------------------------------------
 # 5. Unitree SDK2 Python
@@ -226,6 +226,7 @@ import unitree_sdk2py
 import scipy
 import meshcat
 import cv2
+import pyrealsense2
 import zmq
 import mcap
 
