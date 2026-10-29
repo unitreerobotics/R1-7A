@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """View the local R1Arm cameras live to adjust their mounting.
 
-Opens the exact same backends and camera specs as ``record_r1arm_real.py``
+Opens the exact same backends and camera specs as ``scripts/teleop.py --record``
 (``--camera`` parses identically), shows the frames in one labeled window and
 prints per-camera status, so what you see while positioning the cameras is
 what the recorder will store. Quit with q or Esc.
@@ -64,7 +64,7 @@ def main() -> None:
         action="append",
         metavar="SPEC",
         default=None,
-        help="Same syntax as record_r1arm_real.py; default: both local cameras",
+        help="Same syntax as scripts/teleop.py --record; default: both local cameras",
     )
     parser.add_argument(
         "--seconds",

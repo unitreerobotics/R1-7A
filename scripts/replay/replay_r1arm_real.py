@@ -2,7 +2,7 @@
 """Replay recorded R1Arm state trajectories on the real arm.
 
 Reads ``actions.q_purpose`` (the already-shaped action) or measured
-``states.joint_state`` from an MCAP episode written by ``record_r1arm_real.py``.
+``states.joint_state`` from an MCAP episode written by ``scripts/teleop.py --record``.
 By default, the action trajectory is replayed without another trajectory
 shaper. The baseline replays the recorded shaped command directly.
 
@@ -39,7 +39,7 @@ import cv2
 import numpy as np
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -142,9 +142,11 @@ def load_episode_states(
                 DEX1_SIM_OPEN - DEX1_SIM_CLOSE
             )
             actions = dict(payload)
-            actions["q_purpose"] = np.r_[q_action[:JOINT_COUNT], to_sim(command_ratio)].tolist()
+            actions["q_purpose"] = (q_action.tolist() if q_action.size == 8 else
+                                     np.r_[q_action[:JOINT_COUNT], to_sim(command_ratio)].tolist())
             states = {
-                "joint_state": np.r_[q_state[:JOINT_COUNT], to_sim(state_ratio)].tolist(),
+                "joint_state": (q_state.tolist() if q_state.size == 8 else
+                                np.r_[q_state[:JOINT_COUNT], to_sim(state_ratio)].tolist()),
                 "dq": payload.get("dq_measured", []),
                 "tau_est": payload.get("tau_est", []),
                 "control_seq": payload.get("control_seq"),
@@ -650,11 +652,16 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
     try:
         if args.show_observations and observation_frames and camera_order:
             preview_worker = ReplayPreview(
-                episode, camera_order, scale=args.preview_scale,
+                episode, camera_order, scale=args.preview_scale, backend=args.preview_backend,
                 window="R1Arm real replay observations",
             )
             preview_worker.update(int(observation_stamps[0]))
-        bus = R1ArmSdkBus(args.bridge_lib)
+        if args.side == 'left':
+            from dual.controller import LeftArmBus
+            from dual.config import LEFT_BUS_SIGN
+            bus = LeftArmBus(args.bridge_lib, sign=config.get('left_bus_sign', LEFT_BUS_SIGN))
+        else:
+            bus = R1ArmSdkBus(args.bridge_lib)
         bus.open(args.port, args.baud, calibration)
 
         print("Probing all 7 joints with zero-gain FOC; keep the arm supported...")
@@ -827,6 +834,10 @@ def run(args: argparse.Namespace, calibration: Path) -> None:
                 last_command_mono = command_mono
                 command_sdk = cmd
                 command_gripper(gripper_traj[i])
+                if args.print_actions:
+                    print(f'[Action] frame={i} side={args.side} '
+                          f'q_motor_target_rad={json.dumps(command_model_q.tolist())} '
+                          f'gripper_slide={float(gripper_traj[i]):.6f}', flush=True)
                 if preview_worker is not None:
                     replay_elapsed = float(np.sum(intervals[1 : i + 1]))
                     replay_stamp_ns = replay_start_ns + int(replay_elapsed * 1e9)
@@ -962,7 +973,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--motion-mode", action="store_true", help="Actually open and command the arm"
     )
-    parser.add_argument("--port", default=os.environ.get("PORT", ""))
+    parser.add_argument("--port", default="")
+    parser.add_argument("--side", choices=('right', 'left'), help='Defaults to the recorded arm side')
     parser.add_argument("--baud", type=int, default=6_000_000)
     parser.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK_ROOT)
     parser.add_argument("--calib", type=Path, help="joint calibration file")
@@ -1043,7 +1055,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replay the Dex1 gripper (state index 7) through DDS as a closed ratio",
     )
     parser.add_argument("--dex1-net", default=os.environ.get("DEX1_NETWORK", ""), help="DDS interface for the single Dex1")
-    parser.add_argument("--dex1-side", choices=("left", "right"), default=os.environ.get("DEX1_SIDE", "right"),
+    parser.add_argument("--dex1-side", choices=("left", "right"), default=None,
                         help="DDS side topic for the physical Dex1")
     parser.add_argument("--dex1-domain", type=int, default=0)
     parser.add_argument("--grip-torque-limit", type=float, default=-1.0)
@@ -1055,6 +1067,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-frame", type=int, default=-1)
     parser.add_argument("--show-observations", action=argparse.BooleanOptionalAction, default=True,
                         help="show recorded camera views by timestamp (default; use --no-show-observations to disable)")
+    parser.add_argument('--preview-backend', choices=('browser', 'window'), default='browser',
+                        help='browser: localhost preview for VS Code Simple Browser; window: OpenCV')
+    parser.add_argument('--print-actions', action=argparse.BooleanOptionalAction, default=True,
+                        help='Print each playback command after sending; --no-print-actions disables output')
     parser.add_argument("--preview-scale", type=float, default=0.75)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--no-confirm", action="store_true")
@@ -1063,6 +1079,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    episode = resolve_episode(Path(args.episode))
+    recorded_side = 'right'
+    with episode.open('rb') as stream:
+        for _, channel, message in make_reader(stream).iter_messages():
+            if channel.topic == '/episode/meta':
+                recorded_side = json.loads(message.data).get('config', {}).get('control_side', 'right')
+                break
+    if recorded_side not in ('right', 'left') or (args.side and args.side != recorded_side):
+        raise SystemExit('Replay arm side must match the recorded control_side')
+    args.side = recorded_side
+    if args.dex1_side and args.dex1_side != args.side:
+        raise SystemExit('Gripper side must match the recorded arm side')
+    args.dex1_side = args.side
+    from dual.config import PORTS, validate_arm_port
+    args.port = args.port or os.environ.get('PORT_'+args.side.upper()) or str(PORTS[args.side])
+    validate_arm_port(args.port, args.side)
     if args.motion_mode and not args.port:
         raise SystemExit("Set --port or PORT to the verified arm serial device")
     if args.motion_mode and args.enable_dex1 and not args.dex1_net:
@@ -1077,7 +1109,7 @@ def main() -> None:
     if args.motion_mode and not Path(args.port).exists():
         raise SystemExit(f"serial port not found: {args.port}")
 
-    calibration = args.calib or args.sdk_root / "config/joint_calib_zero_右臂.txt"
+    calibration = args.calib or args.sdk_root / f"config/joint_calib_zero_{'右' if args.side == 'right' else '左'}臂.txt"
     if args.motion_mode:
         try:
             calibration = validate_calibration_file(calibration)

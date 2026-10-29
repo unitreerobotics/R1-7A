@@ -7,15 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
-from dual.config import fingerprint
+from dual.config import ARM_SIDES, fingerprint
 from robot.r1arm_config import DEX1_SIM_OPEN, DEX1_SIM_CLOSE, DEFAULT_URDF_PATH
 from teleop.mcap_writer import FourCameraMcapRecorder
 from teleop.r1arm_dataset import R1ArmDatasetAdapter
 
 
-def paired_vectors(samples, *, measured):
+def paired_vectors(samples, *, measured, sides=('right', 'left')):
     result = []
-    for side in ('right', 'left'):
+    for side in sides:
         sample = samples[side]
         ratio = sample.get('dex1_state_open_ratio' if measured else 'dex1_command_open_ratio')
         if measured and sample.get('gripper_enabled') and (ratio is None or not sample.get('dex1_feedback_valid')):
@@ -36,9 +36,10 @@ def paired_vectors(samples, *, measured):
 class DualRecorder:
     def __init__(self, args, camera=None):
         self.args, self.camera = args, camera
-        self.adapter = R1ArmDatasetAdapter(dual_arm=True)
+        self.sides = ARM_SIDES[getattr(args, 'arm', 'dual')]
+        self.adapter = R1ArmDatasetAdapter(dual_arm=len(self.sides) == 2, control_side=self.sides[0])
         self.writer = FourCameraMcapRecorder(args.data_root, args.task_goal, args.frequency,
-            format_name='r1arm_dual_real_mcap_json_v2', camera_order=() if camera is None else camera.active_keys,
+            format_name=f'r1arm_{getattr(args, "arm", "dual")}_real_mcap_json_v2', camera_order=() if camera is None else camera.active_keys,
             control_frequency=args.rate)
         self.queue = queue.Queue(maxsize=max(16, int(args.rate*10)))
         self.error = None
@@ -82,14 +83,19 @@ class DualRecorder:
     def _metadata(self):
         args = self.args
         urdf = Path(args.urdf or DEFAULT_URDF_PATH)
-        metadata = {'dual_arm': True, 'state_dim':16, 'action_dim':16,
+        metadata = {'dual_arm': len(self.sides) == 2, 'control_side': self.sides[0],
+            'state_dim':self.adapter.vector_size, 'action_dim':self.adapter.vector_size,
             'joint_names':self.adapter.joint_names, 'urdf':str(urdf), 'urdf_sha256':fingerprint(urdf),
-            'vector_order':'right J1..J7, grip, left J1..J7, grip', 'dry_run':not args.motion_mode,
+            'vector_order':', '.join(f'{side} J1..J7, grip' for side in self.sides), 'dry_run':not args.motion_mode,
             'camera_devices':None if self.camera is None else self.camera.describe(),
             'camera_specs':[] if self.camera is None else [asdict(spec) for spec in self.camera.specs],
             'control_parameters':{k:str(v) if isinstance(v,Path) else v.tolist() if isinstance(v,np.ndarray) else v
                                   for k,v in vars(args).items()}}
-        for side in ('right','left'):
+        if 'left' in self.sides:
+            metadata['left_bus_sign'] = [1., -1. if args.left_j2_convention == 'mirrored' else 1., 1.,
+                -1. if args.left_j4_convention == 'model' else 1., 1.,
+                -1. if args.left_j6_convention == 'mirrored' else 1., 1.]
+        for side in self.sides:
             path = Path(getattr(args,side+'_calib'))
             metadata[side+'_calibration'] = str(path)
             metadata[side+'_calibration_sha256'] = fingerprint(path) if path.is_file() else None
@@ -119,14 +125,15 @@ class DualRecorder:
                     self.writer.add_event(dict(data, record_segment=segment))
                     next_observation = 0
                 elif kind == 'sample':
-                    measured, commanded = paired_vectors(data, measured=True), paired_vectors(data, measured=False)
+                    measured = paired_vectors(data, measured=True, sides=self.sides)
+                    commanded = paired_vectors(data, measured=False, sides=self.sides)
                     states, actions = self.adapter.frame_data(measured, commanded)
                     stamp = max(s['control_time_ns'] for s in data.values())
                     seq = max(s['control_seq'] for s in data.values())
-                    control = {'control_time_ns':stamp, 'control_seq':seq,
-                        'q_purpose': actions['action'], 'q_measured':states['joint_state'],
-                        'right':data['right'], 'left':data['left'],
-                        'pair_skew_ns':data['right'].get('pair_skew_ns')}
+                    control = dict(data) if len(self.sides) == 2 else dict(data[self.sides[0]])
+                    control.update(control_time_ns=stamp, control_seq=seq,
+                        q_purpose=actions['action'], q_measured=states['joint_state'],
+                        control_side=self.sides[0], pair_skew_ns=data[self.sides[0]].get('pair_skew_ns'))
                     self.writer.add_control_sample(control, record_segment=segment)
                     self.diagnostics['controls'] += 1
                     if stamp < next_observation:

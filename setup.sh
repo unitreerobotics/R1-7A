@@ -11,7 +11,7 @@
 # 装好后:
 #   conda activate r1_teleop
 #   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-#   python scripts/teleop_r1arm_sim.py --mock-xr --debug
+#   python scripts/teleop.py --sim --right --mock-xr --debug
 #
 set -euo pipefail
 
@@ -249,7 +249,7 @@ cat <<EOF
   conda activate ${ENV_NAME}
   export LD_LIBRARY_PATH="\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH"
   cd ${PROJECT_ROOT}
-  python scripts/teleop_r1arm_sim.py --mock-xr --debug
+  python scripts/teleop.py --sim --right --mock-xr --debug
 
 说明:
   - 若 meshcat / sqlite3 报 CXXABI 错误，确认已把 \$CONDA_PREFIX/lib 放在 LD_LIBRARY_PATH 最前

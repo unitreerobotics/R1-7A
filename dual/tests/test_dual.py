@@ -21,7 +21,7 @@ from dual.config import PORTS,CALIBRATIONS,LEFT_BUS_SIGN,HOME,validate_pair,pars
 from dual.controller import LeftArmBus,ArmController,R1ArmDualRealController
 from dual.calibrate import offsets_from_samples
 from dual.recorder import DualRecorder,paired_vectors
-from dual.teleop import parse_args
+from scripts.teleop import parse_args
 from dual.replay import load_dual_episode
 from robot.r1arm_config import R1ArmConfig
 from robot.r1arm_sdk import R1ArmSdkState,model_to_sdk_q,sdk_to_model_q,validate_calibration_file
@@ -77,7 +77,7 @@ class Coordinates(unittest.TestCase):
         for text in ('0,0','0,1.2,0,-1.2,0,nan,0','0,1.2,0,-1.2,0,6.3,0'):
             with self.assertRaises(ValueError): parse_home(text)
     def test_defaults_and_calibrations(self):
-        args=parse_args(['--mock-xr','--no-cameras'])
+        args=parse_args(['--dual','--mock-xr','--no-cameras'])
         self.assertEqual(args.left_j2_convention,'mirrored')
         self.assertEqual(args.left_j4_convention,'model')
         self.assertEqual(args.left_j6_convention,'mirrored')
@@ -318,7 +318,7 @@ class Recording(unittest.TestCase):
             'gripper_enabled':True,'pair_skew_ns':123} for side in ('right','left')}
     def test_high_rate_controls_and_lower_rate_frames(self):
         with tempfile.TemporaryDirectory() as directory:
-            args=parse_args(['--mock-xr','--no-cameras','--data-root',directory])
+            args=parse_args(['--dual','--mock-xr','--no-cameras','--data-root',directory])
             recorder=DualRecorder(args)
             recorder.toggle()
             for i in range(18): recorder.publish(self.samples(i))
@@ -349,7 +349,7 @@ class Recording(unittest.TestCase):
         with self.assertRaises(RuntimeError): recorder._put(('sample',None,0))
     def test_queue_overflow_still_drains_and_closes_worker(self):
         with tempfile.TemporaryDirectory() as directory:
-            args=parse_args(['--mock-xr','--no-cameras','--data-root',directory])
+            args=parse_args(['--dual','--mock-xr','--no-cameras','--data-root',directory])
             args.rate=1
             recorder=DualRecorder(args)
             ready,release=threading.Event(),threading.Event()
@@ -371,7 +371,7 @@ class Recording(unittest.TestCase):
 
     def test_writer_error_surfaces_without_close_hang(self):
         with tempfile.TemporaryDirectory() as directory:
-            args=parse_args(['--mock-xr','--no-cameras','--data-root',directory])
+            args=parse_args(['--dual','--mock-xr','--no-cameras','--data-root',directory])
             recorder=DualRecorder(args)
             with patch.object(recorder.writer,'start_episode',side_effect=OSError('disk failed')):
                 recorder.toggle()

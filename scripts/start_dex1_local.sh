@@ -14,15 +14,21 @@ if [[ ! -x "$DEX1_SERVER" ]]; then
     echo "Build third_party/dex1_1_service as described in README.md." >&2
     exit 1
 fi
-if ! command -v conda >/dev/null 2>&1; then
-    echo "conda was not found in PATH; initialize the Conda shell first." >&2
-    exit 1
+# Activated environments are inherited by child shells, but the conda function is not.
+if [[ -z "${CONDA_PREFIX:-}" || -n "${DEX1_CONDA_ENV:-}" ]]; then
+    if [[ -n "${CONDA_EXE:-}" && -x "$CONDA_EXE" ]]; then
+        CONDA_BASE="$("$CONDA_EXE" info --base)"
+    elif command -v conda >/dev/null 2>&1; then
+        CONDA_BASE="$(conda info --base)"
+    else
+        echo "No active Conda environment; activate r1_teleop or set CONDA_EXE to the conda executable." >&2
+        exit 1
+    fi
+    set +u
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${DEX1_CONDA_ENV:-r1_teleop}"
+    set -u
 fi
-CONDA_BASE="$(conda info --base)"
-set +u
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${DEX1_CONDA_ENV:-r1_teleop}"
-set -u
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${DEX1_SERVICE_LIB}:${DEX1_SDK_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 # Help must not require a connected gripper or initialize DDS.

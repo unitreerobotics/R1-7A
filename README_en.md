@@ -12,9 +12,9 @@ Single-arm / dual-arm teleoperation · Multi-camera capture · MCAP recording an
 
 </div>
 
-| Dual-arm Teleoperation · 01 | Dual-arm Teleoperation · 02 |
+| Single-arm Teleoperation · 01 | Dual-arm Teleoperation · 02 |
 |:---:|:---:|
-| ![Dual-arm teleoperation demo 1](mp4/demo-1.gif) | ![Dual-arm teleoperation demo 2](mp4/demo-2.gif) |
+| ![Single-arm teleoperation demo 1](mp4/demo-1.gif) | ![Dual-arm teleoperation demo 2](mp4/demo-2.gif) |
 
 ## ✳️ Overview
 
@@ -36,15 +36,13 @@ The R1-7A teleoperation framework uses two PICO controllers to operate 7-DoF rob
   <img src="mp4/硬件连线.png" alt="R1-7A hardware wiring diagram: PC, USB-to-RS485 module, arm power module, and gripper connections; labels in Chinese" width="800">
 </p>
 
-**[4-Channel USB-to-RS485 Module](https://support.unitree.com/home/en/Motor_SDK_Dev_Guide/4-channel_485_to_USB_module)**
-
 | Device | Description |
 |---|---|
-| R1-7A 7-DoF robotic arm | One arm for single-arm operation or two for dual-arm operation; each uses its own serial port and calibration |
-| Dex1 gripper | Independent left/right control; can be disabled when not installed |
+| [R1-7A 7-DoF robotic arm](https://www.unitree.com/R1-7a/) | One arm for single-arm operation or two for dual-arm operation; each uses its own serial port and calibration |
+| [Dex1 gripper](https://www.unitree.com/Dex1-1/) | Independent left/right control; can be disabled when not installed |
 | PICO headset and two controllers | Runs the XRoboToolkit client |
 | Linux PC | Ubuntu 22.04, x86_64, with Git and Conda installed |
-| 4-channel USB-to-RS485 module | Connects the PC, arms, and grippers through separate channels |
+| [4-channel USB-to-RS485 module](https://support.unitree.com/home/en/Motor_SDK_Dev_Guide/4-channel_485_to_USB_module) | Connects the PC, arms, and grippers through separate channels |
 | Cameras (optional) | RealSense or V4L2 / UVC cameras for image collection |
 
 > Before operating real hardware, secure the arm bases, support the arms, and keep the emergency stop accessible and the homing paths clear. Zero-gain probing does not hold the arms in place. Dual-arm collision planning is not provided.
@@ -98,37 +96,43 @@ source scripts/real_env.sh
 
 ## 🛠️ Teleoperation
 
-### 1. Start the Gripper Services
+Use a single entry point, `scripts/teleop.py`, and select exactly one of `--right`, `--left`, or `--dual`. **Add `--record` to enable recording. Without it, no recorder, cameras, or recording files are created.**
 
-After loading the environment in terminal 1, run the following command and keep the terminal open:
+### 1. Terminal 1: Start the Selected Gripper Services
 
-```bash
-bash dual/start_grippers.sh
-```
-
-Confirm that both sides report `Detected motors` and `Gripper Server started`.
-
-### 2. Start Dual-arm Teleoperation
-
-Load the same environment in terminal 2, then run:
+Load the environment, select one command, and keep this terminal open:
 
 ```bash
-python dual/teleop.py --motion-mode --no-cameras
+# Right arm
+python -m dual.grippers --side right
+
+# Left arm
+python -m dual.grippers --side left
+
+# Both arms
+python -m dual.grippers --side both
 ```
 
-Check the serial ports, calibration files, and startup messages before typing `MOVE`. Both arms move smoothly to home by default. Once homing is complete, hold the corresponding controller's grip button to start tracking.
+Confirm that each required side reports `Detected motors` and `Gripper Server started`.
 
-For right-arm-only operation, use these commands in terminals 1 and 2 instead:
+### 2. Terminal 2: Start Teleoperation
+
+Load the same environment and select one command:
 
 ```bash
-# Terminal 1: right gripper
-bash scripts/start_gripper.sh
+# Right arm
+python scripts/teleop.py --right --motion-mode
 
-# Terminal 2: right-arm teleoperation
-python scripts/teleop_r1arm_real.py --motion-mode
+# Left arm
+python scripts/teleop.py --left --motion-mode
+
+# Both arms
+python scripts/teleop.py --dual --motion-mode
 ```
 
-If no grippers are installed, skip the gripper services and add `--no-enable-dex1` to the teleoperation command.
+Check the ports, calibration files, and startup messages before typing `MOVE`. The selected arms move smoothly to home by default. Hold the corresponding grip button to start tracking after homing. Left-arm mode uses the left calibration, coordinate transform, and gripper topic without requiring right-arm hardware.
+
+If no grippers are installed, skip the gripper services and add `--no-enable-dex1`.
 
 ### 3. Controller Buttons
 
@@ -136,32 +140,34 @@ If no grippers are installed, skip the gripper services and add `--no-enable-dex
 |---|---|
 | Left / right grip | Hold to track the corresponding controller's relative pose |
 | Left / right trigger | Controls the corresponding gripper's closing ratio |
-| A (right controller) | Return to home; both arms home together in dual-arm mode |
-| X (left controller) | Start recording / stop and save |
+| A (right controller) | Return the selected arms to home |
+| X (left controller) | With `--record`: start recording / stop and save |
 | B (right controller) | Pause / resume recording and tracking during an active recording |
 | Ctrl+C | Stop and exit; continue supporting the arms after exit |
 
-The single-arm teleoperation entry point does not record data; use the single-arm recording entry point below to enable X/B recording controls. The dual-arm teleoperation entry point also supports recording; no episode is saved until X is pressed.
+Default recording controls still use both controllers in single-arm mode: X is on the left controller, and A/B are on the right.
 
 ## 📦 Data Collection
 
-Exit any existing teleoperation program and keep the gripper services running. The recording programs include teleoperation.
+Exit the existing teleoperation program, keep the selected gripper services running, and add `--record` to the same entry point:
 
 ```bash
-# Dual-arm recording with three cameras by default
-python dual/record.py --motion-mode --data-root data/dual_real
+# Right arm: head and right-wrist cameras by default
+python scripts/teleop.py --right --record --motion-mode --output-dir data/right_real
 
-# Right-arm recording with two cameras by default
-python scripts/record_r1arm_real.py --motion-mode \
-  --output-dir data/right_real --require-all-cameras
+# Left arm: head and left-wrist cameras by default
+python scripts/teleop.py --left --record --motion-mode --output-dir data/left_real
+
+# Both arms: head and both wrist cameras by default
+python scripts/teleop.py --dual --record --motion-mode --output-dir data/dual_real
 ```
 
-Press X to start / save and B to pause / resume. Output files are named `episode_0000.mcap`, etc. The target control rate is 90 Hz and the target image observation rate is 30 Hz.
+Press X to start / save and B to pause / resume. MCAP vectors contain 8 values in single-arm mode and 16 in dual-arm mode. Files are named `episode_0000.mcap`, etc. Real-hardware target rates are 90 Hz for control and 30 Hz for image observations.
 
-For camera configuration and verification commands, see the [image collection guide (Chinese)](detail.md#2-启用图像). To record without images:
+See the [image collection guide (Chinese)](detail.md#2-启用图像) for camera configuration. Add `--no-cameras` to record without images:
 
 ```bash
-python dual/record.py --motion-mode --no-cameras --data-root data/dual_real
+python scripts/teleop.py --dual --record --motion-mode --no-cameras --output-dir data/dual_real
 ```
 
 ## 🔄 Trajectory Replay
@@ -185,10 +191,12 @@ Replay does not require PICO. For single-arm replay, slower playback, and image 
 Run dual-arm simulation with mock input, without connecting to real arms:
 
 ```bash
-python scripts/teleop_r1arm_sim.py --mock-xr --use-dual-arm
+python scripts/teleop.py --sim --dual --mock-xr
 ```
 
-Remove `--mock-xr` to test real PICO input.
+Remove `--mock-xr` to test real PICO input. Simulation also supports `--right`, `--left`, and `--record`; use `python scripts/teleop.py --sim --help` for simulation options.
+
+![R1-7A dual-arm MuJoCo simulation](mp4/simulation.gif)
 
 ## 🧑‍✈️ Key Parameters
 
@@ -205,6 +213,8 @@ Use `--help` on each entry point for the full parameter list. Device configurati
 ## 🧠 Training
 
 ## 🚀 Deployment
+
+![R1-7A training and deployment demo](mp4/training_deployment.gif)
 
 ## 🙏 Acknowledgments
 

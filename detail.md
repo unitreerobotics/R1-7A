@@ -167,10 +167,10 @@ $R1ARM_SDK_ROOT/config/joint_calib_zero_左臂.txt
 
 ```bash
 # 单臂
-python scripts/teleop_r1arm_real.py --motion-mode --calib /absolute/path/right.txt
+python scripts/teleop.py --right --motion-mode --calib /absolute/path/right.txt
 
 # 双臂；初次验证先关闭相机
-python dual/teleop.py --motion-mode --no-cameras \
+python scripts/teleop.py --dual --motion-mode \
   --right-calib /absolute/path/right.txt --left-calib /absolute/path/left.txt
 ```
 
@@ -218,14 +218,14 @@ python scripts/capture_dex1_endpoints.py --network lo
 先在 Conda 环境中检查 mock 仿真，不连接真实机械臂：
 
 ```bash
-python scripts/teleop_r1arm_sim.py --mock-xr
-python scripts/teleop_r1arm_sim.py --mock-xr --use-dual-arm
+python scripts/teleop.py --sim --right --mock-xr
+python scripts/teleop.py --sim --dual --mock-xr
 ```
 
 检查真实 PICO 输入时去掉 `--mock-xr`。双臂无硬件控制流程也可短时运行：
 
 ```bash
-python dual/teleop.py --mock-xr --no-cameras --duration 3
+python scripts/teleop.py --dual --mock-xr --no-cameras --duration 3
 ```
 
 这只能验证软件流程，不能证明实体供电、串口回复、标定或实际运动正确。`--mock-xr` 不能与 `--motion-mode` 合用。
@@ -233,6 +233,29 @@ python dual/teleop.py --mock-xr --no-cameras --duration 3
 真机开始前确认：串口角色正确且可读写、左右标定与实体对应、bridge 可加载；夹爪服务各侧识别成功；XR 位姿与时间戳持续更新。检查时只运行一套占用对应串口的程序。
 
 ## 🛠️ 遥操作
+
+### 0. 统一命令规则
+
+```bash
+python scripts/teleop.py --right --motion-mode
+python scripts/teleop.py --left --motion-mode
+python scripts/teleop.py --dual --motion-mode
+python scripts/teleop.py --left --record --motion-mode --no-cameras --output-dir data/left_real
+```
+
+`--right`、`--left`、`--dual` 必须三选一；`--record` 开启录制，不加时完全不创建录制线程、相机和输出文件。单臂 8 维、双臂 16 维，左臂元数据保存 `control_side=left`。单臂真机回放自动读取记录侧别并使用对应的标定、串口及左臂坐标转换；显式指定与记录不符的 `--side` 会拒绝播放。
+
+默认 X 开始／保存，B 暂停／恢复，A 回 home。`--auto-start` 仅与 `--record` 一起使用，启动成功后立即开始一条 episode；真机仍需 `--motion-mode` 和 MOVE 确认。`--duration N` 在真机模式下限制程序运行时间，退出时先停机再完成写盘。
+
+仿真增加 `--sim`，三种臂选择与录制开关保持一致：
+
+```bash
+python scripts/teleop.py --sim --left --mock-xr --no-viewer --duration 3
+python scripts/teleop.py --sim --dual --record --mock-xr --no-viewer \
+  --auto-start --duration 1 --exit-after-duration --output-dir data/sim_dual
+```
+
+`python scripts/teleop.py --sim --help` 显示仿真专用参数。仿真使用 50 Hz 默认控制频率；`--exit-after-duration` 在达到指定录制时长、保存 episode 后退出。
 
 以下均从仓库根目录运行，每个终端先完成 `.env` 和 `real_env.sh` 加载。
 
@@ -259,34 +282,34 @@ bash dual/start_grippers.sh
 右臂单臂：
 
 ```bash
-python scripts/teleop_r1arm_real.py --motion-mode
+python scripts/teleop.py --right --motion-mode
 ```
 
 双臂，先验证运动与手柄输入，不依赖相机：
 
 ```bash
-python dual/teleop.py --motion-mode --no-cameras
+python scripts/teleop.py --dual --motion-mode
 ```
 
 核对打印的左右串口、标定、增益与归位提示，确认支撑、急停和运动空间后输入 `MOVE`。**当前单臂、双臂均默认回 home**，到位后再按 grip 进行相对跟踪。双臂先等待两侧夹爪反馈，先就绪的机械臂保持实测姿态，等待另一侧就绪后再开始归位。
 
 - 不希望启动归位时加 `--no-home-on-start`；电机会保持当前姿态，仍需满足启动检查。
 - 没有夹爪时加 `--no-enable-dex1`，并跳过夹爪服务；该选项不放宽机械臂检查。
-- 双臂去掉 `--no-cameras` 后会请求默认三路相机，缺相机可能阻止启动。
+- 仅加 `--record` 时会请求相机：左右单臂各两路，双臂三路；`--no-cameras` 可关闭图像。纯遥操不打开相机。
 - 双臂可加 `--timing-report` 查看控制耗时；目标 90 Hz 不代表实体通信一定达到 90 Hz。
 
 ### 3. 手柄按键
 
 | 输入 | 行为 |
 |---|---|
-| 左 / 右 grip | 按住后对应机械臂跟踪相对位姿；单臂默认右侧 |
+| 左 / 右 grip | 按住后对应机械臂跟踪相对位姿；单臂使用所选侧手柄 |
 | 左 / 右 trigger | 控制对应夹爪闭合比例 |
 | A（右手柄） | 平滑回 home；双臂同时归位 |
-| X（左手柄） | 录制开始／停止并保存；双臂遥操入口本身也支持录制 |
+| X（左手柄） | 录制开始／停止并保存；仅加 --record 时启用录制 |
 | B（右手柄） | 录制期间暂停／恢复记录与跟踪；暂停后形成新 `record_segment` |
 | Ctrl+C | 退出并停止控制；退出后继续支撑机械臂 |
 
-单臂的纯遥操入口不录制，X/B 录制行为由 `record_r1arm_real.py` 提供。保存一条 episode 后，等待保存完成提示再退出。默认 X 在左手柄、B/A 在右手柄。
+三个模式均须加 `--record` 才启用 X/B 录制。保存一条 episode 后，等待保存完成提示再退出。默认 X 在左手柄、B/A 在右手柄。
 
 当前 XR 保护包括有效性、跳变与时效检查；停更超过 250 ms 停止／保持，恢复稳定后重新锚定，不追补断流期间位移。未启用旧版 cutoff / beta 滤波参数或位姿预测。
 
@@ -298,21 +321,21 @@ python dual/teleop.py --motion-mode --no-cameras
 
 ```bash
 # 右臂
-python scripts/record_r1arm_real.py --motion-mode --no-cameras \
+python scripts/teleop.py --right --record --motion-mode --no-cameras \
   --output-dir data/right_real
 
 # 双臂
-python dual/record.py --motion-mode --no-cameras --data-root data/dual_real
+python scripts/teleop.py --dual --record --motion-mode --no-cameras --data-root data/dual_real
 ```
 
-两条命令选择一种运行。X 开始／保存，B 暂停／恢复，A 回 home。双臂 `teleop.py` 与 `record.py` 使用相同控制／录制实现。
+两条命令选择一种运行。X 开始／保存，B 暂停／恢复，A 回 home。三个模式使用同一控制／录制实现；没有 `--record` 时不创建录制线程和相机。
 
 ### 2. 启用图像
 
 | 图像键 | 默认设备识别 | 请求规格 |
 |---|---|---|
 | `color_0_head_left` | RealSense D405 | 640×480、30 fps，曝光 8000 µs、gain 16 |
-| `color_2_wrist_left` | V4L2 / JR0001 | 640×480、30 fps、MJPG；双臂使用 |
+| `color_2_wrist_left` | V4L2 / JR0001 | 640×480、30 fps、MJPG；左臂／双臂使用 |
 | `color_3_wrist_right` | V4L2 / JR0002 | 640×480、30 fps、MJPG |
 
 默认配置在 [local_camera_client.py](teleop/local_camera_client.py)，设备名称和曝光需按实际设备、照明调整。`setup.sh` 已安装 `pyrealsense2`；RealSense 仍需设备正确连接并有访问权限。分别检查相机：
@@ -326,21 +349,21 @@ python scripts/verify_r1arm_dual_cameras.py
 
 ```bash
 # 单臂两路图像，要求请求的相机均可用
-python scripts/record_r1arm_real.py --motion-mode \
-  --output-dir data/right_real --require-all-cameras
+python scripts/teleop.py --right --record --motion-mode \
+  --output-dir data/right_real
 
 # 双臂三路图像，默认要求全部相机可用
-python dual/record.py --motion-mode --data-root data/dual_real
+python scripts/teleop.py --dual --record --motion-mode --data-root data/dual_real
 ```
 
-可重复传 `--camera` 覆盖整套默认相机，例如 `--camera 'key=color_3_wrist_right,backend=v4l2,match=JR0002,size=640x480,fps=30'`；规格语法见入口 `--help` 及相机实现。单臂录制加 `--image-show` 显示预览；双臂录制无此选项。
+可重复传 `--camera` 覆盖整套默认相机，例如 `--camera 'key=color_3_wrist_right,backend=v4l2,match=JR0002,size=640x480,fps=30'`；规格语法见入口 `--help` 及相机实现。相机预览可先运行 `scripts/view_r1arm_cameras.py`，退出预览后再录制，避免设备争用。
 
 ### 3. 输出格式
 
-目录内依次生成 `episode_0000.mcap` 等文件。示例显式指定 `data/right_real` / `data/dual_real`；单臂用 `--output-dir`，双臂用 `--data-root`。
+目录内依次生成 `episode_0000.mcap` 等文件。示例显式指定 `data/right_real` / `data/dual_real`；统一用 `--output-dir` 指定目录，`--data-root` 为同义参数。
 
 ```text
-单臂：右臂 J1–J7 + 右夹爪 = 8 维
+单臂：所选侧 J1–J7 + 对应夹爪 = 8 维
 双臂：右臂 J1–J7 + 右夹爪 + 左臂 J1–J7 + 左夹爪 = 16 维
 ```
 
@@ -363,7 +386,7 @@ python scripts/check_r1arm_images.py data/dual_real/episode_0000.mcap --preview
 ### 1. 只读检查
 
 ```bash
-python scripts/replay_r1arm_real.py --episode data/right_real/episode_0000.mcap
+python scripts/replay/replay_r1arm_real.py --episode data/right_real/episode_0000.mcap
 python dual/replay.py --episode data/dual_real/episode_0000.mcap
 ```
 
@@ -373,7 +396,7 @@ python dual/replay.py --episode data/dual_real/episode_0000.mcap
 
 ```bash
 # 右臂
-python scripts/replay_r1arm_real.py \
+python scripts/replay/replay_r1arm_real.py \
   --episode data/right_real/episode_0000.mcap --motion-mode
 
 # 双臂
@@ -382,12 +405,20 @@ python dual/replay.py --episode data/dual_real/episode_0000.mcap --motion-mode
 
 默认优先使用高频控制流中的整形目标 `q_purpose`；旧记录缺少控制流时回退观测流。`--section state` 使用实测轨迹，`--speed 0.5` 慢放。回放先接近段首帧，暂停分段分别处理，不跨段直接插值。
 
-记录中有图像时默认在独立进程同步显示；`--no-show-observations` 关闭预览，q / Esc 停止回放。接近、限速或反馈检查失败时先检查数据与设备，不放宽保护强行播放。
+单臂、双臂真机回放默认在独立进程同步显示录制图像，并逐帧输出关节和夹爪目标。单臂关节字段为 `q_motor_target_rad`，双臂为 `right.q_rad` / `left.q_rad`，均是限速后下发的模型坐标（rad）；夹爪字段 `gripper_slide` 为记录空间的 slide 目标。双臂还输出 `grippers_enabled`，表明是否真的启用夹爪。在 VS Code 按 `Ctrl+Shift+P`，执行 `Simple Browser: Show`，粘贴终端打印的 `http://127.0.0.1:端口` 地址；远程 SSH 时先在 Ports 面板转发该端口。MCAP 中有三路图像时显示三视角，缺少的视角不会补齐。加 `--preview-backend window` 可改用本地 OpenCV 窗口；`--no-print-actions` 关闭逐帧终端输出，`--no-show-observations` 关闭预览。浏览器预览通过终端 Ctrl+C 停止；OpenCV 窗口中 q / Esc 也可停止回放。接近、限速或反馈检查失败时先检查数据与设备，不放宽保护强行播放。
+
+双臂纯预览（不打开串口或 DDS、不需要启动夹爪服务）：
+
+```bash
+python dual/replay.py --episode data/dual_real/episode_0000.mcap --preview-only
+```
+
+此模式会先启动预览并打印网址，打开 VS Code Simple Browser 后回到终端输入 `MOVE` 才开始播放图像和左右 action。默认按录制速度播放，可用 `--speed` 调整。浏览器会将三个视角横向排列，并按窗口大小等比缩放；`--preview-scale 0.5` 可进一步缩小画面。终端标记 `mode=preview`；真机模式标记 `mode=command`，并区分 `approach`、`playback`、`hold` 阶段。`--preview-only` 与 `--motion-mode` 互斥；两者都不加仍只检查数据。真机双臂默认启用夹爪，先在另一终端运行 `python -m dual.grippers --side both`；没有夹爪时用 `--no-enable-dex1`。
 
 ### 3. MuJoCo 中查看记录
 
 ```bash
-python scripts/replay_r1arm_sim.py --episode data/dual_real/episode_0000.mcap
+python scripts/replay/replay_r1arm_sim.py --episode data/dual_real/episode_0000.mcap
 ```
 
 此命令不驱动真机。`--no-viewer` 关闭机器人窗口，`--no-show-observations` 关闭记录图像预览。
@@ -439,6 +470,38 @@ python scripts/replay_r1arm_sim.py --episode data/dual_real/episode_0000.mcap
 
 一次排查只改变一个条件。通信恢复不等于完整运动验收；依次确认反馈、标定、归位、单侧跟踪、双侧跟踪、夹爪开合，最后再增加相机和录制负载。
 
+## 机械臂通信检查
+通信预检由独立程序执行，不由遥操／录制自动调用；遥操／录制保留原有的反馈就绪和故障检查，不再要求连续 10 轮反馈。只读 replay 和 MuJoCo 仿真不需要执行真机通信预检。先完成本 README 的环境初始化，退出所有机械臂遥操／录制／回放程序，可靠支撑机械臂，再运行：
+
+# 双臂预检（默认）
+python scripts/check_r1arm_communication.py
+
+# 只检查右臂或左臂，选择其中一条
+python scripts/check_r1arm_communication.py --side right
+python scripts/check_r1arm_communication.py --side left
+每侧依次执行：全轴停止 → 等待 100 ms → 单独探测 ID 0–6（每 ID 连续 10 轮新反馈）→ 七轴连续 10 轮新反馈。探测按 50 Hz 的等待间隔执行，每个阶段最多等待 3 秒；中间缺反馈会重新计数。程序检查反馈计数增量，避免把曾经收到过反馈的 ready 标志当作本轮新反馈。故障码、反馈 timeout 或非有限值会使预检失败，不自动清故障。
+
+显示全部 [PASS] 并正常退出后，可在同一终端启动前面的遥操、录制或回放命令。程序退出时会停止电机并关闭串口，不保持姿态。预检通过说明检查期间通信正常，不能保证重新打开串口后或后续运行中不再出现间歇问题。
+
+本机 bridge 已重建。首次在其他构建目录／机器使用新增的单 ID 探测接口，或出现 Bridge lacks single-ID probing／Bridge lacks feedback diagnostics 时，需要重建实际使用的 bridge。默认本机构建目录的命令如下（环境初始化后执行）：
+
+python scripts/build_r1arm_sdk_bridge.py --sdk-root "$ARM" --build-dir build/dual_sdk_bridge
+source scripts/real_env.sh
+预检失败会以非零状态退出，应先排查失败的 ID／故障码；不要在预检未通过时继续运动。无论检查通过、失败还是按 Ctrl+C 中断，程序都会尝试停止电机并关闭串口。
+
+程序默认使用环境中的 PORT_RIGHT/PORT_LEFT、CALIB_RIGHT/CALIB_LEFT 和 bridge；也支持 --right-port/--left-port、--right-calib/--left-calib、--bridge-lib。预检与遥操应使用相同的串口、SDK 和 bridge。
+
+需要单独检查右臂 ID 1 时，在没有遥操／回放进程占用串口的情况下运行 SDK 诊断程序：
+
+"$ARM/bin/test_arm_lowlevel" \
+  --probe-id 1 \
+  --port "$PORT_RIGHT" \
+  --baud 6000000 \
+  --calib "$CALIB_RIGHT"
+确认出现 Feedback ready from motor ID 1，且 Bus replies 持续增长、Bus timeouts 保持为 0；按 Ctrl+C 退出。该命令只验证 ID 1 的探测链路，不代表七轴都正常；全轴连续通信由上面的独立预检程序验证。探测期间机械臂不会主动保持，请可靠支撑。
+
+连接问题先按下面顺序排查，避免把通信问题当作标定问题：
+
 ## 🧪 离线回归
 
 ```bash
@@ -454,8 +517,8 @@ python -m unittest dual.tests.test_dual
 assets/                         机械臂 URDF、网格和 MuJoCo 场景
 robot/                          SDK bridge 封装、设备参数和 Dex1 客户端
 teleop/                         XR 输入、IK、控制、相机和 MCAP
-scripts/                        单臂、仿真、相机与构建入口
-dual/                           双臂遥操、采集、回放与标定入口
+scripts/teleop.py               统一真机／仿真遥操与录制入口
+dual/                           复用的机械臂控制、录制、双臂回放与标定实现
 native/                         C++ bridge 与依赖适配补丁
 third_party/                    固定版本第三方 submodule
 tests/、dual/tests/              离线回归

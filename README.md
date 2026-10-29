@@ -12,9 +12,9 @@
 
 </div>
 
-| 双臂遥操作演示 · 01 | 双臂遥操作演示 · 02 |
+| 单臂遥操作演示 · 01 | 双臂遥操作演示 · 02 |
 |:---:|:---:|
-| ![双臂遥操作演示一](mp4/demo-1.gif) | ![双臂遥操作演示二](mp4/demo-2.gif) |
+| ![单臂遥操作演示一](mp4/demo-1.gif) | ![双臂遥操作演示二](mp4/demo-2.gif) |
 
 ## ✳️ 概述
 
@@ -36,16 +36,13 @@ R1-7A 遥操作框架通过 PICO 双手柄控制七轴机械臂与 Dex1 夹爪�
   <img src="mp4/硬件连线.png" alt="R1-7A 供电模块、机械臂与夹爪的硬件连线示意" width="800">
 </p>
 
-**[4路USB转485模块](https://support.unitree.com/home/en/Motor_SDK_Dev_Guide/4-channel_485_to_USB_module)**
-
 | 设备 | 说明 |
 |---|---|
-| R1-7A 七轴机械臂 | 单臂一台，双臂两台；左右使用各自串口和标定 |
-| Dex1 夹爪 | 左右独立控制；无夹爪时可关闭 |
+| [R1-7A 七轴机械臂](https://www.unitree.com/R1-7a/) | 单臂一台，双臂两台；左右使用各自串口和标定 |
+| [Dex1 夹爪](https://www.unitree.com/Dex1-1/) | 左右独立控制；无夹爪时可关闭 |
 | PICO 头显与双手柄 | 运行 XRoboToolkit 客户端 |
-| Linux 主机 | Ubuntu 22.04、x86_64，预先安装 Git 和 Conda |
-| 4路USB转485模块 | 连接主机、机械臂与夹爪，各设备使用独立通道 |
-| 相机（可选） | RealSense、V4L2 / UVC，用于图像采集 |
+| [4路USB转485模块](https://support.unitree.com/home/en/Motor_SDK_Dev_Guide/4-channel_485_to_USB_module) | 连接主机、机械臂与夹爪，各设备使用独立通道 |
+
 
 > 真机启动前固定底座、可靠支撑机械臂，确认急停和归位路径净空。零增益探测期间不保持姿态；当前不提供双臂碰撞规划。
 
@@ -59,8 +56,6 @@ cd R1-7A
 ```
 
 ### 2. 安装依赖
-
-一条命令安装全部项目依赖并完成编译：
 
 ```bash
 bash setup.sh
@@ -98,37 +93,43 @@ source scripts/real_env.sh
 
 ## 🛠️ 遥操作
 
-### 1. 启动夹爪服务
+所有模式使用同一个入口 `scripts/teleop.py`，`--right`、`--left`、`--dual` 三选一。**加 `--record` 开启录制，不加时只遥操，不创建相机或录制文件。**
 
-终端一加载环境后运行，并保持该终端开启：
+### 1. 终端一：启动对应夹爪
 
-```bash
-bash dual/start_grippers.sh
-```
-
-确认左右均显示 `Detected motors` 和 `Gripper Server started`。
-
-### 2. 启动双臂遥操作
-
-终端二加载相同环境后运行：
+加载环境后，按所选模式运行一条命令并保持终端开启：
 
 ```bash
-python dual/teleop.py --motion-mode --no-cameras
+# 右臂
+python -m dual.grippers --side right
+
+# 左臂
+python -m dual.grippers --side left
+
+# 双臂
+python -m dual.grippers --side both
 ```
 
-核对串口、标定和启动提示后输入 `MOVE`。两臂默认平滑回 home，随后按住对应手柄 grip 开始跟踪。
+确认所需侧均显示 `Detected motors` 和 `Gripper Server started`。
 
-只使用右臂时，终端一和终端二分别改用：
+### 2. 终端二：启动遥操作
+
+加载相同环境后，选择一条命令：
 
 ```bash
-# 终端一：右夹爪
-bash scripts/start_gripper.sh
+# 右臂
+python scripts/teleop.py --right --motion-mode
 
-# 终端二：右臂遥操作
-python scripts/teleop_r1arm_real.py --motion-mode
+# 左臂
+python scripts/teleop.py --left --motion-mode
+
+# 双臂
+python scripts/teleop.py --dual --motion-mode
 ```
 
-没有夹爪时跳过夹爪服务，并在遥操命令后加 `--no-enable-dex1`。
+核对串口、标定和启动提示后输入 `MOVE`。所选机械臂默认平滑回 home，随后按住对应手柄 grip 开始跟踪。左臂自动使用左侧标定、方向转换与夹爪 topic，不要求右臂设备在线。
+
+没有夹爪时跳过夹爪服务，并在命令后加 `--no-enable-dex1`。
 
 ### 3. 手柄操作
 
@@ -136,32 +137,34 @@ python scripts/teleop_r1arm_real.py --motion-mode
 |---|---|
 | 左 / 右 grip | 按住后对应机械臂跟踪手柄相对位姿 |
 | 左 / 右 trigger | 控制对应夹爪闭合比例 |
-| A（右手柄） | 回 home；双臂同时归位 |
-| X（左手柄） | 录制开始 / 停止并保存 |
+| A（右手柄） | 所选机械臂回 home |
+| X（左手柄） | 开启 `--record` 后，开始录制 / 停止并保存 |
 | B（右手柄） | 录制期间暂停 / 恢复记录和跟踪 |
 | Ctrl+C | 停止并退出，退出后继续支撑机械臂 |
 
-单臂纯遥操不录制，使用下方单臂采集入口启用 X/B。双臂遥操入口同时支持录制，不按 X 时不保存 episode。
+单臂默认录制按键仍需要双手柄：X 在左手柄、A/B 在右手柄。
 
 ## 📦 数据采集
 
-退出原遥操程序，保持夹爪服务运行。采集程序本身包含遥操作。
+退出原遥操程序，保持对应夹爪服务运行，在同一入口加 `--record`：
 
 ```bash
-# 双臂，默认三路相机
-python dual/record.py --motion-mode --data-root data/dual_real
+# 右臂，默认头部与右腕相机
+python scripts/teleop.py --right --record --motion-mode --output-dir data/right_real
 
-# 右臂，默认两路相机
-python scripts/record_r1arm_real.py --motion-mode \
-  --output-dir data/right_real --require-all-cameras
+# 左臂，默认头部与左腕相机
+python scripts/teleop.py --left --record --motion-mode --output-dir data/left_real
+
+# 双臂，默认头部与左右腕三路相机
+python scripts/teleop.py --dual --record --motion-mode --output-dir data/dual_real
 ```
 
-X 开始 / 保存，B 暂停 / 恢复。默认输出 `episode_0000.mcap` 等文件，控制目标频率 90 Hz、图像观测目标频率 30 Hz。
+X 开始 / 保存，B 暂停 / 恢复。单臂输出 8 维、双臂输出 16 维 MCAP 数据，文件名为 `episode_0000.mcap` 等。真机控制目标频率 90 Hz、图像观测目标频率 30 Hz。
 
-相机配置和检查命令见 [图像采集说明](detail.md#2-启用图像)。不录图像时：
+相机配置和检查命令见 [图像采集说明](detail.md#2-启用图像)。不录图像时加 `--no-cameras`：
 
 ```bash
-python dual/record.py --motion-mode --no-cameras --data-root data/dual_real
+python scripts/teleop.py --dual --record --motion-mode --no-cameras --output-dir data/dual_real
 ```
 
 ## 🔄 轨迹回放
@@ -185,10 +188,12 @@ python dual/replay.py --episode data/dual_real/episode_0000.mcap --motion-mode
 不连接真实机械臂，使用 mock 输入运行双臂仿真：
 
 ```bash
-python scripts/teleop_r1arm_sim.py --mock-xr --use-dual-arm
+python scripts/teleop.py --sim --dual --mock-xr
 ```
 
-检查真实 PICO 输入时去掉 `--mock-xr`。
+检查真实 PICO 输入时去掉 `--mock-xr`；仿真同样支持 `--right`、`--left` 和 `--record`，使用 `python scripts/teleop.py --sim --help` 查看仿真参数。
+
+![R1-7A 双臂 MuJoCo 仿真](mp4/simulation.gif)
 
 ## 🧑‍✈️ 主要参数
 
@@ -204,6 +209,7 @@ python scripts/teleop_r1arm_sim.py --mock-xr --use-dual-arm
 
 ## 🚀 训练与部署
 
+![R1-7A 训练与部署演示](mp4/training_deployment.gif)
 
 
 ## 🙏 致谢

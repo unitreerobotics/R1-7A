@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+ARM_SIDES = {'right': ('right',), 'left': ('left',), 'dual': ('right', 'left')}
 SDK_ROOT = Path(os.environ.get('R1ARM_SDK_ROOT', ROOT.parent / 'R1_arm_SDK_x86/r1_arm')).expanduser().resolve()
 SERIAL_PREFIX = os.environ.get('R1ARM_SERIAL_PREFIX', '/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBPG771-')
 PORTS = {side: Path(SERIAL_PREFIX + suffix + '-port0') for side, suffix in

@@ -4,8 +4,8 @@
 The established observation schema is retained, while joint_state/action use
 the R1Arm simulation space (8 DoF single-arm, 16 DoF dual-arm).
 
-Teleoperation starts immediately, just like ``teleop_r1arm_sim.py``:
-  Y: start/stop and save an episode
+Teleoperation starts immediately:
+  X: start/stop and save an episode
   B: pause/resume recording and teleoperation output
   A: soft-reset the arm to home
   grip/trigger: unchanged arm tracking and Dex1 control
@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import queue
-import signal
 import sys
 import threading
 import time
@@ -68,7 +67,7 @@ class R1ArmSimMcapRecorder:
         self.record_paused_duration = 0.0
         self.next_sample_monotonic = 0.0
         self.image_frame_id = -1
-        self.previous_buttons = {name: False for name in ("Y", "B")}
+        self.previous_buttons = {name: False for name in ("X", "B")}
         self._frame_queue: queue.Queue[dict | None] = queue.Queue()
         self._render_ready = threading.Event()
         self._render_error: BaseException | None = None
@@ -362,7 +361,7 @@ class R1ArmSimMcapRecorder:
 
     def _handle_buttons(self) -> None:
         edges = self._button_edges()
-        if edges["Y"]:
+        if edges["X"]:
             if self.is_recording:
                 self._stop_episode()
             else:
@@ -451,8 +450,8 @@ class R1ArmSimMcapRecorder:
 
     def run(self) -> None:
         print("\n[R1Arm MuJoCo MCAP Record] ready")
-        print("  Teleoperation is active immediately (same as teleop_r1arm_sim.py)")
-        print("  Pico Y: start/stop and save an episode")
+        print("  Teleoperation is active immediately")
+        print("  Pico X: start/stop and save an episode")
         print("  Pico B: pause/resume recording and teleoperation")
         print("  Pico A: soft-reset the arm to home")
         print("  Hold grip while moving a controller; trigger controls Dex1")
@@ -502,8 +501,6 @@ def build_parser() -> argparse.ArgumentParser:
     sim = parser.add_argument_group("R1Arm MuJoCo teleoperation")
     sim.add_argument("--urdf", default="")
     sim.add_argument("--mjcf", default="")
-    sim.add_argument("--use-dual-arm", action="store_true")
-    sim.add_argument("--side", choices=("left", "right"), default="right")
     sim.add_argument("--scale-factor", type=float, default=1.0)
     sim.add_argument("--mock-xr", action="store_true")
     sim.add_argument("--debug", action="store_true")
@@ -548,19 +545,3 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exit after --duration saves the episode (useful for mock/headless runs)",
     )
     return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    recorder = R1ArmSimMcapRecorder(args)
-
-    def stop(_signum, _frame) -> None:
-        recorder.running = False
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    recorder.run()
-
-
-if __name__ == "__main__":
-    main()

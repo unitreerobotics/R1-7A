@@ -16,8 +16,8 @@ from mcap.reader import make_reader
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.teleop_r1arm_real import build_parser as teleop_parser
-from scripts.replay_r1arm_real import (
+from teleop.cli import build_parser as teleop_parser
+from scripts.replay.replay_r1arm_real import (
     observation_mosaic, resolve_episode, load_episode_states, recorded_sample_times, plan_frame_intervals,
     interp_trajectory, recorded_peak_speed, wait_for_feedback, enable_foc_hold,
     check_feedback_range, check_faults, gravity_feedforward, safe_stop,
@@ -182,6 +182,13 @@ def parse_args(argv=None):
     parser.add_argument('--data-source', choices=('auto','control','frame'), default='auto')
     parser.add_argument('--show-observations', action=argparse.BooleanOptionalAction, default=True,
                         help='show recorded camera views by timestamp (default; use --no-show-observations to disable)')
+    parser.add_argument('--preview-only', action='store_true',
+                        help='Play recorded images and targets without opening serial/DDS devices')
+    parser.add_argument('--preview-backend', choices=('browser', 'window'), default='browser',
+                        help='browser: VS Code Simple Browser; window: OpenCV')
+    parser.add_argument('--preview-scale', type=float, default=.75)
+    parser.add_argument('--print-actions', action=argparse.BooleanOptionalAction, default=True,
+                        help='Print targets during preview and commands during real replay')
     parser.add_argument('--section', choices=('action', 'state'), default='action')
     parser.add_argument('--speed', type=float, default=1.0)
     parser.add_argument('--max-gap', type=float, default=0.5)
@@ -192,6 +199,10 @@ def parse_args(argv=None):
     parser.set_defaults(port='', dex1_side='right',
         bridge_lib=DEFAULT_BRIDGE_LIBRARY)
     args = parser.parse_args(argv)
+    if args.preview_only and args.motion_mode:
+        parser.error('--preview-only cannot be combined with --motion-mode')
+    if not math.isfinite(args.preview_scale) or args.preview_scale <= 0:
+        parser.error('--preview-scale must be finite and positive')
     try:
         validate_pair(args.right_port,args.left_port,args.right_calib,args.left_calib)
     except ValueError as exc:
@@ -219,6 +230,44 @@ def parse_args(argv=None):
         except (ValueError, OSError) as exc:
             parser.error(str(exc))
     return args
+
+
+def print_action(vector, *, mode, phase, grippers_enabled=False):
+    print('[Action] ' + json.dumps(dict(mode=mode, phase=phase, grippers_enabled=grippers_enabled,
+        right=dict(q_rad=np.asarray(vector[:7]).tolist(), gripper_slide=float(vector[7])),
+        left=dict(q_rad=np.asarray(vector[8:15]).tolist(), gripper_slide=float(vector[15])))), flush=True)
+
+
+def preview_only(args, path, vectors, frames, info, intervals, observations):
+    worker = None
+    def stop_signal(*_):
+        raise KeyboardInterrupt
+    previous_handler = signal.signal(signal.SIGTERM, stop_signal)
+    try:
+        if args.show_observations and observations:
+            worker = ReplayPreview(path, tuple(info.get('camera_order') or observations[0]['colors']),
+                scale=args.preview_scale, backend=args.preview_backend, window='Dual recorded observations')
+        print('Open the VS Code preview URL above, then type MOVE here to start slow playback.')
+        if input('Type MOVE to play recorded images and actions (Enter cancels): ').strip() != 'MOVE':
+            raise SystemExit('Preview cancelled; no serial/DDS devices were opened')
+        print(f'PREVIEW ONLY at {args.speed:g}x: recorded targets; no serial/DDS devices opened. Ctrl+C stops preview.')
+        deadline = time.monotonic()
+        for index, (vector, frame) in enumerate(zip(vectors, frames)):
+            if index:
+                deadline += float(intervals[index]) / args.speed
+                time.sleep(max(0., deadline - time.monotonic()))
+            if worker is not None and worker.update(int(frame['sample_time_ns'])):
+                break
+            if args.print_actions:
+                print_action(vector, mode='preview', phase=f'frame_{index}')
+    except KeyboardInterrupt:
+        print('Preview stopped')
+    finally:
+        try:
+            if worker is not None:
+                worker.close()
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 def run(args):
@@ -256,8 +305,11 @@ def run(args):
                                    intervals[a:b]) for a, b in zip(boundaries[:-1], boundaries[1:])) * args.speed
     print(f'{path}: {len(vectors)} frames, {len(boundaries)-1} segments, {hz:g} Hz, section={args.section}')
     print(f'Right={args.right_port}, left={args.left_port}; peak recorded joint speed={peak:.3f} rad/s')
-    if peak > args.max_joint_speed + 1e-6:
+    if peak > args.max_joint_speed + 1e-6 and not args.preview_only:
         raise ValueError(f'Recorded speed exceeds {args.max_joint_speed:g} rad/s; reduce --speed')
+    if args.preview_only:
+        preview_only(args, path, vectors, frames, info, intervals, observations)
+        return
     if not args.motion_mode:
         print('DRY RUN: validated both arms and grippers; no serial/DDS devices opened')
         return
@@ -296,7 +348,7 @@ def run(args):
             raise errors[0]
         return results
 
-    def cycle(vector, speed_limit):
+    def cycle(vector, speed_limit, phase='playback'):
         if not running:
             raise KeyboardInterrupt
         feedback = {side: bus.read_state() for side,bus in buses.items()}
@@ -337,6 +389,9 @@ def run(args):
                 feedback_timeout=np.asarray(state.timeout).tolist(),
                 motor_error_code=np.asarray(state.error_code).tolist())
         outputs = barrier([lambda: output('right',0),lambda: output('left',8)])
+        if args.print_actions:
+            sent = np.r_[outputs[0][1]['q_sent'], vector[7], outputs[1][1]['q_sent'], vector[15]]
+            print_action(sent, mode='command', phase=phase, grippers_enabled=args.enable_dex1)
         measured = np.concatenate([item[0] for item in outputs])
         telemetry.put([time.time_ns(),*vector,*measured,json.dumps([item[1] for item in outputs])])
         return measured
@@ -348,7 +403,7 @@ def run(args):
         previous_q = None
         while time.monotonic() < deadline:
             start = time.monotonic()
-            measured = cycle(vector, min(args.approach_speed, args.max_joint_speed))
+            measured = cycle(vector, min(args.approach_speed, args.max_joint_speed), phase='approach')
             cmd = np.r_[sdk_to_model_q(commands['right']), sdk_to_model_q(commands['left'])]
             slow = previous_q is not None and np.max(np.abs(measured - previous_q)) / tick < .05
             settled = settled + 1 if np.max(np.abs(measured - desired)) < .05 and np.max(np.abs(cmd - desired)) < .001 and slow else 0
@@ -362,14 +417,14 @@ def run(args):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             start = time.monotonic()
-            cycle(vector, args.max_joint_speed)
+            cycle(vector, args.max_joint_speed, phase='hold')
             time.sleep(max(0., tick - (time.monotonic() - start)))
 
     try:
         if args.show_observations and observations:
             preview_worker = ReplayPreview(
                 path, tuple(info.get('camera_order') or observations[0]['colors']),
-                window='Dual recorded observations',
+                window='Dual recorded observations', scale=args.preview_scale, backend=args.preview_backend,
             )
             preview_worker.update(observations[0]['sample_time_ns'])
         log_path = args.telemetry_csv or path.with_name(path.stem + f'_dual_replay_{time.time_ns()}.csv')

@@ -7,7 +7,7 @@ import threading
 
 import numpy as np
 
-from dual.config import LEFT_BUS_SIGN, validate_pair
+from dual.config import LEFT_BUS_SIGN, validate_pair, validate_arm_port
 from robot.r1arm_sdk import R1ArmSdkBus, sdk_to_model_q, model_to_sdk_q
 from teleop.r1arm_real_controller import R1ArmRealTeleopController, MODEL_LOWER, MODEL_UPPER
 from teleop.xr_snapshot import sample_xr
@@ -143,10 +143,15 @@ PausableArmController = ArmController
 class R1ArmDualRealController:
     def __init__(self, config, *, right_port, left_port, right_calibration,
                  left_calibration, left_sign=LEFT_BUS_SIGN, right_home=None, left_home=None,
-                 recovery_margin=.25, **kwargs):
-        validate_pair(right_port, left_port, right_calibration, left_calibration)
+                 recovery_margin=.25, sides=('right', 'left'), **kwargs):
+        if sides not in (('right',), ('left',), ('right', 'left')):
+            raise ValueError('Select right, left or both arms')
+        if len(sides) == 2:
+            validate_pair(right_port, left_port, right_calibration, left_calibration)
+        else:
+            validate_arm_port(right_port if sides[0] == 'right' else left_port, sides[0])
         self.arms = {}
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='arm-serial')
+        self.pool = ThreadPoolExecutor(max_workers=len(sides), thread_name_prefix='arm-serial')
         self.paused = False
         self.native_xr = None
         self.snapshot = None
@@ -155,19 +160,23 @@ class R1ArmDualRealController:
         self._last_pair = None
         try:
             base = dict(kwargs, recovery_margin=recovery_margin)
-            self.arms['right'] = ArmController(
-                replace(config, dual_arm=False, control_side='right', home_q=right_home),
-                port=right_port, calibration_path=right_calibration, dex1_side='right', **base)
-            self.native_xr = self.arms['right'].xr_client
-            self.arms['left'] = ArmController(
-                replace(config, dual_arm=False, control_side='left', home_q=left_home),
-                port=left_port, calibration_path=left_calibration, dex1_side='left',
-                bus_factory=lambda lib: LeftArmBus(lib, sign=left_sign),
-                **dict(base, motion_mode=False, mock_xr=True))
-            right, left = self.arms['right'], self.arms['left']
-            left.motion_mode, left.mock_xr = right.motion_mode, right.mock_xr
-            left.allow_xr_fallback = right.allow_xr_fallback
-            left.xr_client = self.native_xr
+            for index, side in enumerate(sides):
+                options = dict(base) if index == 0 else dict(base, motion_mode=False, mock_xr=True)
+                if side == 'left':
+                    options['bus_factory'] = lambda lib: LeftArmBus(lib, sign=left_sign)
+                self.arms[side] = ArmController(
+                    replace(config, dual_arm=False, control_side=side,
+                            home_q=right_home if side == 'right' else left_home),
+                    port=right_port if side == 'right' else left_port,
+                    calibration_path=right_calibration if side == 'right' else left_calibration,
+                    dex1_side=side, **options)
+                first = self.arms[sides[0]]
+                if index == 0:
+                    self.native_xr = first.xr_client
+                self.arms[side].motion_mode = first.motion_mode
+                self.arms[side].mock_xr = first.mock_xr
+                self.arms[side].allow_xr_fallback = first.allow_xr_fallback
+                self.arms[side].xr_client = self.native_xr
             for arm in self.arms.values():
                 arm.enable_a_button_reset = False
         except BaseException:
@@ -261,9 +270,9 @@ class R1ArmDualRealController:
         samples = {side: arm.control_sample() for side, arm in self.arms.items()}
         stamps = [s['command_time_ns'] for s in samples.values()]
         skew = max(stamps)-min(stamps)
-        for sample in samples.values():
+        for side, sample in samples.items():
             sample['pair_skew_ns'] = skew
-            sample['gripper_enabled'] = bool(self.arms['right'].motion_mode and self.arms['right'].enable_dex1)
+            sample['gripper_enabled'] = bool(self.arms[side].motion_mode and self.arms[side].enable_dex1)
         self._last_pair = deepcopy(samples)
         for sample in samples.values():
             for value in sample.values():
