@@ -471,36 +471,52 @@ python scripts/replay/replay_r1arm_sim.py --episode data/dual_real/episode_0000.
 一次排查只改变一个条件。通信恢复不等于完整运动验收；依次确认反馈、标定、归位、单侧跟踪、双侧跟踪、夹爪开合，最后再增加相机和录制负载。
 
 ## 机械臂通信检查
-通信预检由独立程序执行，不由遥操／录制自动调用；遥操／录制保留原有的反馈就绪和故障检查，不再要求连续 10 轮反馈。只读 replay 和 MuJoCo 仿真不需要执行真机通信预检。先完成本 README 的环境初始化，退出所有机械臂遥操／录制／回放程序，可靠支撑机械臂，再运行：
 
-# 双臂预检（默认）
-python scripts/check_r1arm_communication.py
+本节用于定位主机到机械臂电机的串口通信问题。`Accessible` 只表示 Linux 串口存在且当前用户有读写权限，不代表电机已上电或会回复。项目提供的单电机诊断入口是 SDK 中的 `test_arm_lowlevel`。
 
-# 只检查右臂或左臂，选择其中一条
-python scripts/check_r1arm_communication.py --side right
-python scripts/check_r1arm_communication.py --side left
-每侧依次执行：全轴停止 → 等待 100 ms → 单独探测 ID 0–6（每 ID 连续 10 轮新反馈）→ 七轴连续 10 轮新反馈。探测按 50 Hz 的等待间隔执行，每个阶段最多等待 3 秒；中间缺反馈会重新计数。程序检查反馈计数增量，避免把曾经收到过反馈的 ready 标志当作本轮新反馈。故障码、反馈 timeout 或非有限值会使预检失败，不自动清故障。
+### 检查前
 
-显示全部 [PASS] 并正常退出后，可在同一终端启动前面的遥操、录制或回放命令。程序退出时会停止电机并关闭串口，不保持姿态。预检通过说明检查期间通信正常，不能保证重新打开串口后或后续运行中不再出现间歇问题。
+- 确认机械臂有可靠支撑，急停可触及；诊断期间关节可能不保持姿态。
+- 退出会占用机械臂串口的遥操、录制和回放进程。
+- 加载本机配置后核对右臂 `PORT_RIGHT` / `CALIB_RIGHT`，或左臂 `PORT_LEFT` / `CALIB_LEFT`。机械臂端口应分别接到正确的 USB 转 485 通道。
 
-本机 bridge 已重建。首次在其他构建目录／机器使用新增的单 ID 探测接口，或出现 Bridge lacks single-ID probing／Bridge lacks feedback diagnostics 时，需要重建实际使用的 bridge。默认本机构建目录的命令如下（环境初始化后执行）：
+### 探测单个电机 ID
 
-python scripts/build_r1arm_sdk_bridge.py --sdk-root "$ARM" --build-dir build/dual_sdk_bridge
-source scripts/real_env.sh
-预检失败会以非零状态退出，应先排查失败的 ID／故障码；不要在预检未通过时继续运动。无论检查通过、失败还是按 Ctrl+C 中断，程序都会尝试停止电机并关闭串口。
+右臂探测 ID 1：
 
-程序默认使用环境中的 PORT_RIGHT/PORT_LEFT、CALIB_RIGHT/CALIB_LEFT 和 bridge；也支持 --right-port/--left-port、--right-calib/--left-calib、--bridge-lib。预检与遥操应使用相同的串口、SDK 和 bridge。
-
-需要单独检查右臂 ID 1 时，在没有遥操／回放进程占用串口的情况下运行 SDK 诊断程序：
-
+```bash
 "$ARM/bin/test_arm_lowlevel" \
   --probe-id 1 \
   --port "$PORT_RIGHT" \
   --baud 6000000 \
   --calib "$CALIB_RIGHT"
-确认出现 Feedback ready from motor ID 1，且 Bus replies 持续增长、Bus timeouts 保持为 0；按 Ctrl+C 退出。该命令只验证 ID 1 的探测链路，不代表七轴都正常；全轴连续通信由上面的独立预检程序验证。探测期间机械臂不会主动保持，请可靠支撑。
+```
 
-连接问题先按下面顺序排查，避免把通信问题当作标定问题：
+`--probe-id N` 只检查所选电机 ID。成功时应看到 `Feedback ready from motor ID N`，且 Bus replies 持续增加、Bus timeouts 保持为 0；按 Ctrl+C 退出。换测其他侧时要同步更改 ID、串口和标定文件。
+
+该命令会向目标电机发送零力矩 FOC 指令，并在超时退出时向整条总线发送停止指令；它不是只读操作，也不保证机械臂保持姿态。失败时不要连续重试或启动回放。先支撑机械臂，按设备流程断电检查对应电机的供电、通信线缆、接头和 ID 配置。
+
+### 结果判读
+
+| 输出 | 含义与处理 |
+|---|---|
+| `Accessible` | 只说明串口节点可访问；继续看电机反馈 |
+| `No valid feedback from motor ID N` | 指定 ID 未返回有效数据；检查电机供电、线缆、通道映射和 ID。标定文件已加载不等于串口收到了反馈 |
+| `missing joints [1,...,6]` | 列表为零起始关节索引，对应电机 ID 1–6；若 ID 0 有反馈，优先检查后续通信链路和这些电机的供电／ID |
+| 电机反馈正常，夹爪无反馈 | 这是独立的夹爪串口／DDS 检查；核对对应侧 ID 7、夹爪服务、topic、DDS domain 和网卡 |
+| `Port is already used` | 先退出占用该串口的服务或控制程序；启动器不会自动终止其他进程 |
+| `CXXABI` / `GLIBCXX` / 动态库缺失 | 检查激活的 Conda 环境、SDK、bridge 和 Dex1 库路径 |
+
+Python bridge 默认读取 `R1ARM_BRIDGE_LIB`；若出现 `Bridge lacks single-ID probing` 或 `Bridge lacks feedback diagnostics`，只需重建实际使用的 bridge：
+
+```bash
+python scripts/build_r1arm_sdk_bridge.py \
+  --sdk-root "$R1ARM_SDK_ROOT" \
+  --build-dir build/r1arm_sdk_bridge
+source scripts/real_env.sh
+```
+
+串口反馈恢复后，再依序确认标定、单臂启动、归位、双臂启动及夹爪开合；最后再增加相机和录制负载。普通断电不要求重新标定，只有确认零位对应关系改变时才重新采集标定。
 
 ## 🧪 离线回归
 
@@ -531,7 +547,7 @@ mp4/                            演示 GIF 与设备照片
 
 感谢 [XRoboToolkit](https://github.com/XR-Robotics/XRoboToolkit-PC-Service)、[XRoboToolkit Python binding](https://github.com/YanjieZe/XRoboToolkit-PC-Service-Pybind)、[R1-7A SDK](https://github.com/unitreerobotics/r1-7a_sdk)、[Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2)、[Unitree SDK2 Python](https://github.com/unitreerobotics/unitree_sdk2_python)、[Dex1 服务](https://github.com/unitreerobotics/dex1_1_service)、[Placo](https://github.com/Rhoban/placo) 与 [MuJoCo](https://github.com/google-deepmind/mujoco) 等项目。
 
-页面结构参考 [UniArmL1](https://github.com/unitreerobotics/UniArmL1)，硬件、控制入口、数据格式及功能说明以本仓库代码为准。
+硬件、控制入口、数据格式及功能说明以本仓库代码为准。
 
 ## 📄 许可证
 

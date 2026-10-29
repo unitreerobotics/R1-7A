@@ -14,7 +14,7 @@
 
 | 单臂遥操作演示 · 01 | 双臂遥操作演示 · 02 |
 |:---:|:---:|
-| ![单臂遥操作演示一](mp4/demo-1.gif) | ![双臂遥操作演示二](mp4/demo-2.gif) |
+| ![单臂遥操作演示一](mp4/single_arm_teleop.gif) | ![双臂遥操作演示二](mp4/dual_arm_teleop.gif) |
 
 ## ✳️ 概述
 
@@ -29,11 +29,11 @@ R1-7A 遥操作框架通过 PICO 双手柄控制七轴机械臂与 Dex1 夹爪�
 ## 🔧 硬件准备
 
 <p align="center">
-  <img src="mp4/微信图片_20261022175307_8_2.jpg" alt="R1-7A 机械臂、Dex1 夹爪与相机" width="800">
+  <img src="mp4/r1_7a_with_dex1.jpg" alt="R1-7A 机械臂、Dex1 夹爪与相机" width="800">
 </p>
 
 <p align="center">
-  <img src="mp4/硬件连线.png" alt="R1-7A 供电模块、机械臂与夹爪的硬件连线示意" width="800">
+  <img src="mp4/hardware_wiring.png" alt="R1-7A 供电模块、机械臂与夹爪的硬件连线示意" width="800">
 </p>
 
 | 设备 | 说明 |
@@ -216,4 +216,4 @@ python scripts/teleop.py --sim --dual --mock-xr
 
 感谢 [XRoboToolkit](https://github.com/XR-Robotics/XRoboToolkit-PC-Service)、[Placo](https://github.com/Rhoban/placo)、[MuJoCo](https://github.com/google-deepmind/mujoco) 以及 Unitree 相关 SDK 项目。
 
-页面结构参考 [UniArmL1](https://github.com/unitreerobotics/UniArmL1)。第三方依赖的许可遵循其原项目声明，当前根目录尚未提供 `LICENSE` 文件。
+第三方依赖的许可遵循其原项目声明，当前根目录尚未提供 `LICENSE` 文件。

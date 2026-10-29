@@ -14,7 +14,7 @@ Single-arm / dual-arm teleoperation · Multi-camera capture · MCAP recording an
 
 | Single-arm Teleoperation · 01 | Dual-arm Teleoperation · 02 |
 |:---:|:---:|
-| ![Single-arm teleoperation demo 1](mp4/demo-1.gif) | ![Dual-arm teleoperation demo 2](mp4/demo-2.gif) |
+| ![Single-arm teleoperation demo 1](mp4/single_arm_teleop.gif) | ![Dual-arm teleoperation demo 2](mp4/dual_arm_teleop.gif) |
 
 ## ✳️ Overview
 
@@ -29,11 +29,11 @@ The R1-7A teleoperation framework uses two PICO controllers to operate 7-DoF rob
 ## 🔧 Hardware Preparation
 
 <p align="center">
-  <img src="mp4/微信图片_20261022175307_8_2.jpg" alt="R1-7A robotic arms, Dex1 grippers, and cameras" width="800">
+  <img src="mp4/r1_7a_with_dex1.jpg" alt="R1-7A robotic arms, Dex1 grippers, and cameras" width="800">
 </p>
 
 <p align="center">
-  <img src="mp4/硬件连线.png" alt="R1-7A hardware wiring diagram: PC, USB-to-RS485 module, arm power module, and gripper connections; labels in Chinese" width="800">
+  <img src="mp4/hardware_wiring.png" alt="R1-7A hardware wiring diagram: PC, USB-to-RS485 module, arm power module, and gripper connections; labels in Chinese" width="800">
 </p>
 
 | Device | Description |
@@ -220,4 +220,4 @@ Use `--help` on each entry point for the full parameter list. Device configurati
 
 Thanks to [XRoboToolkit](https://github.com/XR-Robotics/XRoboToolkit-PC-Service), [Placo](https://github.com/Rhoban/placo), [MuJoCo](https://github.com/google-deepmind/mujoco), and the related Unitree SDK projects.
 
-The page structure is inspired by [UniArmL1](https://github.com/unitreerobotics/UniArmL1). Third-party dependencies retain their original licenses. This repository does not currently include a root-level `LICENSE` file.
+Third-party dependencies retain their original licenses. This repository does not currently include a root-level `LICENSE` file.
