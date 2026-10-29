@@ -472,17 +472,11 @@ python scripts/replay/replay_r1arm_sim.py --episode data/dual_real/episode_0000.
 
 ## 机械臂通信检查
 
-本节用于定位主机到机械臂电机的串口通信问题。`Accessible` 只表示 Linux 串口存在且当前用户有读写权限，不代表电机已上电或会回复。项目提供的单电机诊断入口是 SDK 中的 `test_arm_lowlevel`。
+本节说明 SDK 自带的 `test_arm_lowlevel` 诊断命令。它直接打开真实机械臂串口；并非只读工具。先按前文加载本机环境，退出遥操、录制、回放等串口占用程序，并可靠支撑机械臂、确认急停可触及。若串口显示 `Accessible`，只代表设备路径可读写，不代表电机已上电或有反馈。
 
-### 检查前
+### 探测单个电机
 
-- 确认机械臂有可靠支撑，急停可触及；诊断期间关节可能不保持姿态。
-- 退出会占用机械臂串口的遥操、录制和回放进程。
-- 加载本机配置后核对右臂 `PORT_RIGHT` / `CALIB_RIGHT`，或左臂 `PORT_LEFT` / `CALIB_LEFT`。机械臂端口应分别接到正确的 USB 转 485 通道。
-
-### 探测单个电机 ID
-
-右臂探测 ID 1：
+例如检查右臂 ID 1：
 
 ```bash
 "$ARM/bin/test_arm_lowlevel" \
@@ -492,31 +486,45 @@ python scripts/replay/replay_r1arm_sim.py --episode data/dual_real/episode_0000.
   --calib "$CALIB_RIGHT"
 ```
 
-`--probe-id N` 只检查所选电机 ID。成功时应看到 `Feedback ready from motor ID N`，且 Bus replies 持续增加、Bus timeouts 保持为 0；按 Ctrl+C 退出。换测其他侧时要同步更改 ID、串口和标定文件。
+`--probe-id N` 的 ID 范围是 0–6。程序先向全臂发送停止指令，再持续向指定 ID 发送零增益 FOC 探测；成功后按 Ctrl+C 退出。成功时应看到 `Feedback ready from motor ID N`，并且 Bus replies 增长、Bus timeouts 保持为 0。该命令只验证所选 ID，不代表七轴通信均正常。探测期间电机不保持姿态；退出时也会停止全臂，因此全程必须可靠支撑。
 
-该命令会向目标电机发送零力矩 FOC 指令，并在超时退出时向整条总线发送停止指令；它不是只读操作，也不保证机械臂保持姿态。失败时不要连续重试或启动回放。先支撑机械臂，按设备流程断电检查对应电机的供电、通信线缆、接头和 ID 配置。
+### 清除已知故障码
 
-### 结果判读
+只在反馈正常、故障原因已经排除且需要清除锁存故障时使用。右臂示例：
+
+```bash
+"$ARM/bin/test_arm_lowlevel" \
+  --clear \
+  --port "$PORT_RIGHT" \
+  --baud 6000000 \
+  --calib "$CALIB_RIGHT"
+```
+
+检查左臂时改用 `$PORT_LEFT` 和 `$CALIB_LEFT`。`--clear` 会先探测并打印七轴状态，向所有电机发送多轮清故障命令，再次探测并打印状态。它会发送零增益 FOC 探测指令，机械臂可能不保持姿态。清码不能修复欠压电源、断线或没有反馈；先排除根因，不要把 `--clear` 或 `--reset` 当作通信修复步骤。
+
+### 其他低层命令
+
+| 命令 | 实际操作 | 影响 |
+|---|---|---|
+| `--stop` | 向七轴发送约 500 ms 的 mode 0 停止命令 | 解除电机保持，机械臂可能下垂 |
+| `--zero-torque` | 等待全轴反馈后，持续发送 `kp=0`、`kd=0`、`tau=0` 的 FOC 命令 | 七轴不主动保持姿态；Ctrl+C 后发送停止命令 |
+| `--foc` | 读取当前七轴姿态，再用 `kp` / `kd` 持续保持该姿态 | 电机产生保持力矩；Ctrl+C 后发送停止命令 |
+| `--clear` / `--clear-fault` | 探测、打印清除前状态、向所有电机发送清故障命令、再次探测 | 只清理可清除的电机故障状态，不会修复持续存在的故障原因 |
+| `--reset` | 探测、打印状态、向所有电机发送复位命令，再次探测 | 会改变电机内部状态；仅在明确需要时使用 |
+| `--home` | 使七轴移动到 URDF/model 坐标全零位置 | 会实际运动；该姿态不同于遥操 home `[0, 1.2, 0, -1.2, 0, 0, 0]` |
+| `--goto --q ...` | 使七轴移动到 `--q` 指定的七个 URDF/model 坐标角度，单位 rad | 会实际运动；运行前核对目标、限位和机械臂周边空间 |
+
+### 常见输出
 
 | 输出 | 含义与处理 |
 |---|---|
-| `Accessible` | 只说明串口节点可访问；继续看电机反馈 |
-| `No valid feedback from motor ID N` | 指定 ID 未返回有效数据；检查电机供电、线缆、通道映射和 ID。标定文件已加载不等于串口收到了反馈 |
-| `missing joints [1,...,6]` | 列表为零起始关节索引，对应电机 ID 1–6；若 ID 0 有反馈，优先检查后续通信链路和这些电机的供电／ID |
-| 电机反馈正常，夹爪无反馈 | 这是独立的夹爪串口／DDS 检查；核对对应侧 ID 7、夹爪服务、topic、DDS domain 和网卡 |
-| `Port is already used` | 先退出占用该串口的服务或控制程序；启动器不会自动终止其他进程 |
-| `CXXABI` / `GLIBCXX` / 动态库缺失 | 检查激活的 Conda 环境、SDK、bridge 和 Dex1 库路径 |
+| `No valid feedback from motor ID N` | 指定 ID 没有返回有效数据；检查电机供电、通信线缆、USB 转 485 通道和 ID。标定文件加载成功不代表收到电机反馈 |
+| `Feedback incomplete: j1 ...` | `j` 后是从 0 开始的关节索引；对照机械臂 ID、供电和线缆逐项排查，先支撑机械臂，不要盲目改 ID 或重标定 |
+| `motor_timeout=1` | 电机反馈报文里的超时状态；它与程序统计的 Bus timeouts（等待回复超时）是两个不同字段 |
+| `error=0` 但反馈缺失 | 没收到报文时没有可读取的故障码；不能据此判断电机正常 |
+| `Port is already used` | 串口正被其他进程占用；退出占用进程后再检查，启动工具不会自动终止它 |
 
-Python bridge 默认读取 `R1ARM_BRIDGE_LIB`；若出现 `Bridge lacks single-ID probing` 或 `Bridge lacks feedback diagnostics`，只需重建实际使用的 bridge：
-
-```bash
-python scripts/build_r1arm_sdk_bridge.py \
-  --sdk-root "$R1ARM_SDK_ROOT" \
-  --build-dir build/r1arm_sdk_bridge
-source scripts/real_env.sh
-```
-
-串口反馈恢复后，再依序确认标定、单臂启动、归位、双臂启动及夹爪开合；最后再增加相机和录制负载。普通断电不要求重新标定，只有确认零位对应关系改变时才重新采集标定。
+单电机诊断程序来自 `$ARM/bin/test_arm_lowlevel`，直接使用该 SDK 和电机控制库，不依赖 Python bridge。通信问题应先查供电、连接、通道映射和反馈；通信恢复后再检查标定、归位、单臂与双臂运动，最后增加夹爪、相机和录制负载。普通断电不要求重新标定；只有确认零位对应关系改变时才重新采集标定。
 
 ## 🧪 离线回归
 
