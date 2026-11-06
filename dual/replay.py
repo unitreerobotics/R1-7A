@@ -3,7 +3,9 @@
 import argparse
 import csv
 import json
+import os
 import queue
+import select
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 import math
@@ -57,9 +59,14 @@ class StartupLimitRecovery:
                 raise RuntimeError(f'{self.side}: feedback left bounded replay startup recovery corridor')
             return q
         if startup:
-            excess = max(float(np.max(MODEL_LOWER-q)), float(np.max(q-MODEL_UPPER)), 0.)
+            outside = np.maximum(MODEL_LOWER-q, q-MODEL_UPPER)
+            joint = int(np.argmax(outside))
+            excess = max(float(outside[joint]), 0.)
             if excess > self.margin:
-                raise RuntimeError(f'{self.side}: startup exceeds replay recovery margin {self.margin:g} rad')
+                raise RuntimeError(
+                    f'{self.side}: J{joint + 1} feedback {q[joint]:+.3f} rad outside '
+                    f'[{MODEL_LOWER[joint]:+.3f}, {MODEL_UPPER[joint]:+.3f}] by '
+                    f'{excess:.3f} rad; startup recovery limit {self.margin:g} rad')
             if excess > 0:
                 self.origin = q.copy()
                 self.lower, self.upper = np.minimum(MODEL_LOWER, q), np.maximum(MODEL_UPPER, q)
@@ -84,8 +91,10 @@ class StartupLimitRecovery:
 
 class ReplayTelemetry:
     """Bounded background CSV writer; overflow and disk errors stop replay."""
-    def __init__(self,path,header):
+    def __init__(self,path,header,robot_state_path=None):
         self.stream = Path(path).open('x',newline='')
+        self.robot_state_path = Path(robot_state_path) if robot_state_path else None
+        self.next_state_write = 0.0
         self.queue = queue.Queue(maxsize=1800)
         self.error = None
         self.thread = threading.Thread(target=self._run,args=(header,),daemon=True)
@@ -100,6 +109,9 @@ class ReplayTelemetry:
                 if row is None:
                     break
                 writer.writerow(row)
+                if self.robot_state_path and time.monotonic() >= self.next_state_write:
+                    self._write_robot_state(row)
+                    self.next_state_write = time.monotonic() + 0.1
         except Exception as exc:
             self.error = exc
         finally:
@@ -107,6 +119,27 @@ class ReplayTelemetry:
                 self.stream.close()
             except Exception as exc:
                 self.error = self.error or exc
+
+    def _write_robot_state(self, row):
+        try:
+            arms = {}
+            for item in json.loads(row[-1]):
+                arms[item['side']] = {
+                    'q_rad': item['q_measured'],
+                    'dq_rad_s': item['dq_measured'],
+                    'feedback_ready': item['feedback_ready'],
+                    'feedback_timeout': item['feedback_timeout'],
+                    'motor_error_code': item['motor_error_code'],
+                    'motor_mode': item['motor_mode'],
+                }
+            payload = {'updated_ns': int(row[0]), 'arms': arms}
+            target = self.robot_state_path
+            temporary = target.with_name(f'.{target.name}.{threading.get_ident()}.tmp')
+            temporary.write_text(json.dumps(payload, separators=(',', ':')), encoding='utf-8')
+            temporary.replace(target)
+        except Exception as exc:
+            print(f'[UI state] cannot update robot state file: {exc}', file=sys.stderr, flush=True)
+            self.robot_state_path = None
 
     def put(self,row):
         if self.error:
@@ -170,6 +203,51 @@ def load_dual_episode(path, section='action', data_source='auto'):
     return np.asarray(vectors), frames, info, config
 
 
+def recorded_settle_target(frame, action, max_gap):
+    measured = np.asarray(frame.get('states', {}).get('joint_state'), dtype=float)
+    if measured.shape != (16,) or not np.isfinite(measured).all():
+        raise ValueError(f"Frame {frame.get('idx')}: missing finite recorded joint feedback")
+    requested = np.r_[action[:7], action[8:15]]
+    observed = np.r_[measured[:7], measured[8:15]]
+    gap = float(np.max(np.abs(requested - observed)))
+    if gap > max_gap:
+        raise ValueError(f"Frame {frame.get('idx')}: recorded action/feedback gap {gap:.3f} rad exceeds {max_gap:.3f} rad")
+    return observed
+
+
+def pause_boundary_indices(frames, spec):
+    if not spec:
+        return set()
+    try:
+        times = [float(part) for part in spec.split(',')]
+    except ValueError as exc:
+        raise ValueError('--pause-at requires comma-separated seconds') from exc
+    stamps = np.asarray([int(frame['sample_time_ns']) for frame in frames], dtype=np.int64)
+    if len(stamps) < 2 or np.any(np.diff(stamps) <= 0):
+        raise ValueError('--pause-at requires strictly increasing recorded timestamps')
+    duration = (stamps[-1] - stamps[0]) / 1e9
+    if any(not math.isfinite(t) or not 0 < t < duration for t in times) or any(
+        b <= a for a, b in zip(times, times[1:])
+    ):
+        raise ValueError(f'--pause-at times must increase within (0, {duration:.3f}) seconds')
+    indices = [int(np.searchsorted(stamps, stamps[0] + round(t * 1e9))) for t in times]
+    if len(set(indices)) != len(indices):
+        raise ValueError('--pause-at times must select different recorded frames')
+    return set(indices)
+
+
+def wait_for_move_while_holding(hold_cycle, rate, timeout, stream):
+    tick = 1.0 / rate
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        start = time.monotonic()
+        hold_cycle()
+        if select.select([stream], [], [], 0)[0]:
+            return stream.readline().strip() == 'MOVE'
+        time.sleep(max(0., tick - (time.monotonic() - start)))
+    raise TimeoutError(f'No MOVE within {timeout:g}s; replay stopped')
+
+
 def parse_args(argv=None):
     # Use the same gains, gravity and serial defaults as live teleoperation.
     parser = teleop_parser()
@@ -191,16 +269,34 @@ def parse_args(argv=None):
                         help='Print targets during preview and commands during real replay')
     parser.add_argument('--section', choices=('action', 'state'), default='action')
     parser.add_argument('--speed', type=float, default=1.0)
+    parser.add_argument('--target-motion-minutes', type=float,
+                        help='scale all stage motion to this total time, excluding visual-check waits')
+    parser.add_argument('--first-stage-motion-minutes', type=float,
+                        help='motion time for stage 1 when --target-motion-minutes is set')
     parser.add_argument('--max-gap', type=float, default=0.5)
     parser.add_argument('--approach-speed', type=float, default=0.3)
     parser.add_argument('--approach-timeout', type=float, default=30.0)
     parser.add_argument('--hold-time', type=float, default=2.0)
+    parser.add_argument('--pause-at', default='',
+                        help='pause at comma-separated seconds while holding both arms; enter MOVE to continue (120s limit)')
+    parser.add_argument('--settle-to-recorded-state', action='store_true',
+                        help='for control-sample action replay, accept the demonstrated measured pose at segment boundaries')
     parser.add_argument('--telemetry-csv', type=Path)
+    parser.add_argument('--robot-state-file', type=Path,
+                        help='optional dashboard state JSON, updated at 10 Hz off the control thread')
+    parser.add_argument('--phase-state-file', type=Path,
+                        help='optional dashboard phase JSON, updated at stage transitions')
     parser.set_defaults(port='', dex1_side='right',
         bridge_lib=DEFAULT_BRIDGE_LIBRARY)
     args = parser.parse_args(argv)
     if args.preview_only and args.motion_mode:
         parser.error('--preview-only cannot be combined with --motion-mode')
+    if args.preview_only and args.pause_at:
+        parser.error('--pause-at cannot be combined with --preview-only')
+    if args.pause_at and args.no_confirm:
+        parser.error('--pause-at requires operator confirmation; --no-confirm is not allowed')
+    if args.settle_to_recorded_state and args.section != 'action':
+        parser.error('--settle-to-recorded-state requires --section action')
     if not math.isfinite(args.preview_scale) or args.preview_scale <= 0:
         parser.error('--preview-scale must be finite and positive')
     try:
@@ -213,6 +309,15 @@ def parse_args(argv=None):
             parser.error(f'--{name.replace("_", "-")} must be finite and positive')
     if not math.isfinite(args.hold_time) or args.hold_time < 0:
         parser.error('--hold-time must be finite and nonnegative')
+    if (args.target_motion_minutes is None) != (args.first_stage_motion_minutes is None):
+        parser.error('--target-motion-minutes and --first-stage-motion-minutes must be used together')
+    if args.target_motion_minutes is not None and (
+        not math.isfinite(args.target_motion_minutes) or
+        not math.isfinite(args.first_stage_motion_minutes) or
+        args.target_motion_minutes <= args.first_stage_motion_minutes or
+        args.first_stage_motion_minutes <= 0
+    ):
+        parser.error('motion durations must be finite, positive, and first-stage time below total time')
     if args.port or args.calib or args.side != 'right' or args.dex1_side != 'right':
         parser.error('Use the two explicit arm ports/calibrations; sides are fixed')
     if args.mock_xr or False or False or False:
@@ -243,6 +348,7 @@ def preview_only(args, path, vectors, frames, info, intervals, observations):
     def stop_signal(*_):
         raise KeyboardInterrupt
     previous_handler = signal.signal(signal.SIGTERM, stop_signal)
+
     try:
         if args.show_observations and observations:
             worker = ReplayPreview(path, tuple(info.get('camera_order') or observations[0]['colors']),
@@ -298,15 +404,50 @@ def run(args):
     if not math.isfinite(hz) or hz <= 0:
         raise ValueError('Episode frequency must be finite and positive')
     intervals = plan_frame_intervals(recorded_sample_times(vectors, frames), hz, args.max_gap)
+    if args.pause_at and info['replay_data_source'] != 'control':
+        raise ValueError('--pause-at requires high-rate control samples')
+    pause_indices = pause_boundary_indices(frames, args.pause_at)
+    if pause_indices and args.motion_mode and not sys.stdin.isatty():
+        raise ValueError('--pause-at motion replay requires an interactive terminal')
     segments = np.asarray([int(frame.get('record_segment', 0)) for frame in frames])
     # Pause/resume gaps are approached separately, never interpolated as motion.
-    boundaries = np.r_[0, np.flatnonzero(np.diff(segments) != 0) + 1, len(vectors)]
-    peak = max(recorded_peak_speed(vectors[a:b, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]],
-                                   intervals[a:b]) for a, b in zip(boundaries[:-1], boundaries[1:])) * args.speed
+    boundaries = np.r_[0, np.asarray(sorted(set(np.flatnonzero(np.diff(segments) != 0) + 1) |
+                                              pause_indices), dtype=int), len(vectors)]
+    settle_targets = {}
+    if args.settle_to_recorded_state:
+        if info['replay_data_source'] != 'control':
+            raise ValueError('--settle-to-recorded-state requires high-rate control samples')
+        for index in sorted({int(i) for i in boundaries[:-1]} | {len(vectors) - 1} |
+                            {i - 1 for i in pause_indices}):
+            settle_targets[index] = recorded_settle_target(
+                frames[index], vectors[index], min(0.1, args.max_command_lead))
+    stage_durations = []
+    for duration_index, (a, b) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        duration = float(np.sum(intervals[a + 1:b]))
+        if b < len(intervals):
+            duration += float(intervals[b])  # boundary hold belongs to the stage just completed
+        stage_durations.append(duration)
+    stage_speeds = np.full(len(stage_durations), args.speed, dtype=float)
+    if args.target_motion_minutes is not None:
+        if len(stage_durations) < 2 or min(stage_durations) <= 0:
+            raise ValueError('duration scaling needs at least two nonempty stages')
+        total_s = args.target_motion_minutes * 60
+        first_s = args.first_stage_motion_minutes * 60
+        stage_speeds[0] = stage_durations[0] / first_s
+        stage_speeds[1:] = sum(stage_durations[1:]) / (total_s - first_s)
+        print(f'Target motion time: {total_s / 60:.1f} min; stage 1: {first_s / 60:.1f} min; '
+              'visual-check waits are additional.')
+        print('Stage pace multipliers: ' + ', '.join(f'{speed:.5f}x' for speed in stage_speeds))
+    stage_peaks = [
+        recorded_peak_speed(vectors[a:b, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]],
+                            intervals[a:b]) * stage_speeds[index]
+        for index, (a, b) in enumerate(zip(boundaries[:-1], boundaries[1:]))
+    ]
+    peak = max(stage_peaks)
     print(f'{path}: {len(vectors)} frames, {len(boundaries)-1} segments, {hz:g} Hz, section={args.section}')
     print(f'Right={args.right_port}, left={args.left_port}; peak recorded joint speed={peak:.3f} rad/s')
     if peak > args.max_joint_speed + 1e-6 and not args.preview_only:
-        raise ValueError(f'Recorded speed exceeds {args.max_joint_speed:g} rad/s; reduce --speed')
+        raise ValueError(f'Recorded speed exceeds {args.max_joint_speed:g} rad/s; reduce the requested pace')
     if args.preview_only:
         preview_only(args, path, vectors, frames, info, intervals, observations)
         return
@@ -334,6 +475,28 @@ def run(args):
         running = False
 
     previous_handler = signal.signal(signal.SIGTERM, stop_signal)
+
+    phase_events = []
+
+    def set_phase(state, step, completed, detail):
+        if not args.phase_state_file:
+            return
+        phase_events.append({'time': time.strftime('%H:%M:%S'), 'text': detail})
+        del phase_events[:-8]
+        payload = {
+            'state': state, 'step': step, 'max_steps': len(boundaries) - 1,
+            'completed_steps': completed,
+            'progress': completed / max(1, len(boundaries) - 1),
+            'progress_text': detail, 'execution': detail, 'events': phase_events,
+        }
+        target = args.phase_state_file
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f'.{target.name}.{os.getpid()}.tmp')
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+            temporary.replace(target)
+        except OSError as exc:
+            print(f'[UI phase] cannot update phase file: {exc}', file=sys.stderr, flush=True)
 
     def barrier(functions):
         futures = [pool.submit(function) for function in functions]
@@ -387,7 +550,9 @@ def run(args):
                 dq_measured=sdk_to_model_q(state.dq).tolist(),
                 q_limit_delta_model=sdk_to_model_q(command-target).tolist(),
                 feedback_timeout=np.asarray(state.timeout).tolist(),
-                motor_error_code=np.asarray(state.error_code).tolist())
+                motor_error_code=np.asarray(state.error_code).tolist(),
+                feedback_ready=np.asarray(state.ready).tolist(),
+                motor_mode=np.asarray(state.mode).tolist())
         outputs = barrier([lambda: output('right',0),lambda: output('left',8)])
         if args.print_actions:
             sent = np.r_[outputs[0][1]['q_sent'], vector[7], outputs[1][1]['q_sent'], vector[15]]
@@ -396,9 +561,10 @@ def run(args):
         telemetry.put([time.time_ns(),*vector,*measured,json.dumps([item[1] for item in outputs])])
         return measured
 
-    def approach(vector):
+    def approach(vector, expected_feedback=None):
         deadline = time.monotonic() + args.approach_timeout
         desired = np.r_[vector[:7], vector[8:15]]
+        expected_feedback = desired if expected_feedback is None else expected_feedback
         settled = 0
         previous_q = None
         while time.monotonic() < deadline:
@@ -406,12 +572,13 @@ def run(args):
             measured = cycle(vector, min(args.approach_speed, args.max_joint_speed), phase='approach')
             cmd = np.r_[sdk_to_model_q(commands['right']), sdk_to_model_q(commands['left'])]
             slow = previous_q is not None and np.max(np.abs(measured - previous_q)) / tick < .05
-            settled = settled + 1 if np.max(np.abs(measured - desired)) < .05 and np.max(np.abs(cmd - desired)) < .001 and slow else 0
+            settled = settled + 1 if np.max(np.abs(measured - expected_feedback)) < .05 and np.max(np.abs(cmd - desired)) < .001 and slow else 0
             previous_q = measured
             if settled >= max(1, math.ceil(.1 * args.rate)):
                 return
             time.sleep(max(0., tick - (time.monotonic() - start)))
-        raise TimeoutError('Both arms did not settle at segment start; replay cancelled')
+        raise TimeoutError(f'Both arms did not settle at segment pose; max recorded-state error '
+                           f'{np.max(np.abs(measured - expected_feedback)):.3f} rad')
 
     def hold(vector, seconds):
         deadline = time.monotonic() + seconds
@@ -420,6 +587,7 @@ def run(args):
             cycle(vector, args.max_joint_speed, phase='hold')
             time.sleep(max(0., tick - (time.monotonic() - start)))
 
+    pause_steps = {index: step for step, index in enumerate(sorted(pause_indices), 1)}
     try:
         if args.show_observations and observations:
             preview_worker = ReplayPreview(
@@ -429,7 +597,8 @@ def run(args):
             preview_worker.update(observations[0]['sample_time_ns'])
         log_path = args.telemetry_csv or path.with_name(path.stem + f'_dual_replay_{time.time_ns()}.csv')
         telemetry = ReplayTelemetry(log_path,['time_ns', *[f'target_{i}' for i in range(16)],
-            *[f'{s}_measured_J{i}' for s in ('right','left') for i in range(1,8)],'diagnostics_json'])
+            *[f'{s}_measured_J{i}' for s in ('right','left') for i in range(1,8)],'diagnostics_json'],
+            robot_state_path=args.robot_state_file)
         def startup(side, port, calib, factory):
             bus = buses[side] = factory(args.bridge_lib)
             bus.open(port,args.baud,calib)
@@ -448,26 +617,52 @@ def run(args):
                 hands[side] = Dex1Single(side=side, interface=args.dex1_net,
                     domain=args.dex1_domain, grip_torque_limit=args.grip_torque_limit)
         last_command_time.update({side:time.monotonic()-tick for side in buses})
-        for a, b in zip(boundaries[:-1], boundaries[1:]):
+        stage_count = len(boundaries) - 1
+        for stage_index, (a, b) in enumerate(zip(boundaries[:-1], boundaries[1:]), 1):
+            stage_speed = stage_speeds[stage_index - 1]
+            set_phase('RUNNING', stage_index, stage_index - 1,
+                      f'正在执行第 {stage_index}/{stage_count} 步：双臂协同整理毛巾')
             if a:
-                hold(vectors[a-1], intervals[a] / args.speed)
-            approach(vectors[a])
-            targets, _, gaps = interp_trajectory(vectors[a:b], np.zeros(b-a), intervals[a:b], args.rate, args.speed)
+                hold(vectors[a-1], intervals[a] / stage_speeds[stage_index - 2])
+                if a in pause_indices:
+                    approach(vectors[a-1], settle_targets.get(a-1))
+                    set_phase('WAITING', stage_index, stage_index - 1,
+                              f'第 {stage_index - 1} 步已完成，查看图像并核对毛巾状态')
+                    print(f'Step {pause_steps[a]} complete. Both arms remain powered and holding. '
+                          'Inspect the scene; type MOVE within 120s for the next step, '
+                          'or press Enter to stop: ', end='', flush=True)
+                    if not wait_for_move_while_holding(
+                        lambda: cycle(vectors[a-1], args.max_joint_speed, phase='hold'),
+                        args.rate, 120., sys.stdin):
+                        raise KeyboardInterrupt
+                    set_phase('RUNNING', stage_index, stage_index - 1,
+                              f'已通过视觉检查，开始第 {stage_index}/{stage_count} 步')
+            approach(vectors[a], settle_targets.get(a))
+            targets, _, gaps = interp_trajectory(vectors[a:b], np.zeros(b-a), intervals[a:b], args.rate, stage_speed)
             preview(frames[a]['sample_time_ns'])
             cycle(targets[0], args.max_joint_speed)
             timeline_stamp = frames[a]['sample_time_ns']
             deadline = time.monotonic()
             for index in range(1, len(targets)):
-                deadline = max(deadline + gaps[index] / args.speed, time.monotonic())
+                deadline = max(deadline + gaps[index] / stage_speed, time.monotonic())
                 time.sleep(max(0., deadline - time.monotonic()))
                 timeline_stamp += int(gaps[index]*1e9)
                 preview(timeline_stamp)
                 cycle(targets[index], args.max_joint_speed)
-        approach(vectors[-1])
+        approach(vectors[-1], settle_targets.get(len(vectors) - 1))
         hold(vectors[-1], args.hold_time)
+        set_phase('COMPLETE', stage_count, stage_count, '五步叠毛巾操作已完成')
         print(f'Replay finished; telemetry: {log_path}')
     except KeyboardInterrupt:
+        set_phase('STOPPED', int(locals().get('stage_index', 0)),
+                  max(0, int(locals().get('stage_index', 1)) - 1), '操作已停止，双臂进入安全停机')
         print('Replay stopped')
+        raise SystemExit(130)
+    except BaseException as exc:
+        set_phase('ERROR', int(locals().get('stage_index', 0)),
+                  max(0, int(locals().get('stage_index', 1)) - 1),
+                  f'第 {locals().get("stage_index", "—")} 步异常：{exc}')
+        raise
     finally:
         pool.shutdown(wait=True)
         for bus in reversed(list(buses.values())):

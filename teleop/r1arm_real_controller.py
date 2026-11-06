@@ -293,6 +293,7 @@ class R1ArmRealTeleopController(R1ArmTeleopControllerBase):
             self._initialize_gripper()
 
             self.arm_bus = self.bus_factory(self.bridge_library)
+            print(f"Opening {self.control_side} arm bus on {self.port}...", flush=True)
             self.arm_bus.open(self.port, self.baudrate, self.calibration_path)
             print("Probing all 7 joints with zero-gain FOC; keep the arm supported...")
             state = self._wait_for_feedback()

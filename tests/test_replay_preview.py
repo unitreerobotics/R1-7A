@@ -46,7 +46,8 @@ class ReplayPreviewTest(unittest.TestCase):
             output = io.StringIO()
             with patch.object(replay, 'R1ArmSdkBus') as right, patch.object(replay, 'LeftArmBus') as left, \
                  patch.object(replay, 'load_robot_model') as model, patch('robot.eef.dex1_single.Dex1Single') as hand, \
-                 patch.object(replay, 'ReplayPreview') as preview, contextlib.redirect_stdout(output):
+                 patch.object(replay, 'ReplayPreview') as preview, patch('builtins.input', return_value='MOVE'), \
+                 contextlib.redirect_stdout(output):
                 preview.return_value.update.return_value = False
                 replay.run(args)
                 for hardware in (right, left, model, hand):

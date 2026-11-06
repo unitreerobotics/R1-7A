@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -17,6 +18,8 @@ struct Bridge {
     ArmMotorBus bus;
 };
 
+constexpr int kCommandCycleRetries = 2;
+
 void setError(char* dst, int capacity, const std::string& message) {
     if (dst == nullptr || capacity <= 0) {
         return;
@@ -28,6 +31,33 @@ void setError(char* dst, int capacity, const std::string& message) {
 
 Bridge* asBridge(void* handle) {
     return static_cast<Bridge*>(handle);
+}
+
+void commandWithFreshFeedback(
+    ArmMotorBus& bus,
+    const std::array<ArmJointCmd, kArmJointCount>& commands) {
+    for (int attempt = 0; attempt <= kCommandCycleRetries; ++attempt) {
+        bus.step(commands);
+        const auto fresh = bus.lastStepFeedback();
+        std::ostringstream missing;
+        for (int i = 0; i < kArmJointCount; ++i) {
+            if (!fresh[i]) {
+                missing << (missing.tellp() > 0 ? ", J" : "J") << (i + 1);
+            }
+        }
+        if (missing.tellp() <= 0) {
+            return;
+        }
+        if (attempt == kCommandCycleRetries) {
+            throw std::runtime_error(
+                "R1Arm command cycle missing fresh feedback after " +
+                std::to_string(attempt + 1) + " attempts from " + missing.str());
+        }
+        std::cerr << "[R1ArmBridge] missing fresh feedback from " << missing.str()
+                  << "; retrying same position command ("
+                  << (attempt + 1) << "/" << kCommandCycleRetries << ")"
+                  << std::endl;
+    }
 }
 
 template <typename T, typename = void>
@@ -161,18 +191,7 @@ int r1arm_bridge_command_position(void* handle,
                 commands[i].kp = kp;
                 commands[i].kd = kd;
             }
-            asBridge(handle)->bus.step(commands);
-            const auto fresh = asBridge(handle)->bus.lastStepFeedback();
-            std::ostringstream missing;
-            for (int i = 0; i < kArmJointCount; ++i) {
-                if (!fresh[i]) {
-                    missing << (missing.tellp() > 0 ? ", J" : "J") << (i + 1);
-                }
-            }
-            if (missing.tellp() > 0) {
-                throw std::runtime_error(
-                    "R1Arm command cycle missing fresh feedback from " + missing.str());
-            }
+            commandWithFreshFeedback(asBridge(handle)->bus, commands);
         },
         error,
         error_capacity);
@@ -202,18 +221,7 @@ int r1arm_bridge_command_position_v2(void* handle,
                 commands[i].kp = kp[i];
                 commands[i].kd = kd[i];
             }
-            asBridge(handle)->bus.step(commands);
-            const auto fresh = asBridge(handle)->bus.lastStepFeedback();
-            std::ostringstream missing;
-            for (int i = 0; i < kArmJointCount; ++i) {
-                if (!fresh[i]) {
-                    missing << (missing.tellp() > 0 ? ", J" : "J") << (i + 1);
-                }
-            }
-            if (missing.tellp() > 0) {
-                throw std::runtime_error(
-                    "R1Arm command cycle missing fresh feedback from " + missing.str());
-            }
+            commandWithFreshFeedback(asBridge(handle)->bus, commands);
         },
         error,
         error_capacity);
@@ -244,18 +252,7 @@ int r1arm_bridge_command_position_v3(void* handle,
                 commands[i].kp = kp[i];
                 commands[i].kd = kd[i];
             }
-            asBridge(handle)->bus.step(commands);
-            const auto fresh = asBridge(handle)->bus.lastStepFeedback();
-            std::ostringstream missing;
-            for (int i = 0; i < kArmJointCount; ++i) {
-                if (!fresh[i]) {
-                    missing << (missing.tellp() > 0 ? ", J" : "J") << (i + 1);
-                }
-            }
-            if (missing.tellp() > 0) {
-                throw std::runtime_error(
-                    "R1Arm command cycle missing fresh feedback from " + missing.str());
-            }
+            commandWithFreshFeedback(asBridge(handle)->bus, commands);
         },
         error,
         error_capacity);

@@ -162,6 +162,7 @@ class R1ArmTeleopControllerBase:
             print("Using mock XR input")
         else:
             try:
+                print("Initializing XRoboToolkit input...", flush=True)
                 self.xr_client = XrInputWorker(make_xr_client(), config)
                 print("Connected to XRoboToolkit")
             except Exception as e:

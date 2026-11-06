@@ -39,6 +39,16 @@ MCAP 16D：右七轴＋右夹爪＋左七轴＋左夹爪。夹爪逻辑位置是
 图像为头部 D405、左腕 JR0001、右腕 JR0002，640×480／30 fps。
 回放优先高频控制流；暂停分段独立接近首帧；同步图像仅展示录制内容。
 
+叠毛巾五步需要在同一进程内保持双臂控制。复位毛巾和双臂后，使用原始录制按 8、12、20、26 秒暂停；每段完成时持续下发保持指令并检查反馈，操作员在 120 秒内输入 `MOVE` 才继续，其他输入或 Ctrl-C 会安全停止。不要分别启动五个切片：每次进程退出都会停止电机，下一段起点可能因手臂下垂而失配。
+
+```bash
+python dual/replay.py --episode data/dual_real/episode_0002.mcap \
+  --motion-mode --speed 0.5 --dex1-net lo --settle-to-recorded-state \
+  --pause-at 8,12,20,26 --no-show-observations --no-print-actions
+```
+
+启动前确认双臂姿态在回放恢复范围内、夹爪服务和四路相机正常，保持实体急停可触及。暂停时不要移动机械臂；UI 退出只关闭画面，停止回放应在回放终端按 Ctrl-C。
+
 `grippers.py` 是单／双夹爪共用启动实现，`scripts/start_gripper.sh` 默认只开右侧，`dual/start_grippers.sh` 默认开双侧。
 重复启动检查不再调用可能卡住的 fuser；不主动杀掉已有服务。
 

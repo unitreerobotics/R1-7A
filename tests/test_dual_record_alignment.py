@@ -1,16 +1,77 @@
 import csv
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from dual.replay import ReplayTelemetry, load_dual_episode
+from dual.replay import (ReplayTelemetry, StartupLimitRecovery, load_dual_episode,
+                         pause_boundary_indices, recorded_settle_target, wait_for_move_while_holding)
+from robot.r1arm_sdk import R1ArmSdkState, model_to_sdk_q
+from teleop.r1arm_real_controller import MODEL_LOWER
 from teleop.local_camera_client import CameraSpec, _CameraWorker
 from teleop.mcap_writer import FourCameraMcapRecorder
 
 
 class Alignment(unittest.TestCase):
+    def test_pause_boundaries_follow_recorded_time_and_reject_bad_times(self):
+        frames = [{'sample_time_ns': 10**18 + i * 10**9} for i in range(4)]
+        self.assertEqual(pause_boundary_indices(frames, '1.5,2.5'), {2, 3})
+        for spec in ('0', '3', '2,1', '1.1,1.2', 'nan', '1,'):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                pause_boundary_indices(frames, spec)
+
+    def test_pause_keeps_issuing_hold_commands_until_move(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd) as stream:
+                count = 0
+                def hold():
+                    nonlocal count
+                    count += 1
+                    if count == 3:
+                        os.write(write_fd, b'MOVE\n')
+                self.assertTrue(wait_for_move_while_holding(hold, 1000, .2, stream))
+                self.assertEqual(count, 3)
+        finally:
+            os.close(write_fd)
+
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd) as stream:
+                os.write(write_fd, b'\n')
+                self.assertFalse(wait_for_move_while_holding(lambda: None, 1000, .2, stream))
+        finally:
+            os.close(write_fd)
+
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd) as stream:
+                with self.assertRaisesRegex(TimeoutError, 'No MOVE'):
+                    wait_for_move_while_holding(lambda: None, 1000, .003, stream)
+        finally:
+            os.close(write_fd)
+
+    def test_startup_limit_error_identifies_joint_without_widening_margin(self):
+        q = np.array([0., 1.2, 0., -1.2, 0., 0., 0.])
+        q[5] = MODEL_LOWER[5] - .3
+        state = R1ArmSdkState(q=model_to_sdk_q(q), dq=np.zeros(7), tau_est=np.zeros(7),
+            mode=np.zeros(7), timeout=np.zeros(7), error_code=np.zeros(7), ready=np.ones(7, dtype=bool))
+        with self.assertRaisesRegex(RuntimeError, r'left: J6 feedback .* by 0.300 rad; startup recovery limit 0.25 rad'):
+            StartupLimitRecovery('left').check(state, startup=True)
+
+    def test_recorded_settle_target_preserves_action_and_bounds_feedback_gap(self):
+        action = np.array([0., 1.2, 0., -1.2, 0., 0., 0., .0245] * 2)
+        measured = action.copy()
+        measured[9] -= .076
+        frame = {'idx': 1, 'states': {'joint_state': measured.tolist()}}
+        target = recorded_settle_target(frame, action, .1)
+        self.assertAlmostEqual(target[8], action[9] - .076)
+        self.assertAlmostEqual(action[9], 1.2)
+        with self.assertRaisesRegex(ValueError, 'recorded action/feedback gap'):
+            recorded_settle_target(frame, action, .05)
+
     def test_control_source_preserves_16d_grippers_and_segments(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = FourCameraMcapRecorder(directory,'test',30,camera_order=(),control_frequency=90)

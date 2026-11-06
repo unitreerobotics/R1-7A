@@ -89,8 +89,10 @@ class DualRecorder:
             'vector_order':', '.join(f'{side} J1..J7, grip' for side in self.sides), 'dry_run':not args.motion_mode,
             'camera_devices':None if self.camera is None else self.camera.describe(),
             'camera_specs':[] if self.camera is None else [asdict(spec) for spec in self.camera.specs],
+            # Camera specs are already serialized above with asdict(); keeping
+            # the dataclass tuple here makes the MCAP JSON metadata fail.
             'control_parameters':{k:str(v) if isinstance(v,Path) else v.tolist() if isinstance(v,np.ndarray) else v
-                                  for k,v in vars(args).items()}}
+                                  for k,v in vars(args).items() if k != 'camera_specs'}}
         if 'left' in self.sides:
             metadata['left_bus_sign'] = [1., -1. if args.left_j2_convention == 'mirrored' else 1., 1.,
                 -1. if args.left_j4_convention == 'model' else 1., 1.,

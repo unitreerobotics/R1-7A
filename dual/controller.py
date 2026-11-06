@@ -229,7 +229,9 @@ class R1ArmDualRealController:
         try:
             # Finish discovery for BOTH hands before either motor bus is enabled.
             for arm in self.arms.values():
+                print(f"Initializing {arm.control_side} Dex1 DDS...", flush=True)
                 arm._initialize_gripper()
+            print('Starting both arm buses...', flush=True)
             self._parallel('_on_start', operation=start_and_hold)
         except BaseException:
             self.stop()

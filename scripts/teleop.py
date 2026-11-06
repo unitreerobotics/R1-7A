@@ -158,11 +158,15 @@ def run_real(args):
     previous_term = signal.signal(signal.SIGTERM, stop_signal)
     try:
         if args.record and not args.no_cameras:
+            print(f'Starting {len(args.camera_specs)} recording camera(s)...', flush=True)
             camera = LocalCameraSubscriber(args.camera_specs)
             camera.start()
+            print('Waiting for recording cameras to stabilize...', flush=True)
             camera.resolve_active(5.)
+            print(f'Camera startup finished: active={camera.active_keys}; inactive={camera.inactive}', flush=True)
             if camera.inactive or not camera.active_keys:
                 raise RuntimeError(f'Requested cameras unavailable: {camera.inactive}; verify cameras or use --no-cameras')
+        print('Creating XR and arm controllers...', flush=True)
         controller = R1ArmDualRealController(config, sides=sides,
             right_port=args.right_port, left_port=args.left_port,
             right_calibration=args.right_calib, left_calibration=args.left_calib,
@@ -179,6 +183,7 @@ def run_real(args):
             foc_timeout=args.foc_timeout, home_on_start=args.home_on_start,
             mock_xr=args.mock_xr, debug=args.debug, ik_dt=args.ik_dt,
             gravity_ff=args.gravity_ff, tau_clip=args.tau_clip)
+        print('XR and arm controllers created; initializing grippers and arm buses...', flush=True)
         controller.start()
         if args.record:
             recorder = DualRecorder(args, camera)
@@ -215,18 +220,24 @@ def run_real(args):
     except KeyboardInterrupt:
         pass
     finally:
-        reporter.close()
+        # Repeated Ctrl+C must not interrupt bounded hardware/camera cleanup.
+        previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
-            if controller is not None:
-                controller.stop()
-        finally:
+            reporter.close()
             try:
-                if recorder is not None:
-                    recorder.close()
+                if controller is not None:
+                    controller.stop()
             finally:
-                if camera is not None:
-                    camera.close()
-                signal.signal(signal.SIGTERM, previous_term)
+                try:
+                    if recorder is not None:
+                        recorder.close()
+                finally:
+                    if camera is not None:
+                        print('Stopping camera capture workers...', flush=True)
+                        camera.close()
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
 
 
 def run_sim(args):
