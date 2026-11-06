@@ -142,7 +142,7 @@ def run_real(args):
         if input(f'Type MOVE to enable {args.arm.upper()}: ').strip() != 'MOVE':
             raise SystemExit('Cancelled; no motor command sent')
     set_affinity(args.cpu_affinity)
-    reporter = TimingReporter(args.timing_report or args.debug)
+    reporter = TimingReporter(args.timing_report or args.debug, target_hz=args.rate)
     config = R1ArmConfig(ik_max_acc_per_s2=args.max_joint_acceleration,
         reset_blend_frames=args.reset_blend_frames, scale_factor=args.scale_factor,
         trajectory_position_gain=args.trajectory_position_gain,
@@ -197,6 +197,7 @@ def run_real(args):
         while running and (args.duration <= 0 or time.monotonic() - start < args.duration):
             now = time.monotonic()
             controller.sample_inputs()
+            xr_done = time.monotonic()
             buttons = {name: controller.button(name) for name in previous}
             edges = {name: buttons[name] and not previous[name] for name in previous}
             previous = buttons
@@ -210,11 +211,15 @@ def run_real(args):
                     controller.set_paused(not controller.paused)
                     recorder.pause(controller.paused)
             samples = controller.step(now-last, sample_inputs=False)
+            control_done = time.monotonic()
             if recorder is not None:
                 recorder.publish(samples)
                 if recorder.error is not None:
                     raise RuntimeError('Recording failed') from recorder.error
-            reporter.add(dict(controller.last_timing, cycle=now-last))
+            work_done = time.monotonic()
+            reporter.add(dict(controller.last_timing, cycle=now-last,
+                              xr=xr_done-now, work=work_done-now,
+                              record_publish=work_done-control_done, overruns=clock.overruns))
             last = now
             clock.wait()
     except KeyboardInterrupt:

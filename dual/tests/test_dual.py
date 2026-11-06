@@ -277,7 +277,7 @@ class Parallel(unittest.TestCase):
             def _on_stop(self): events.append('stop_'+self.side)
         c=R1ArmDualRealController.__new__(R1ArmDualRealController)
         c.pool=ThreadPoolExecutor(max_workers=2);c.arms={s:Arm(s) for s in ('right','left')}
-        c.native_xr=None;c.snapshot=None;c.closed=False;c.last_timing={}
+        c.native_xr=None;c.snapshot=None;c.closed=False;c.last_timing={};c._last_command_ends={}
         return c,events
     def test_parallel_barrier_and_isolated_snapshots(self):
         c,events=self.controller()
@@ -287,6 +287,20 @@ class Parallel(unittest.TestCase):
             self.assertLess(events.index('prepare_left'),events.index('sent_right'))
             copy=c.latest_pair();copy['right']['q_purpose'][0]=99
             self.assertEqual(c.latest_pair()['right']['q_purpose'][0],0)
+        finally: c.stop()
+    def test_command_frequency_uses_sdk_completion_timestamps(self):
+        c,_=self.controller()
+        try:
+            for side,arm in c.arms.items():
+                original=arm.control_sample
+                stamps=iter((1_000_000_000,1_012_500_000))
+                arm.control_sample=lambda original=original,stamps=stamps: dict(
+                    original(),command_send_end_monotonic_ns=next(stamps))
+            c.step(1/90)
+            self.assertNotIn('right_command_interval',c.last_timing)
+            c.step(1/90)
+            for side in ('right','left'):
+                self.assertAlmostEqual(c.last_timing[side+'_command_interval'],.0125)
         finally: c.stop()
     def test_preparation_failure_neither_arm_sent(self):
         c,events=self.controller(fail_prepare=True)

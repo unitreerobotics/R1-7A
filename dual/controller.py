@@ -158,6 +158,7 @@ class R1ArmDualRealController:
         self.closed = False
         self.last_timing = {}
         self._last_pair = None
+        self._last_command_ends = {}
         try:
             base = dict(kwargs, recovery_margin=recovery_margin)
             for index, side in enumerate(sides):
@@ -265,10 +266,15 @@ class R1ArmDualRealController:
             self.sample_inputs()
         for arm in self.arms.values():
             arm.preflight()
-        for arm in self.arms.values():
+        feedback_done = time.monotonic()
+        prepare_timing = {}
+        for side, arm in self.arms.items():
+            arm_start = time.monotonic()
             arm.prepare_step(dt)
+            prepare_timing[side + '_prepare'] = time.monotonic() - arm_start
         prepared = time.monotonic()
         self._parallel('_output_command')
+        output_done = time.monotonic()
         samples = {side: arm.control_sample() for side, arm in self.arms.items()}
         stamps = [s['command_time_ns'] for s in samples.values()]
         skew = max(stamps)-min(stamps)
@@ -281,8 +287,19 @@ class R1ArmDualRealController:
                 if isinstance(value,np.ndarray): value.setflags(write=False)
         self.last_timing = {'prepare': prepared-start, 'output': time.monotonic()-prepared,
                             'cycle': time.monotonic()-start,
+                            'feedback': feedback_done-start,
+                            'serial_barrier': output_done-prepared,
+                            'sample_copy': time.monotonic()-output_done,
+                            **prepare_timing,
                             **{side+'_io': (sample.get('command_send_end_monotonic_ns',0)-sample.get('command_send_start_monotonic_ns',0))*1e-9
                                for side,sample in samples.items()}}
+        for side, sample in samples.items():
+            end = sample.get('command_send_end_monotonic_ns', 0)
+            previous = self._last_command_ends.get(side)
+            if end and previous is not None and end > previous:
+                self.last_timing[side + '_command_interval'] = (end-previous)*1e-9
+            if end:
+                self._last_command_ends[side] = end
         return samples
 
     def latest_pair(self):

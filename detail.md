@@ -448,6 +448,38 @@ python scripts/replay/replay_r1arm_sim.py --episode data/dual_real/episode_0000.
 
 启动检查、模型限位、反馈故障检查、指令步长和超前限制均应保留。双臂每侧有独立模型、标定和控制状态，串口事务并行完成；实际控制频率取决于通信和主机负载。
 
+### 测量实际控制频率
+
+先正常退出已有遥操进程，保留所需夹爪服务。加载本机环境后执行：
+
+```bash
+python -u scripts/teleop.py --dual --motion-mode --rate 90 --timing-report
+```
+
+输入 `MOVE` 后，等待归位完成，再观察静止保持和按住 grip 跟踪时的 `[Timing]`。
+该命令不启用相机或录制；单臂将 `--dual` 改为 `--right` 或 `--left`。
+需要对比录制开销时，在同一命令加 `--record`，先加 `--no-cameras` 采集动作，再启用实际相机。
+
+| 字段 | 含义 |
+|---|---|
+| `target_hz` | 请求频率，不代表实际达到 |
+| `control_hz` | 控制循环起点之间间隔的倒数均值对应频率 |
+| `right_command_hz` / `left_command_hz` | 每侧 SDK 指令调用完成时间间隔对应的频率；不包含 bridge 内部重发次数，不代表电机内部伺服环频率 |
+| `cycle_p95_ms` / `cycle_max_ms` | 周期间隔的 95 分位与最大值；90 Hz 的目标周期约 11.11 ms |
+| `xr_p95_ms` | 主线程取 XR 快照耗时 |
+| `feedback_p95_ms` | 双侧缓存反馈读取及检查耗时 |
+| `right_prepare_p95_ms` / `left_prepare_p95_ms` | 对应侧 IK、轨迹整形等准备耗时 |
+| `right_io_p95_ms` / `left_io_p95_ms` | 对应侧下发阶段耗时，含重力前馈计算及 SDK 通信/反馈等待 |
+| `serial_barrier_p95_ms` | 主线程等待并行输出阶段完成的时间，含工作线程调度 |
+| `sample_copy_p95_ms` | 输出后构造、复制控制快照的时间 |
+| `record_publish_p95_ms` | 控制线程提交录制样本的时间；后台相机/编码争用可能体现为其他阶段或周期抖动 |
+| `work_p95_ms` | 一轮主线程处理时间，不含主动等待下一周期 |
+| `overruns` | 调度器累计发现的超期次数；超期后不追赶补发 |
+
+每秒输出一次最近最多 300 个有效周期间隔的统计，首个不完整周期不计入。纯 dry run 不输出真实 `*_command_hz`，不能用于证明真机达到 90 Hz。
+若出现 `[R1ArmBridge] ... retrying`，检查反馈丢失；当前 bridge 最多重试两次，可能拉长控制周期。不要为提高频率关闭反馈保护。
+当 `serial_barrier` 高于各侧 `io` 很多时，检查线程调度和主机负载；当各侧 `io` 本身已超过周期预算时，先排查 SDK、串口和反馈等待。
+
 ## 🩺 常见问题
 
 | 现象 | 检查方法 |
